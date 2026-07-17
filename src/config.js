@@ -92,7 +92,10 @@ export function buildRuntime({ config, file, storage, logger }) {
       const out = { ...config, orgs: state.orgs };
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const tmp = `${file}.tmp-${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify(out, null, 2));
+      // 0o600: the config holds secrets (api_key, cf_access.client_secret). A
+      // plain writeFileSync defaults to 0o644 and would rewrite the file
+      // world-readable on every member_id/owner write-back.
+      fs.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 0o600 });
       fs.renameSync(tmp, file);
     } catch (e) {
       logger?.warn?.(`config persist failed: ${e.message}`);
@@ -106,7 +109,7 @@ export function buildRuntime({ config, file, storage, logger }) {
   const tokenManager = new TokenManager({
     apiKey: config.auth.apiKey,
     coreUrl: config.http.baseUrl,
-    cfAccess: config.cf_access,
+    cfAccess: { cf_access: config.cf_access },
     storage,
     resolveDefaultOrgId,
     onMemberId: (orgId, memberId) => {
@@ -125,7 +128,7 @@ export function buildRuntime({ config, file, storage, logger }) {
     apiKey: config.auth.apiKey,
     deviceId: config.ws.deviceId,
     clientVersion: config.ws.clientVersion,
-    cfAccess: config.cf_access,
+    cfAccess: { cf_access: config.cf_access },
     tokenManager,
     resolveDefaultOrgId,
     logger,
