@@ -1,0 +1,16 @@
+{
+  "name": "openmax-channel",
+  "version": "0.1.0-alpha.0",
+  "description": "OpenMax/CWS channel plugin for Claude Code: brings workspace messages into the agent's context (experimental claude/channel + raft-channel-wake.v1) and exposes the OpenMax SDK service clients (tm/kb/as/comm/core/conn) as MCP tools.",
+  "author": {
+    "name": "OpenMax AI"
+  },
+  "mcpServers": {
+    "openmax": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/src/index.js"
+      ]
+    }
+  }
+}

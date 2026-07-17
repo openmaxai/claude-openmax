@@ -1,0 +1,17 @@
+{
+  "description": "OpenMax Claude Code hooks. SessionStart runs synchronously to inject the OpenMax orientation context (so a session started without --append-system-prompt still knows about the channel + tools, and it is re-injected after resume/compaction). All hooks always exit 0 and never block tool execution.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/session-hook.js"],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

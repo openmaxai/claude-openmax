@@ -1,0 +1,25 @@
+{
+  "http": {
+    "baseUrl": "https://your-cws-core.example.com"
+  },
+  "ws": {
+    "baseUrl": "wss://your-cws-comm.example.com/cws-comm",
+    "deviceId": "claude-openmax-device-1",
+    "clientVersion": "claude-openmax/0.1.0"
+  },
+  "auth": {
+    "apiKey": "cwsk_replace_me"
+  },
+  "orgs": [
+    {
+      "slug": "my-org",
+      "org_id": "org_uuid_here",
+      "self": { "member_id": "" },
+      "owner": { "member_id": "", "name": "" },
+      "access": { "dmPolicy": "owner", "dmAllowFrom": [] }
+    }
+  ],
+  "wake": {
+    "endpoint": "http://127.0.0.1:47600/wake"
+  }
+}
