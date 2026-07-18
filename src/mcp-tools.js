@@ -41,7 +41,7 @@ const SERVICE_KEYS = ['tm', 'kb', 'as', 'comm', 'core', 'conn'];
 const SERVICE_DESCRIPTIONS = {
   tm: 'Task management: projects, issues, tasks, blueprints, comments, attempts, event-bindings (cws-work via cws-core). method = a camelCase verb like projectCreate, issueCreate, taskCreate.',
   kb: 'Knowledge base: KB collections, directory tree nodes, pages + content/revisions/trash, full-text search, file upload. method = a camelCase verb like create, pageCreate, pageContentWrite, search.',
-  as: 'Artifact store: upload/download media, resolve artifact:// URIs, presigned URLs. method = a camelCase verb like uploadMedia, getMediaUrl, downloadMedia, resolveUris. NOTE: as methods take POSITIONAL args (e.g. uploadMedia(localPath, opts)), not a single params object — call them from code, not through this dispatch shape.',
+  as: 'Artifact store: upload/download media, resolve artifact:// URIs, presigned URLs. method = a camelCase verb like uploadMedia, getMediaUrl, downloadMedia, resolveUris. Pass a FLAT params object as usual — the adapter maps it to the SDK\'s positional call shape for you (e.g. getMediaUrl(idOrUri, opts)); you do NOT need to construct positional args.',
   comm: 'Communication: conversations, messages, history, mark-read, sync, DM access control. method = a camelCase verb like getMessages, getMessage, send, listConversations, createDm. Prefer the comm_send tool for replies.',
   core: 'Directory/identity: me, member/agent/org/role/invitation directory, agent profiles, self rename, onboarding. method = a camelCase verb like me, memberList, agentProfiles, orgList, selfRename.',
   conn: 'Connection credentials: list/acquire/proxy connection credentials + local cache. method = a camelCase verb like list, acquire, proxy, status, cached.',
@@ -900,7 +900,88 @@ const METHOD_SPECS = {
       params: [['connectionId', false, 'clear one connection; omit to clear all (alias: connection_id)']],
     },
   },
+
+  // The `as` (artifact-store) SDK methods take POSITIONAL args (see `as.js`), but
+  // the agent still passes a FLAT params object here — the POSITIONAL map below
+  // maps the flat keys onto the positional call. The `params` field lists are the
+  // FLAT keys the agent supplies; the first-listed name(s) become leading
+  // positional args and (unless the mapping has rest:null) everything else is
+  // folded into a trailing options object.
+  as: {
+    uploadMedia: {
+      summary: 'Upload a local file to the artifact store (IM upload when conversationId is set, else a KB file node). Returns {mediaId, artifactId, ...}.',
+      params: [
+        ['localPath', true, 'local filesystem path of the file to upload (positional arg 1)'],
+        ['filename', false, 'name override (defaults to the basename of localPath)'],
+        ['parentId', false, 'KB parent tree-node id (KB upload branch)'],
+        ['conversationId', false, 'set → conversation-scoped IM upload; omit → KB upload'],
+        ['mediaType', false, 'kind hint: image|video|audio|voice|file|sticker (default "file")'],
+        ['mimeType', false, 'explicit MIME/content type (alias: contentType); else inferred from extension'],
+      ],
+    },
+    getMediaUrl: {
+      summary: 'Resolve one artifact id or artifact:// URI to a short-lived presigned download URL (+ metadata). Use downloadMedia to fetch bytes.',
+      params: [
+        ['idOrUri', true, 'artifact id or artifact:// URI to resolve (positional arg 1)'],
+        ['inline', false, 'true → inline/preview disposition'],
+        ['mode', false, '"preview" is treated as inline'],
+      ],
+    },
+    resolveUris: {
+      summary: 'Batch-resolve an array of artifact:// URIs to presigned URLs in one call. Use getMediaUrl for a single id.',
+      params: [
+        ['uris', true, 'non-empty array of artifact:// URIs (positional arg 1)'],
+        ['inline', false, 'true → inline/preview disposition for all'],
+      ],
+    },
+    downloadMedia: {
+      summary: "Download an artifact's bytes to a local file (resolves an id/URI first, or uses an https URL directly). Returns the absolute local path.",
+      params: [
+        ['urlOrIdOrUri', true, 'https URL, artifact:// URI, or bare artifact id (positional arg 1)'],
+        ['filename', false, 'local filename to save as (positional arg 2; server/derived name if omitted)'],
+      ],
+    },
+  },
 };
+
+/**
+ * Services whose SDK methods take POSITIONAL args rather than a single params
+ * object. The dispatch handler still receives a FLAT params object from the
+ * agent and maps it here. Shape per method:
+ *   { args: [<ordered leading param names pulled from params>], rest: 'opts'|null }
+ * `rest: 'opts'` → the leftover params keys (those NOT in `args`) are passed as a
+ * trailing options object; `rest: null` → pass only the listed positional args,
+ * with no trailing object. Only `as` needs this — every other service keeps the
+ * plain single-object call path. Ground truth: openmax-agent-sdk/src/services/as.js.
+ */
+const POSITIONAL = {
+  as: {
+    uploadMedia:   { args: ['localPath'], rest: 'opts' },      // uploadMedia(localPath, opts)
+    getMediaUrl:   { args: ['idOrUri'], rest: 'opts' },        // getMediaUrl(idOrUri, opts)
+    resolveUris:   { args: ['uris'], rest: 'opts' },           // resolveUris(uris, opts)
+    downloadMedia: { args: ['urlOrIdOrUri', 'filename'], rest: null }, // downloadMedia(url, filename) — NO trailing opts
+  },
+};
+
+/**
+ * Build the positional argument list for a POSITIONAL-mapped method from the
+ * agent's flat params object. Leading `spec.args` are pulled out in order (an
+ * absent one is passed through as `undefined` so the SDK surfaces its own
+ * "required" error); when `spec.rest === 'opts'` the remaining keys are folded
+ * into a trailing options object.
+ */
+function buildPositionalArgs(spec, params) {
+  const p = params || {};
+  const out = spec.args.map((name) => p[name]);
+  if (spec.rest === 'opts') {
+    const opts = {};
+    for (const key of Object.keys(p)) {
+      if (!spec.args.includes(key)) opts[key] = p[key];
+    }
+    out.push(opts);
+  }
+  return out;
+}
 
 /**
  * Method-level notes for places where the SDK method's accepted fields differ
@@ -909,6 +990,15 @@ const METHOD_SPECS = {
  * (note = caveat/divergence, summary = purpose).
  */
 const METHOD_NOTES = {
+  as: {
+    // The SDK methods are positional; the adapter maps the flat params below onto
+    // that positional call, so the old "positional mismatch — call from code" note
+    // no longer applies.
+    uploadMedia: 'Pass flat params; the adapter calls uploadMedia(localPath, opts) where opts = every key except localPath.',
+    getMediaUrl: 'Pass flat params; the adapter calls getMediaUrl(idOrUri, {inline, mode}).',
+    resolveUris: 'Pass flat params; the adapter calls resolveUris(uris, {inline}). uris must be a non-empty array.',
+    downloadMedia: 'Pass flat params; the adapter calls downloadMedia(urlOrIdOrUri, filename) — no trailing options object.',
+  },
   kb: {
     pageUpdate: 'SDK sends only title/path. To change body/content use pageContentWrite (the docs also list content/baseRevisionId here, but this method does not forward them).',
     pages: 'SDK forwards only cursor/limit/offset (no parentId/kbId filter, despite the docs). Use nodeChildren to browse a folder.',
@@ -1136,7 +1226,12 @@ export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) 
         if (typeof service[method] !== 'function' || method.startsWith('_')) {
           return errResult(`${name}: unknown method "${method}". Call {"method":"list"} to see available verbs and their fields.`);
         }
-        const result = await service[method](args.params || {});
+        // Most services take a single params object; the `as` service takes
+        // POSITIONAL args, so map the flat params onto the positional call.
+        const positional = POSITIONAL[name]?.[method];
+        const result = positional
+          ? await service[method](...buildPositionalArgs(positional, args.params))
+          : await service[method](args.params || {});
         return okResult(result);
       }
 
