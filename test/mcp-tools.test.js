@@ -127,3 +127,99 @@ test('unknown tool name => isError', async () => {
   const res = await handler('bogus', {});
   assert.equal(res.isError, true);
 });
+
+// --- as-service positional dispatch -----------------------------------------
+// The `as` SDK methods take POSITIONAL args (localPath, opts) / (idOrUri, opts)
+// / (uris, opts) / (url, filename). The agent still passes a FLAT params object;
+// the adapter must map it onto the positional call, NOT pass a single object.
+function recordingAsServices() {
+  const calls = {};
+  const record = (name) => async (...args) => { calls[name] = args; return { ok: name }; };
+  return {
+    services: {
+      as: {
+        uploadMedia: record('uploadMedia'),
+        getMediaUrl: record('getMediaUrl'),
+        resolveUris: record('resolveUris'),
+        downloadMedia: record('downloadMedia'),
+      },
+      tm: { issueCreate: async (...args) => { calls.issueCreate = args; return { id: 'i1' }; } },
+    },
+    calls,
+  };
+}
+
+test('as.getMediaUrl maps flat params to (idOrUri, opts) positionally', async () => {
+  const { services, calls } = recordingAsServices();
+  const { handler } = createMcpTools({ services });
+  await handler('as', { method: 'getMediaUrl', params: { idOrUri: 'abc', inline: true } });
+  // arg0 is the bare string, arg1 is the leftover opts — NOT a single object.
+  assert.deepEqual(calls.getMediaUrl, ['abc', { inline: true }]);
+});
+
+test('as.uploadMedia maps to (localPath, optsWithoutLocalPath)', async () => {
+  const { services, calls } = recordingAsServices();
+  const { handler } = createMcpTools({ services });
+  await handler('as', {
+    method: 'uploadMedia',
+    params: { localPath: '/tmp/a.png', filename: 'a.png', conversationId: 'c1', mediaType: 'image' },
+  });
+  assert.deepEqual(calls.uploadMedia, [
+    '/tmp/a.png',
+    { filename: 'a.png', conversationId: 'c1', mediaType: 'image' },
+  ]);
+  // localPath must NOT leak into the opts object.
+  assert.equal('localPath' in calls.uploadMedia[1], false);
+});
+
+test('as.resolveUris maps to (arrayOfUris, {inline})', async () => {
+  const { services, calls } = recordingAsServices();
+  const { handler } = createMcpTools({ services });
+  const uris = ['artifact://x', 'artifact://y'];
+  await handler('as', { method: 'resolveUris', params: { uris, inline: true } });
+  assert.deepEqual(calls.resolveUris, [uris, { inline: true }]);
+  assert.ok(Array.isArray(calls.resolveUris[0]));
+});
+
+test('as.downloadMedia maps to (url, filename) with NO trailing opts arg', async () => {
+  const { services, calls } = recordingAsServices();
+  const { handler } = createMcpTools({ services });
+  await handler('as', { method: 'downloadMedia', params: { urlOrIdOrUri: 'artifact://z', filename: 'out.bin' } });
+  assert.deepEqual(calls.downloadMedia, ['artifact://z', 'out.bin']);
+  // Exactly two args — the SDK signature has no third options object.
+  assert.equal(calls.downloadMedia.length, 2);
+});
+
+test('as positional mapping passes undefined through when a required arg is missing', async () => {
+  const { services, calls } = recordingAsServices();
+  const { handler } = createMcpTools({ services });
+  // No params at all: the SDK method should receive (undefined, {}) and surface
+  // its own "required" error — the adapter does not pre-empt it.
+  await handler('as', { method: 'getMediaUrl' });
+  assert.deepEqual(calls.getMediaUrl, [undefined, {}]);
+});
+
+test('regression: non-as service still receives a single params object', async () => {
+  const { services, calls } = recordingAsServices();
+  const { handler } = createMcpTools({ services });
+  await handler('tm', { method: 'issueCreate', params: { title: 'Bug', projectId: 'p1' } });
+  // tm is NOT positional: exactly one arg, the whole params object.
+  assert.equal(calls.issueCreate.length, 1);
+  assert.deepEqual(calls.issueCreate[0], { title: 'Bug', projectId: 'p1' });
+});
+
+test('as {method:"list"} exposes flat-param schemas + positional-mapping notes', async () => {
+  const { services } = recordingAsServices();
+  const { handler } = createMcpTools({ services });
+  const methods = parse(await handler('as', { method: 'list' })).methods;
+  const byName = Object.fromEntries(methods.map((m) => [m.name, m]));
+  // Each as method has a purpose summary and a flat param list.
+  assert.match(byName.getMediaUrl.summary, /presigned|resolve/i);
+  const gm = Object.fromEntries(byName.getMediaUrl.params.map((p) => [p.name, p]));
+  assert.equal(gm.idOrUri.required, true);
+  assert.equal(gm.inline.required, false);
+  const um = Object.fromEntries(byName.uploadMedia.params.map((p) => [p.name, p]));
+  assert.equal(um.localPath.required, true);
+  // The note documents the adapter's positional mapping.
+  assert.match(byName.downloadMedia.note, /downloadMedia\(urlOrIdOrUri, filename\)|no trailing/i);
+});
