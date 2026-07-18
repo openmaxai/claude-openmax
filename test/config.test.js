@@ -6,7 +6,6 @@ import path from 'node:path';
 
 import {
   normalizeConfig,
-  deriveSlug,
   buildRuntime,
   resolveAndCacheIdentityId,
 } from '../src/config.js';
@@ -49,22 +48,6 @@ function newShape(over = {}) {
   };
 }
 
-// ── slug derivation ────────────────────────────────────────────────────────────
-test('deriveSlug: explicit slug > org_id (never org_name)', () => {
-  assert.equal(deriveSlug({ slug: 'explicit', org_name: 'Acme', org_id: 'id1' }, 'id1'), 'explicit');
-  assert.equal(deriveSlug({ org_name: 'Acme Corp', org_id: 'id1' }, 'id1'), 'id1'); // org_name ignored
-  assert.equal(deriveSlug({ org_id: 'id1' }, 'id1'), 'id1');
-  assert.equal(deriveSlug({}, 'keyed-id'), 'keyed-id');                             // uses the map key
-});
-
-test('deriveSlug: two orgs with the SAME org_name get DISTINCT slugs (no collision)', () => {
-  const a = deriveSlug({ org_name: 'My Workspace', org_id: '019f-aaaa' }, '019f-aaaa');
-  const b = deriveSlug({ org_name: 'My Workspace', org_id: '019f-bbbb' }, '019f-bbbb');
-  assert.notEqual(a, b);
-  assert.equal(a, '019f-aaaa');
-  assert.equal(b, '019f-bbbb');
-});
-
 // ── new-shape parsing ──────────────────────────────────────────────────────────
 test('normalizeConfig: parses new openmax-mirrored shape', () => {
   const c = normalizeConfig(newShape(), { logger: silentLogger });
@@ -77,11 +60,10 @@ test('normalizeConfig: parses new openmax-mirrored shape', () => {
   assert.deepEqual(c.cf_access, { client_id: 'cid', client_secret: 'sec' });
   assert.equal(c.wake.endpoint, 'http://127.0.0.1:47600/wake');
   assert.equal(c.ws.reconnectMaxMs, 12345);
-  // orgs normalized to an internal ARRAY with a derived slug
+  // orgs normalized to an internal ARRAY, each identified by its org_id
   assert.equal(c.orgs.length, 1);
   assert.equal(c.orgs[0].org_id, 'org-uuid-1');
-  assert.equal(c.orgs[0].slug, 'org-uuid-1'); // slug = org_id (org_name NOT used)
-  assert.equal(c.orgs[0].slugExplicit, false);
+  assert.equal('slug' in c.orgs[0], false);   // no derived per-org key anymore
 });
 
 test('normalizeConfig: frontend_base_path defaults to /workspace when absent', () => {
@@ -91,12 +73,12 @@ test('normalizeConfig: frontend_base_path defaults to /workspace when absent', (
   assert.equal(c.server.frontend_base_path, '/workspace');
 });
 
-test('normalizeConfig: explicit slug is preserved and flagged', () => {
+test('normalizeConfig: a stray on-disk `slug` is ignored (org_id is the only key)', () => {
   const raw = newShape();
   raw.orgs['org-uuid-1'].slug = 'my-explicit';
   const c = normalizeConfig(raw, { logger: silentLogger });
-  assert.equal(c.orgs[0].slug, 'my-explicit');
-  assert.equal(c.orgs[0].slugExplicit, true);
+  assert.equal(c.orgs[0].org_id, 'org-uuid-1');
+  assert.equal('slug' in c.orgs[0], false);      // slug is not carried into the runtime record
 });
 
 // ── env overrides ──────────────────────────────────────────────────────────────
@@ -146,21 +128,21 @@ test('normalizeConfig: OLD-shape (http/auth + array orgs) is translated', () => 
   assert.equal(c.ws.reconnectMaxMs, 777);
   assert.equal(c.orgs.length, 1);
   assert.equal(c.orgs[0].org_id, 'old-org-1');
-  assert.equal(c.orgs[0].slug, 'team-alpha');      // explicit slug preserved through translation
+  assert.equal('slug' in c.orgs[0], false);        // slug dropped — org_id is the identity
   assert.equal(c.orgs[0].self.member_id, 'm-old');
 });
 
-// ── org_id ⇄ slug bridge + slug-keyed loadConfig ───────────────────────────────
-test('buildRuntime: loadConfig() returns a SLUG-keyed org map (SDK expectation)', () => {
+// ── org_id-keyed loadConfig (SDK keys orgs by org_id) ───────────────────────────
+test('buildRuntime: loadConfig() returns an org_id-keyed org map (SDK expectation)', () => {
   const file = tmpFile();
   const config = normalizeConfig(newShape(), { logger: silentLogger });
   const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger, httpClient: {} });
   const loaded = rt.callbacks.loadConfig();
   assert.deepEqual(Object.keys(loaded.orgs), ['org-uuid-1']);
   assert.equal(loaded.orgs['org-uuid-1'].org_id, 'org-uuid-1');
-  // orgConfigs handed to the SDK carry both slug (= org_id here) and org_id
-  assert.equal(rt.orgConfigs[0].slug, 'org-uuid-1');
+  // orgConfigs handed to the SDK carry org_id (and no separate slug key)
   assert.equal(rt.orgConfigs[0].org_id, 'org-uuid-1');
+  assert.equal('slug' in rt.orgConfigs[0], false);
 });
 
 // ── self-healing member_id writeback into the org_id-keyed on-disk map ──────────

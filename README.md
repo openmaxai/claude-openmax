@@ -128,7 +128,7 @@ enabled?: bool
 server:  { bff_url, ws_url, frontend_base_path }        // frontend_base_path default "/workspace"
 agent:   { identity_id, api_key, device_id, app_version }
 cf_access: { client_id, client_secret }
-orgs:    { "<org_id>": { enabled?, org_id, org_name?, slug?,
+orgs:    { "<org_id>": { enabled?, org_id, org_name?,
              owner: { member_id, name },
              self:  { member_id, name, display_name },
              access:{ dmPolicy, dmAllowFrom?, groupPolicy?, groups?:{ "<convId>": { mode, allowFrom } } } } }
@@ -144,11 +144,11 @@ Env fallbacks (map onto the nested fields): `COCO_API_URL`→`server.bff_url`,
 `CLAUDE_OPENMAX_DATA_DIR`, `CLAUDE_OPENMAX_MODE`, `CLAUDE_OPENMAX_DEBOUNCE_MS`,
 `CLAUDE_OPENMAX_CONTENT_FREE`, `CLAUDE_OPENMAX_WAKE_{HOST,PORT,TOKEN}`.
 
-**`orgs` is keyed by `org_id`** (openmax-style), but the SDK orchestrator keys its
-per-org runtime records by a `slug`. The adapter bridges the two: it derives a
-stable, unique slug per org (explicit `slug` > `org_id`; never `org_name`, which
-can collide) and exposes a slug-keyed map to the SDK, while every self-healing write-back (`self.member_id`,
-`self.name`, owner bind) lands back in the `org_id`-keyed on-disk structure.
+**`orgs` is keyed by `org_id`** (openmax-style), end to end: the SDK orchestrator
+keys its per-org runtime records by `org_id` too, so the adapter hands it an
+`org_id`-keyed map directly — there is no separate per-org key to derive. Every
+self-healing write-back (`self.member_id`, `self.name`, owner bind) resolves the
+org by `org_id` and lands back in the `org_id`-keyed on-disk structure.
 
 **`agent.identity_id`** is the agent's global identity. Leave it empty and the
 adapter resolves it from cws-core `GET /me` at startup and caches it back to

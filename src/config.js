@@ -30,7 +30,6 @@
  *       "enabled":  true,
  *       "org_id":   "<org_id>",
  *       "org_name": "Acme",                                // display label only
- *       "slug":     "acme",                                // OPTIONAL explicit slug (else org_id is used)
  *       "owner":    { "member_id": "", "name": "" },
  *       "self":     { "member_id": "", "name": "", "display_name": "" },
  *       "access":   { "dmPolicy": "owner", "dmAllowFrom": [],
@@ -43,15 +42,14 @@
  *   "ws": { "reconnectMaxMs": 0, "heartbeatIntervalMs": 0, "pingIntervalMs": 0 } // WS tuning knobs
  * }
  *
- * ── org_id ⇄ slug bridge ────────────────────────────────────────────────────
- * The on-disk `orgs` map is keyed by org_id (openmax-style). The SDK
- * orchestrator, however, keys its per-org runtime records by a `slug`
- * (`for (const [slug, rec] of this._orgs)`, `loadConfig().orgs?.[slug]`).
- * `normalizeConfig` therefore derives a stable, UNIQUE `slug` per org — an
- * explicit `slug` wins, else the org_id (never org_name, which can collide) —
- * and `buildRuntime` bridges the two: the SDK sees slug-keyed orgs while every write-back
- * (member_id via onMemberId, self.name via syncSelf, owner bind) lands back in
- * the org_id-keyed on-disk structure via persist().
+ * ── keyed by org_id, end to end ─────────────────────────────────────────────
+ * The on-disk `orgs` map is keyed by org_id (openmax-style) and so is every
+ * in-memory view handed to the SDK: `loadConfig().orgs` is keyed by org_id and
+ * each `orgConfig` carries its `org_id`. The SDK orchestrator keys its per-org
+ * runtime records by `orgConfig.org_id` too, so there is no separate per-org
+ * key to derive — org_id (a required UUID) is the single identity everywhere.
+ * Every write-back (member_id via onMemberId, self.name via syncSelf, owner
+ * bind) resolves the org by org_id and persists via persist().
  *
  * The old shape (top-level `http`/`auth` + array `orgs`) is still accepted:
  * normalizeConfig translates it to the new shape with a one-time warning.
@@ -96,21 +94,6 @@ export function loadAdapterConfig(explicitPath) {
   return { config, file };
 }
 
-/**
- * Derive a stable, UNIQUE slug for an org record. Priority: an explicit `slug`
- * (operator-supplied, they own uniqueness) > the org_id (the map key).
- *
- * We deliberately do NOT derive the slug from `org_name`: org_name is a display
- * label with no uniqueness guarantee, so two orgs with the same/similar name
- * would collapse to the same slug and clobber each other in the orchestrator's
- * slug-keyed `_orgs` map. org_id is a UUID — unique and stable by construction —
- * so it is the correct fallback (and matches openmax keying orgs by org_id).
- */
-export function deriveSlug(org, orgIdKey) {
-  if (org?.slug) return String(org.slug);
-  return String(org?.org_id || orgIdKey || '');
-}
-
 /** True when `raw` is an OLD-shape config (top-level http/auth or array orgs). */
 function isLegacyShape(raw) {
   return !!(raw && (raw.http || raw.auth || Array.isArray(raw.orgs)));
@@ -131,7 +114,6 @@ function translateLegacy(raw) {
       ...(o.enabled !== undefined ? { enabled: o.enabled } : {}),
       org_id: o.org_id,
       ...(o.org_name ? { org_name: o.org_name } : {}),
-      ...(o.slug ? { slug: o.slug } : {}),
       owner: o.owner || { member_id: '', name: '' },
       self: o.self || { member_id: '', name: '', display_name: '' },
       access: o.access || {},
@@ -164,9 +146,8 @@ function translateLegacy(raw) {
 
 /**
  * Normalize a raw on-disk config into the internal runtime shape. Applies env
- * fallbacks and derives a stable slug per org. Internally `orgs` is an ARRAY of
- * records (each carrying its derived `slug`); persist() serializes it back to
- * the org_id-keyed on-disk map.
+ * fallbacks. Internally `orgs` is an ARRAY of records (each keyed/identified by
+ * its `org_id`); persist() serializes it back to the org_id-keyed on-disk map.
  *
  * @param {object} raw   parsed config.json (may be new-shape, old-shape, or {})
  * @param {object} [opts]
@@ -194,8 +175,6 @@ export function normalizeConfig(raw, { logger } = {}) {
     const org_id = org.org_id || orgIdKey;
     if (!org_id) continue;
     orgs.push({
-      slug: deriveSlug(org, orgIdKey),
-      slugExplicit: !!org.slug,
       enabled: org.enabled,
       org_id,
       org_name: org.org_name || '',
@@ -300,7 +279,6 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     ...(o.enabled !== undefined ? { enabled: o.enabled } : {}),
     org_id: o.org_id,
     ...(o.org_name ? { org_name: o.org_name } : {}),
-    ...(o.slugExplicit ? { slug: o.slug } : {}),   // only persist slug when explicitly set
     owner: o.owner || { member_id: '', name: '' },
     self: o.self || { member_id: '', name: '', display_name: '' },
     access: o.access || {},
@@ -328,7 +306,6 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     }
   };
 
-  const orgBySlug = (slug) => state.orgs.find((o) => o.slug === slug);
   const orgByOrgId = (id) => state.orgs.find((o) => o.org_id === id);
   const resolveDefaultOrgId = () => state.orgs[0]?.org_id || process.env.COCO_ORG_ID || '';
 
@@ -340,7 +317,7 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     if (org && memberId && org.self?.member_id !== memberId) {
       org.self = { ...(org.self || {}), member_id: memberId };
       persist();
-      logger?.info?.(`member_id resolved for org=${org.slug}: ${memberId}`);
+      logger?.info?.(`member_id resolved for org=${org.org_id}: ${memberId}`);
       return true;
     }
     return false;
@@ -375,15 +352,15 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     enabledOrgs: () => state.orgs.slice(),
     getOrgByOrgId: orgByOrgId,
     updateConfig: (fn) => {
-      const cfg = { orgs: Object.fromEntries(state.orgs.map((o) => [o.slug, o])) };
+      const cfg = { orgs: Object.fromEntries(state.orgs.map((o) => [o.org_id, o])) };
       fn(cfg);
-      // reflect back mutations keyed by slug into the array
+      // reflect back mutations keyed by org_id into the array
       state.orgs = Object.values(cfg.orgs);
       persist();
       return cfg;
     },
-    setOwner: (slug, memberId, name) => {
-      const org = orgBySlug(slug);
+    setOwner: (orgId, memberId, name) => {
+      const org = orgByOrgId(orgId);
       if (org) { org.owner = { member_id: memberId, name: name || '' }; persist(); }
     },
   };
@@ -398,19 +375,19 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
   };
 
   // ── SDK callbacks ─────────────────────────────────────────────────────────
-  // The SDK keys per-org runtime records by slug — bridge the org_id-keyed
-  // on-disk store to a slug-keyed map here.
-  const loadConfig = () => ({ orgs: Object.fromEntries(state.orgs.map((o) => [o.slug, o])) });
+  // The SDK keys per-org runtime records by org_id — hand it the same
+  // org_id-keyed view of the on-disk store.
+  const loadConfig = () => ({ orgs: Object.fromEntries(state.orgs.map((o) => [o.org_id, o])) });
 
-  const loadSession = async (slug) => {
+  const loadSession = async (orgId) => {
     try {
-      const raw = await storage.get(path.join('sessions', `${slug}.json`));
+      const raw = await storage.get(path.join('sessions', `${orgId}.json`));
       return raw ? JSON.parse(raw) : {};
     } catch { return {}; }
   };
-  const saveSession = async (slug, partial) => {
-    const cur = await loadSession(slug);
-    await storage.set(path.join('sessions', `${slug}.json`), JSON.stringify({ ...cur, ...partial }));
+  const saveSession = async (orgId, partial) => {
+    const cur = await loadSession(orgId);
+    await storage.set(path.join('sessions', `${orgId}.json`), JSON.stringify({ ...cur, ...partial }));
   };
 
   const syncSelf = async (orgConfig) => {
@@ -419,12 +396,12 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
       const me = await http.getForOrg(orgConfig.org_id, http.apiPath('/me'));
       const name = me?.display_name || me?.username || '';
       if (name) {
-        const org = orgBySlug(orgConfig.slug);
+        const org = orgByOrgId(orgConfig.org_id);
         if (org) { org.self = { ...(org.self || {}), name }; persist(); }
         return { nameReady: true, displayName: name, source: 'core' };
       }
     } catch (e) {
-      logger?.warn?.(`syncSelf(${orgConfig.slug}) failed: ${e.message}`);
+      logger?.warn?.(`syncSelf(${orgConfig.org_id}) failed: ${e.message}`);
     }
     return { nameReady: false, reason: 'core returned no display_name' };
   };
@@ -434,24 +411,24 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     loadSession,
     saveSession,
     syncSelf,
-    onOwnerBind: (slug, memberId, displayName) => configProvider.setOwner(slug, memberId, displayName),
-    onOwnerNameHint: (slug, name) => {
-      const org = orgBySlug(slug);
+    onOwnerBind: (orgId, memberId, displayName) => configProvider.setOwner(orgId, memberId, displayName),
+    onOwnerNameHint: (orgId, name) => {
+      const org = orgByOrgId(orgId);
       if (org) { org.owner = { ...(org.owner || {}), name }; persist(); }
     },
     onConfigEvent: (orgConfig, { event, data }) => {
-      logger?.info?.(`config event ${event} for org=${orgConfig.slug}`);
+      logger?.info?.(`config event ${event} for org=${orgConfig.org_id}`);
       // Persist agent.config.* into the org's access block (best-effort mirror).
-      const org = orgBySlug(orgConfig.slug);
+      const org = orgByOrgId(orgConfig.org_id);
       if (org && data && typeof data === 'object') {
         org.access = { ...(org.access || {}), ...pickAccess(data) };
         persist();
       }
     },
-    onConnectionEvent: (orgConfig) => logger?.info?.(`connection event for org=${orgConfig.slug} (Cat.B no-op)`),
-    onChannelEvent: (orgConfig) => logger?.info?.(`channel event for org=${orgConfig.slug} (Cat.B no-op)`),
+    onConnectionEvent: (orgConfig) => logger?.info?.(`connection event for org=${orgConfig.org_id} (Cat.B no-op)`),
+    onChannelEvent: (orgConfig) => logger?.info?.(`channel event for org=${orgConfig.org_id} (Cat.B no-op)`),
     onOrgTerminated: (orgConfig, code, reason) =>
-      logger?.error?.(`org ${orgConfig.slug} terminated code=${code} reason="${reason || ''}"`),
+      logger?.error?.(`org ${orgConfig.org_id} terminated code=${code} reason="${reason || ''}"`),
     onAllOrgsTerminated: () => logger?.error?.('all orgs terminated'),
   };
 
