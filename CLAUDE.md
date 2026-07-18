@@ -33,6 +33,16 @@ Each service is exposed as ONE dispatch tool taking `{ method, params }`. Call
 | `core` | directory/identity: `me`, member/org listing, `selfRename` |
 | `conn` | connection credentials |
 
+### Your identity & workspace links
+
+- **`leadAgentId` = your own `identity_id`.** When you register an Issue
+  (`tm issueCreate`), the Lead agent is *you* — pass your own agent `identity_id`.
+  It is resolved from `GET /me` at startup and cached in config (`agent.identity_id`).
+- **Clickable workspace links.** The workspace SPA is mounted at
+  `server.frontend_base_path` (default `/workspace`) on the same origin as the
+  API, so a page/artifact path resolves to a browser-navigable
+  `<bff_url>/workspace/…` URL you can share back to the user.
+
 ## Session / context
 
 Context and session management use Claude Code's **built-in autocompact**

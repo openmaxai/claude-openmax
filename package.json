@@ -20,7 +20,7 @@
     "bridge": "node src/bridge.js"
   },
   "dependencies": {
-    "@openmaxai/openmax-agent-sdk": "file:../cws-agent-sdk",
+    "@openmaxai/openmax-agent-sdk": "file:../openmax-agent-sdk",
     "@modelcontextprotocol/sdk": "^1.22.0"
   },
   "license": "UNLICENSED"

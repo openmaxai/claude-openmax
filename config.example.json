@@ -1,25 +1,49 @@
 {
-  "http": {
-    "baseUrl": "https://your-cws-core.example.com"
+  "enabled": true,
+  "server": {
+    "bff_url": "https://your-cws-core.example.com",
+    "ws_url": "wss://your-cws-comm.example.com/cws-comm",
+    "frontend_base_path": "/workspace"
   },
-  "ws": {
-    "baseUrl": "wss://your-cws-comm.example.com/cws-comm",
-    "deviceId": "claude-openmax-device-1",
-    "clientVersion": "claude-openmax/0.1.0"
+  "agent": {
+    "identity_id": "",
+    "api_key": "cwsk_replace_me",
+    "device_id": "claude-openmax-device-1",
+    "app_version": "claude-openmax/0.1.0"
   },
-  "auth": {
-    "apiKey": "cwsk_replace_me"
+  "cf_access": {
+    "client_id": "",
+    "client_secret": ""
   },
-  "orgs": [
-    {
-      "slug": "my-org",
-      "org_id": "org_uuid_here",
-      "self": { "member_id": "" },
+  "orgs": {
+    "019f0000-0000-7000-8000-000000000000": {
+      "enabled": true,
+      "org_id": "019f0000-0000-7000-8000-000000000000",
+      "org_name": "My Org",
       "owner": { "member_id": "", "name": "" },
-      "access": { "dmPolicy": "owner", "dmAllowFrom": [] }
+      "self": { "member_id": "", "name": "Claude", "display_name": "" },
+      "access": {
+        "dmPolicy": "owner",
+        "dmAllowFrom": [],
+        "groupPolicy": "allowlist",
+        "groups": {
+          "019f0000-0000-7000-8000-conversation1": {
+            "mode": "mention",
+            "allowFrom": ["*"]
+          }
+        }
+      }
     }
-  ],
+  },
   "wake": {
     "endpoint": "http://127.0.0.1:47600/wake"
+  },
+  "metricsReport": {
+    "dashboardApiKey": ""
+  },
+  "ws": {
+    "reconnectMaxMs": 30000,
+    "heartbeatIntervalMs": 30000,
+    "pingIntervalMs": 20000
   }
 }

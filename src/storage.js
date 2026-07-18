@@ -70,6 +70,6 @@ export function createFileStorage(opts = {}) {
     clearCredentials() { return []; },
 
     // Convenience for the per-org sync cursor persisted by loadSession/saveSession.
-    sessionPath(slug) { return resolve(path.join('sessions', `${slug}.json`)); },
+    sessionPath(orgId) { return resolve(path.join('sessions', `${orgId}.json`)); },
   };
 }

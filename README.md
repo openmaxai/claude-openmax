@@ -119,10 +119,72 @@ CLAUDE_OPENMAX_WAKE_TOKEN=... node src/bridge.js
 ### Config / env
 
 Config file at `$CLAUDE_OPENMAX_CONFIG` (or `~/.config/claude-openmax/config.json`);
-see `config.example.json`. Env fallbacks: `COCO_API_URL`, `COCO_API_KEY`,
-`COCO_WS_URL`, `COCO_DEVICE_ID`. Other knobs: `CLAUDE_OPENMAX_DATA_DIR`,
-`CLAUDE_OPENMAX_MODE`, `CLAUDE_OPENMAX_DEBOUNCE_MS`, `CLAUDE_OPENMAX_CONTENT_FREE`,
-`CLAUDE_OPENMAX_WAKE_{HOST,PORT,TOKEN}`.
+see `config.example.json`. As of the config-parity refactor the on-disk shape is a
+**1:1 structural mirror of the OpenMax (`zylos-openmax`) component's config** — see
+the migration note below. The shape:
+
+```
+enabled?: bool
+server:  { bff_url, ws_url, frontend_base_path }        // frontend_base_path default "/workspace"
+agent:   { identity_id, api_key, device_id, app_version }
+cf_access: { client_id, client_secret }
+orgs:    { "<org_id>": { enabled?, org_id, org_name?,
+             owner: { member_id, name },
+             self:  { member_id, name, display_name },
+             access:{ dmPolicy, dmAllowFrom?, groupPolicy?, groups?:{ "<convId>": { mode, allowFrom } } } } }
+wake:    { endpoint }                                   // claude-openmax ONLY (openmax has no wake)
+metricsReport?: { dashboardApiKey }                     // RESERVED / forward-compat — inert (no reporter yet)
+ws?:     { reconnectMaxMs?, heartbeatIntervalMs?, pingIntervalMs? }   // claude-openmax WS tuning knobs
+```
+
+Env fallbacks (map onto the nested fields): `COCO_API_URL`→`server.bff_url`,
+`COCO_WS_URL`→`server.ws_url`, `COCO_FRONTEND_BASE_PATH`→`server.frontend_base_path`,
+`COCO_API_KEY`→`agent.api_key`, `COCO_DEVICE_ID`→`agent.device_id`,
+`COCO_CLIENT_VERSION`→`agent.app_version`, `COCO_ORG_ID`→default org. Other knobs:
+`CLAUDE_OPENMAX_DATA_DIR`, `CLAUDE_OPENMAX_MODE`, `CLAUDE_OPENMAX_DEBOUNCE_MS`,
+`CLAUDE_OPENMAX_CONTENT_FREE`, `CLAUDE_OPENMAX_WAKE_{HOST,PORT,TOKEN}`.
+
+**`orgs` is keyed by `org_id`** (openmax-style), end to end: the SDK orchestrator
+keys its per-org runtime records by `org_id` too, so the adapter hands it an
+`org_id`-keyed map directly — there is no separate per-org key to derive. Every
+self-healing write-back (`self.member_id`, `self.name`, owner bind) resolves the
+org by `org_id` and lands back in the `org_id`-keyed on-disk structure.
+
+**`agent.identity_id`** is the agent's global identity. Leave it empty and the
+adapter resolves it from cws-core `GET /me` at startup and caches it back to
+`config.json`. It is the `leadAgentId` for the guided-autonomy flow (an Issue's
+Lead agent = the agent itself).
+
+**`server.frontend_base_path`** is wired into the SDK's `CwsHttpClient.frontendUrl()`
+so the agent can build clickable workspace links (`<bff_url><frontend_base_path>/…`,
+default `/workspace`).
+
+### Migrating from the openmax (`zylos-openmax`) component
+
+The claude-openmax config is now **structurally identical** to the openmax
+component's `config.json` — you can drop an openmax config in as-is. The only
+differences are additive and claude-openmax-specific:
+
+- **`wake.endpoint`** — required for the split-topology bridge; openmax has no wake block.
+- **`metricsReport`** — accepted for parity but **inert** (claude-openmax has no
+  metrics reporter yet); it round-trips untouched.
+- **`ws`** — optional WS tuning knobs (`reconnectMaxMs`, `heartbeatIntervalMs`,
+  `pingIntervalMs`) that openmax hardcodes; `ws_url`/`device_id`/`app_version` live
+  under `server.*`/`agent.*`, NOT here.
+
+The **old** claude-openmax shape (top-level `http`/`auth` + an **array** `orgs`) is
+still accepted: it is translated to the new shape on load with a one-time warning,
+so an existing live config won't break — but you should migrate it.
+
+**Session files auto-migrate.** Per-org state (incl. the `/sync` cursor) is now
+keyed by `org_id` (`sessions/<org_id>.json`), where earlier builds used a derived
+slug (`sessions/<slug>.json`). On first load, if only a legacy `sessions/<slug>.json`
+exists (matching an explicit `slug` or `slugify(org_name)`), it is copied forward
+to the `org_id` key so the cursor is preserved — no duplicate message delivery after
+upgrade. The old file is left in place (harmless); no manual step is needed.
+
+Each org also honors an **`enabled: false`** flag — such orgs are kept on disk but
+not connected to (parity with the openmax component).
 
 ## Verified vs. spike (honesty ledger)
 

@@ -41,6 +41,10 @@ async function main() {
   const runtimeState = createEmptyRuntimeState();
   const runtime = buildRuntime({ config, file, storage, logger });
 
+  // Resolve + cache the agent's global identity_id (from config or /me). Best-
+  // effort and non-blocking: leadAgentId for the guided-autonomy flow == this.
+  runtime.resolveIdentityId().catch(() => {});
+
   // ── MCP channel (claude/channel push + tools) ──────────────────────────────
   const debounceMs = Number(process.env.CLAUDE_OPENMAX_DEBOUNCE_MS || '0');
   const channel = new ClaudeChannel({
@@ -90,9 +94,9 @@ async function main() {
       storage,
       runtimeState,
       logger,
-      // thread cf_access so the WS handshake gets CF-Access headers from the
-      // config file too (env COCO_CF_ACCESS_* still takes precedence).
-      wsConfig: { ...config.ws, cf_access: config.cf_access },
+      // WS config (ws_url + device_id + app_version + cf_access + tuning) is
+      // assembled by buildRuntime from server.* / agent.* / ws.* / cf_access.
+      wsConfig: runtime.wsConfig,
     });
     // Re-register tools now that comm_send can reach the bridge.
     const withBridge = createMcpTools({

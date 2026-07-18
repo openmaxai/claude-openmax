@@ -23,7 +23,9 @@ const PKG_VERSION = '0.1.0-alpha.0';
  * @param {object} params.storage          StorageProvider
  * @param {object} params.runtimeState     RuntimeStateProvider
  * @param {object} params.logger
- * @param {object} params.wsConfig         normalized config.ws
+ * @param {object} params.wsConfig         runtime.wsConfig — { baseUrl (server.ws_url),
+ *        deviceId (agent.device_id), clientVersion (agent.app_version), cf_access,
+ *        reconnectMaxMs?, heartbeatIntervalMs?, pingIntervalMs? }
  * @returns {CwsAgentBridge}
  */
 export function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {

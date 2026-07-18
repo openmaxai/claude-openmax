@@ -49,6 +49,10 @@ async function main() {
   const storage = createFileStorage();
   const runtime = buildRuntime({ config, file, storage, logger });
 
+  // Resolve + cache the agent's global identity_id (from config or /me). Best-
+  // effort and non-blocking: leadAgentId for the guided-autonomy flow == this.
+  runtime.resolveIdentityId().catch(() => {});
+
   const inbound = createInboundDelivery({
     wake: (wakeReq) => httpWake(endpoint, token, wakeReq),
     logger,
@@ -60,7 +64,8 @@ async function main() {
     storage,
     runtimeState: createEmptyRuntimeState(),
     logger,
-    wsConfig: config.ws,
+    // WS config (ws_url + device_id + app_version + cf_access + tuning).
+    wsConfig: runtime.wsConfig,
   });
 
   await bridge.start();
