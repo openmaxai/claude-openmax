@@ -21,6 +21,11 @@ export function createStderrLogger(prefix = '[claude-openmax]') {
   };
   return {
     info: (...a) => emit('INFO', a),
+    // The SDK's RPC logger calls logger.log(...); without this method the very
+    // first token exchange throws "this._logger.log is not a function". RPC
+    // logging is gated operator-side by COCO_RPC_LOG (set =0 to silence — e.g.
+    // to keep api_key/JWTs out of logs).
+    log: (...a) => emit('LOG', a),
     warn: (...a) => emit('WARN', a),
     error: (...a) => emit('ERROR', a),
     debug: () => {},

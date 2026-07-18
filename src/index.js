@@ -90,7 +90,9 @@ async function main() {
       storage,
       runtimeState,
       logger,
-      wsConfig: config.ws,
+      // thread cf_access so the WS handshake gets CF-Access headers from the
+      // config file too (env COCO_CF_ACCESS_* still takes precedence).
+      wsConfig: { ...config.ws, cf_access: config.cf_access },
     });
     // Re-register tools now that comm_send can reach the bridge.
     const withBridge = createMcpTools({
