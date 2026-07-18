@@ -146,8 +146,8 @@ Env fallbacks (map onto the nested fields): `COCO_API_URL`→`server.bff_url`,
 
 **`orgs` is keyed by `org_id`** (openmax-style), but the SDK orchestrator keys its
 per-org runtime records by a `slug`. The adapter bridges the two: it derives a
-stable slug per org (explicit `slug` > slugified `org_name` > `org_id`) and exposes
-a slug-keyed map to the SDK, while every self-healing write-back (`self.member_id`,
+stable, unique slug per org (explicit `slug` > `org_id`; never `org_name`, which
+can collide) and exposes a slug-keyed map to the SDK, while every self-healing write-back (`self.member_id`,
 `self.name`, owner bind) lands back in the `org_id`-keyed on-disk structure.
 
 **`agent.identity_id`** is the agent's global identity. Leave it empty and the

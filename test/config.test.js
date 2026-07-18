@@ -6,7 +6,6 @@ import path from 'node:path';
 
 import {
   normalizeConfig,
-  slugify,
   deriveSlug,
   buildRuntime,
   resolveAndCacheIdentityId,
@@ -51,18 +50,19 @@ function newShape(over = {}) {
 }
 
 // ── slug derivation ────────────────────────────────────────────────────────────
-test('slugify: lowercases, strips punctuation, collapses to dashes', () => {
-  assert.equal(slugify('Acme Corp'), 'acme-corp');
-  assert.equal(slugify('  Hello, World!  '), 'hello-world');
-  assert.equal(slugify('***'), '');
+test('deriveSlug: explicit slug > org_id (never org_name)', () => {
+  assert.equal(deriveSlug({ slug: 'explicit', org_name: 'Acme', org_id: 'id1' }, 'id1'), 'explicit');
+  assert.equal(deriveSlug({ org_name: 'Acme Corp', org_id: 'id1' }, 'id1'), 'id1'); // org_name ignored
+  assert.equal(deriveSlug({ org_id: 'id1' }, 'id1'), 'id1');
+  assert.equal(deriveSlug({}, 'keyed-id'), 'keyed-id');                             // uses the map key
 });
 
-test('deriveSlug: explicit slug > slugified org_name > org_id', () => {
-  assert.equal(deriveSlug({ slug: 'explicit', org_name: 'Acme', org_id: 'id1' }, 'id1'), 'explicit');
-  assert.equal(deriveSlug({ org_name: 'Acme Corp', org_id: 'id1' }, 'id1'), 'acme-corp');
-  assert.equal(deriveSlug({ org_id: 'id1' }, 'id1'), 'id1');
-  assert.equal(deriveSlug({ org_name: '***', org_id: 'id1' }, 'id1'), 'id1'); // unslugable name falls back
-  assert.equal(deriveSlug({}, 'keyed-id'), 'keyed-id');                        // uses the map key
+test('deriveSlug: two orgs with the SAME org_name get DISTINCT slugs (no collision)', () => {
+  const a = deriveSlug({ org_name: 'My Workspace', org_id: '019f-aaaa' }, '019f-aaaa');
+  const b = deriveSlug({ org_name: 'My Workspace', org_id: '019f-bbbb' }, '019f-bbbb');
+  assert.notEqual(a, b);
+  assert.equal(a, '019f-aaaa');
+  assert.equal(b, '019f-bbbb');
 });
 
 // ── new-shape parsing ──────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ test('normalizeConfig: parses new openmax-mirrored shape', () => {
   // orgs normalized to an internal ARRAY with a derived slug
   assert.equal(c.orgs.length, 1);
   assert.equal(c.orgs[0].org_id, 'org-uuid-1');
-  assert.equal(c.orgs[0].slug, 'acme-corp');
+  assert.equal(c.orgs[0].slug, 'org-uuid-1'); // slug = org_id (org_name NOT used)
   assert.equal(c.orgs[0].slugExplicit, false);
 });
 
@@ -156,10 +156,10 @@ test('buildRuntime: loadConfig() returns a SLUG-keyed org map (SDK expectation)'
   const config = normalizeConfig(newShape(), { logger: silentLogger });
   const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger, httpClient: {} });
   const loaded = rt.callbacks.loadConfig();
-  assert.deepEqual(Object.keys(loaded.orgs), ['acme-corp']);
-  assert.equal(loaded.orgs['acme-corp'].org_id, 'org-uuid-1');
-  // orgConfigs handed to the SDK carry both slug and org_id
-  assert.equal(rt.orgConfigs[0].slug, 'acme-corp');
+  assert.deepEqual(Object.keys(loaded.orgs), ['org-uuid-1']);
+  assert.equal(loaded.orgs['org-uuid-1'].org_id, 'org-uuid-1');
+  // orgConfigs handed to the SDK carry both slug (= org_id here) and org_id
+  assert.equal(rt.orgConfigs[0].slug, 'org-uuid-1');
   assert.equal(rt.orgConfigs[0].org_id, 'org-uuid-1');
 });
 
@@ -203,7 +203,7 @@ test('buildRuntime: onOwnerBind persists owner into the org_id-keyed disk file',
   const file = tmpFile();
   const config = normalizeConfig(newShape(), { logger: silentLogger });
   const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger, httpClient: {} });
-  rt.callbacks.onOwnerBind('acme-corp', 'OWNER-9', 'Alice');
+  rt.callbacks.onOwnerBind('org-uuid-1', 'OWNER-9', 'Alice');
   const disk = readJSON(file);
   assert.equal(disk.orgs['org-uuid-1'].owner.member_id, 'OWNER-9');
   assert.equal(disk.orgs['org-uuid-1'].owner.name, 'Alice');

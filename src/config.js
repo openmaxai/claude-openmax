@@ -29,8 +29,8 @@
  *     "<org_id>": {
  *       "enabled":  true,
  *       "org_id":   "<org_id>",
- *       "org_name": "Acme",                                // display only; slug source
- *       "slug":     "acme",                                // OPTIONAL explicit slug override
+ *       "org_name": "Acme",                                // display label only
+ *       "slug":     "acme",                                // OPTIONAL explicit slug (else org_id is used)
  *       "owner":    { "member_id": "", "name": "" },
  *       "self":     { "member_id": "", "name": "", "display_name": "" },
  *       "access":   { "dmPolicy": "owner", "dmAllowFrom": [],
@@ -47,9 +47,9 @@
  * The on-disk `orgs` map is keyed by org_id (openmax-style). The SDK
  * orchestrator, however, keys its per-org runtime records by a `slug`
  * (`for (const [slug, rec] of this._orgs)`, `loadConfig().orgs?.[slug]`).
- * `normalizeConfig` therefore derives a stable `slug` per org — an explicit
- * `slug` wins, else a slugified `org_name`, else the org_id — and `buildRuntime`
- * bridges the two: the SDK sees slug-keyed orgs while every write-back
+ * `normalizeConfig` therefore derives a stable, UNIQUE `slug` per org — an
+ * explicit `slug` wins, else the org_id (never org_name, which can collide) —
+ * and `buildRuntime` bridges the two: the SDK sees slug-keyed orgs while every write-back
  * (member_id via onMemberId, self.name via syncSelf, owner bind) lands back in
  * the org_id-keyed on-disk structure via persist().
  *
@@ -97,26 +97,17 @@ export function loadAdapterConfig(explicitPath) {
 }
 
 /**
- * Slugify a human string into a stable, URL/path-safe slug. Returns '' when the
- * input has no slug-able characters (caller then falls back to org_id).
- */
-export function slugify(s) {
-  return String(s ?? '')
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-/**
- * Derive a stable slug for an org record. Priority: explicit `slug` > slugified
- * `org_name` > the org_id (map key). Deterministic, so it is stable across
- * restarts as long as those inputs are stable.
+ * Derive a stable, UNIQUE slug for an org record. Priority: an explicit `slug`
+ * (operator-supplied, they own uniqueness) > the org_id (the map key).
+ *
+ * We deliberately do NOT derive the slug from `org_name`: org_name is a display
+ * label with no uniqueness guarantee, so two orgs with the same/similar name
+ * would collapse to the same slug and clobber each other in the orchestrator's
+ * slug-keyed `_orgs` map. org_id is a UUID — unique and stable by construction —
+ * so it is the correct fallback (and matches openmax keying orgs by org_id).
  */
 export function deriveSlug(org, orgIdKey) {
   if (org?.slug) return String(org.slug);
-  const fromName = slugify(org?.org_name);
-  if (fromName) return fromName;
   return String(org?.org_id || orgIdKey || '');
 }
 
