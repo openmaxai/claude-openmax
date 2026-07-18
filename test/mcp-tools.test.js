@@ -23,8 +23,74 @@ test('dispatch: {method:"list"} enumerates callable verbs (excludes private)', a
   const { handler } = createMcpTools({ services: fakeServices() });
   const res = await handler('tm', { method: 'list' });
   const body = parse(res);
-  assert.ok(body.methods.includes('issueCreate'));
-  assert.ok(!body.methods.includes('_secret'));
+  const names = body.methods.map((m) => m.name);
+  assert.ok(names.includes('issueCreate'));
+  assert.ok(!names.includes('_secret'));
+});
+
+test('dispatch: {method:"list"} returns per-method field schemas from the ops docs', async () => {
+  const { handler } = createMcpTools({ services: fakeServices() });
+  const body = parse(await handler('tm', { method: 'list' }));
+  const issueCreate = body.methods.find((m) => m.name === 'issueCreate');
+  // Each method entry carries a params[] of {name, required, description}.
+  assert.ok(Array.isArray(issueCreate.params));
+  const byName = Object.fromEntries(issueCreate.params.map((p) => [p.name, p]));
+  // Required-ness reflects what cws-core validates.
+  assert.equal(byName.projectId.required, true);
+  assert.equal(byName.ownerMemberId.required, true);
+  assert.equal(byName.backlog.required, false);
+  assert.ok(typeof byName.projectId.description === 'string' && byName.projectId.description.length > 0);
+});
+
+test('dispatch: {method:"list"} returns a per-method PURPOSE summary', async () => {
+  const { handler } = createMcpTools({ services: fakeServices() });
+  const body = parse(await handler('tm', { method: 'list' }));
+  const issueCreate = body.methods.find((m) => m.name === 'issueCreate');
+  // The summary is the "what it does / when to use" line, distinct from params.
+  assert.ok(typeof issueCreate.summary === 'string' && issueCreate.summary.length > 0);
+  // It names the non-obvious semantics (owner = the acceptor).
+  assert.match(issueCreate.summary, /owner/i);
+});
+
+test('dispatch: {method:"list"} summaries disambiguate near-synonyms', async () => {
+  const services = {
+    kb: { pageUpdate: async () => ({}), pageContentWrite: async () => ({}) },
+    tm: { taskClaim: async () => ({}), taskStart: async () => ({}) },
+  };
+  const { handler } = createMcpTools({ services });
+  const kb = parse(await handler('kb', { method: 'list' })).methods;
+  const pageUpdate = kb.find((m) => m.name === 'pageUpdate');
+  const pageContentWrite = kb.find((m) => m.name === 'pageContentWrite');
+  // pageUpdate = metadata only; pageContentWrite = the body.
+  assert.match(pageUpdate.summary, /metadata|title\/path/i);
+  assert.match(pageContentWrite.summary, /body/i);
+  const tm = parse(await handler('tm', { method: 'list' })).methods;
+  // claim = ownership only; start = begin work.
+  assert.match(tm.find((m) => m.name === 'taskClaim').summary, /claim|ownership/i);
+  assert.match(tm.find((m) => m.name === 'taskStart').summary, /begin|running|execut/i);
+});
+
+test('dispatch: {method:"list"} flags SDK-vs-docs field divergences via note', async () => {
+  const services = { kb: { pageUpdate: async () => ({}), search: async () => ({}) } };
+  const { handler } = createMcpTools({ services });
+  const body = parse(await handler('kb', { method: 'list' }));
+  const pageUpdate = body.methods.find((m) => m.name === 'pageUpdate');
+  assert.ok(pageUpdate.note && /pageContentWrite/.test(pageUpdate.note));
+});
+
+test('dispatch tool description inlines high-frequency method signatures', () => {
+  const { defs } = createMcpTools({ services: fakeServices() });
+  const tm = defs.find((d) => d.name === 'tm');
+  // `*` marks required, `?` marks optional — the agent can read the shape without a call.
+  assert.match(tm.description, /issueCreate\(projectId\*, title\*, leadAgentId\*, ownerMemberId\*/);
+});
+
+test('static description tags each highlight signature with a purpose gloss', () => {
+  const { defs } = createMcpTools({ services: fakeServices() });
+  const tm = defs.find((d) => d.name === 'tm');
+  // The `— <few words>` gloss names the verb's purpose without a `list` call.
+  assert.match(tm.description, /issueCreate\([^)]*\) — create issue w\/ owner=acceptor/);
+  assert.match(tm.description, /attemptTransition\([^)]*\) — generic state-machine transition/);
 });
 
 test('dispatch: valid method calls the service with params', async () => {
