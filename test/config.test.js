@@ -238,3 +238,88 @@ test('buildRuntime: resolveIdentityId caches identity_id to the org_id-keyed dis
   const disk = readJSON(file);
   assert.equal(disk.agent.identity_id, 'agent-xyz');
 });
+
+// ── P0: config file written 0o600 (secrets protection) ─────────────────────────
+test('persist() writes the config file 0o600 (secrets not world-readable)', () => {
+  const file = tmpFile();
+  const config = normalizeConfig(newShape(), { logger: silentLogger });
+  const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger, httpClient: {} });
+  rt.applyMemberId('org-uuid-1', 'MEMBER-123'); // triggers persist()
+  const mode = fs.statSync(file).mode & 0o777;
+  assert.equal(mode, 0o600, `config file mode should be 0o600, got 0o${mode.toString(8)}`);
+});
+
+// ── P2a: cfAccess is passed to the SDK in the WRAPPED { cf_access } shape ───────
+test('buildRuntime wraps cf_access as { cf_access } for the SDK (CF-Access headers work)', () => {
+  const file = tmpFile();
+  const config = normalizeConfig(newShape(), { logger: silentLogger });
+  // no httpClient injected → real CwsHttpClient, whose _cfAccess we inspect
+  const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger });
+  assert.deepEqual(rt.http._cfAccess, { cf_access: { client_id: 'cid', client_secret: 'sec' } });
+});
+
+test('buildRuntime passes cfAccess=undefined when cf_access is absent', () => {
+  const file = tmpFile();
+  const raw = newShape(); delete raw.cf_access;
+  const config = normalizeConfig(raw, { logger: silentLogger });
+  const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger });
+  assert.equal(rt.http._cfAccess, undefined);
+});
+
+// ── P2b: enabled:false orgs are filtered from the SDK-facing views (but kept on disk) ──
+test('enabled:false orgs excluded from loadConfig/orgConfigs but preserved by persist', () => {
+  const file = tmpFile();
+  const raw = newShape();
+  raw.orgs['org-uuid-2'] = {
+    enabled: false, org_id: 'org-uuid-2', org_name: 'Disabled Org',
+    owner: { member_id: '', name: '' }, self: { member_id: '', name: '', display_name: '' }, access: {},
+  };
+  const config = normalizeConfig(raw, { logger: silentLogger });
+  const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger, httpClient: {} });
+  // SDK-facing views: enabled org only
+  assert.deepEqual(Object.keys(rt.callbacks.loadConfig().orgs), ['org-uuid-1']);
+  assert.deepEqual(rt.orgConfigs.map((o) => o.org_id), ['org-uuid-1']);
+  assert.deepEqual(rt.configProvider.enabledOrgs().map((o) => o.org_id), ['org-uuid-1']);
+  // persist keeps BOTH (disabled org not dropped from disk)
+  rt.persist();
+  assert.deepEqual(Object.keys(readJSON(file).orgs).sort(), ['org-uuid-1', 'org-uuid-2']);
+});
+
+// ── P1: legacy session files migrated forward slug→org_id (cursor preserved) ────
+function memStorage(initial = {}) {
+  const files = { ...initial };
+  return { files, get: async (k) => (k in files ? files[k] : null), set: async (k, v) => { files[k] = v; } };
+}
+const sessKey = (k) => path.join('sessions', `${k}.json`);
+
+test('loadSession migrates a legacy explicit-slug session forward to org_id', async () => {
+  const file = tmpFile();
+  const raw = newShape();
+  raw.orgs['org-uuid-1'].slug = 'team-alpha'; // explicit legacy slug
+  const config = normalizeConfig(raw, { logger: silentLogger });
+  const storage = memStorage({ [sessKey('team-alpha')]: JSON.stringify({ cursor: 42 }) });
+  const rt = buildRuntime({ config, file, storage, logger: silentLogger, httpClient: {} });
+  const session = await rt.callbacks.loadSession('org-uuid-1');
+  assert.deepEqual(session, { cursor: 42 });                 // legacy content returned
+  assert.equal(storage.files[sessKey('org-uuid-1')], JSON.stringify({ cursor: 42 })); // copied forward
+});
+
+test('loadSession migrates a legacy slugify(org_name) session forward to org_id', async () => {
+  const file = tmpFile();
+  const config = normalizeConfig(newShape(), { logger: silentLogger }); // org_name "Acme Corp" → acme-corp
+  const storage = memStorage({ [sessKey('acme-corp')]: JSON.stringify({ cursor: 7 }) });
+  const rt = buildRuntime({ config, file, storage, logger: silentLogger, httpClient: {} });
+  assert.deepEqual(await rt.callbacks.loadSession('org-uuid-1'), { cursor: 7 });
+  assert.equal(storage.files[sessKey('org-uuid-1')], JSON.stringify({ cursor: 7 }));
+});
+
+test('loadSession prefers an existing org_id session over any legacy file', async () => {
+  const file = tmpFile();
+  const config = normalizeConfig(newShape(), { logger: silentLogger });
+  const storage = memStorage({
+    [sessKey('org-uuid-1')]: JSON.stringify({ cursor: 100 }),
+    [sessKey('acme-corp')]: JSON.stringify({ cursor: 1 }),
+  });
+  const rt = buildRuntime({ config, file, storage, logger: silentLogger, httpClient: {} });
+  assert.deepEqual(await rt.callbacks.loadSession('org-uuid-1'), { cursor: 100 }); // no clobber
+});

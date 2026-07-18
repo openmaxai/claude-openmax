@@ -176,6 +176,16 @@ The **old** claude-openmax shape (top-level `http`/`auth` + an **array** `orgs`)
 still accepted: it is translated to the new shape on load with a one-time warning,
 so an existing live config won't break — but you should migrate it.
 
+**Session files auto-migrate.** Per-org state (incl. the `/sync` cursor) is now
+keyed by `org_id` (`sessions/<org_id>.json`), where earlier builds used a derived
+slug (`sessions/<slug>.json`). On first load, if only a legacy `sessions/<slug>.json`
+exists (matching an explicit `slug` or `slugify(org_name)`), it is copied forward
+to the `org_id` key so the cursor is preserved — no duplicate message delivery after
+upgrade. The old file is left in place (harmless); no manual step is needed.
+
+Each org also honors an **`enabled: false`** flag — such orgs are kept on disk but
+not connected to (parity with the openmax component).
+
 ## Verified vs. spike (honesty ledger)
 
 **Verified locally (`node --test` + MCP client smoke):**

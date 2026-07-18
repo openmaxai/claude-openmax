@@ -73,6 +73,17 @@ import {
 const DEFAULT_APP_VERSION = 'claude-openmax/0.1.0';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 
+/**
+ * MIGRATION-ONLY slugify. Before the org_id-keying refactor, per-org session
+ * files were keyed by a derived slug (`explicit slug || slugify(org_name) ||
+ * org_id`). This reproduces that derivation solely so `loadSession` can migrate
+ * a legacy `sessions/<slug>.json` forward to `sessions/<org_id>.json` — it is NOT
+ * used for any live keying (org_id is the only runtime key now).
+ */
+function legacySlugify(s) {
+  return String(s ?? '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
 export function resolveConfigPath(explicit) {
   return explicit
     || process.env.CLAUDE_OPENMAX_CONFIG
@@ -181,6 +192,9 @@ export function normalizeConfig(raw, { logger } = {}) {
       owner: org.owner || { member_id: '', name: '' },
       self: org.self || { member_id: '', name: '', display_name: '' },
       access: org.access || {},
+      // Migration hint only (NOT persisted — serializeOrg omits it): the explicit
+      // pre-refactor slug, used by loadSession to find a legacy session file.
+      ...(org.slug ? { _legacySlug: String(org.slug) } : {}),
     });
   }
 
@@ -299,7 +313,11 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
       };
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const tmp = `${file}.tmp-${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify(out, null, 2));
+      // 0o600: the config holds secrets (agent.api_key, cf_access.client_secret).
+      // A plain writeFileSync defaults to 0o644 and would rewrite the file
+      // world-readable on every self-healing write-back (member_id / owner bind /
+      // identity_id cache / config events) — a credential-exposure regression.
+      fs.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 0o600 });
       fs.renameSync(tmp, file);
     } catch (e) {
       logger?.warn?.(`config persist failed: ${e.message}`);
@@ -307,7 +325,11 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
   };
 
   const orgByOrgId = (id) => state.orgs.find((o) => o.org_id === id);
-  const resolveDefaultOrgId = () => state.orgs[0]?.org_id || process.env.COCO_ORG_ID || '';
+  // Orgs the runtime should actually connect to: `enabled: false` opts an org out
+  // (mirrors the openmax component). `state.orgs` keeps ALL orgs so persist() never
+  // drops a disabled one from disk; only the SDK-facing views are filtered.
+  const activeOrgs = () => state.orgs.filter((o) => o.enabled !== false);
+  const resolveDefaultOrgId = () => activeOrgs()[0]?.org_id || process.env.COCO_ORG_ID || '';
 
   // Self-healing member_id write-back: when the SDK resolves the agent's per-org
   // member_id (from the JWT claim), stash it into the org's `self` block and
@@ -323,10 +345,16 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     return false;
   };
 
+  // The SDK's cfAccessHeaders() reads `cfAccess.cf_access.{client_id,client_secret}`
+  // (WRAPPED). `state.cf_access` is the bare { client_id, client_secret } block,
+  // so it must be wrapped as { cf_access: ... } — passing it bare makes the SDK
+  // read `.cf_access` off the wrong object and emit EMPTY CF-Access headers.
+  const cfAccessWrapped = state.cf_access ? { cf_access: state.cf_access } : undefined;
+
   const tokenManager = new TokenManager({
     apiKey: state.agent.api_key,
     coreUrl: state.server.bff_url,
-    cfAccess: state.cf_access,
+    cfAccess: cfAccessWrapped,
     storage,
     resolveDefaultOrgId,
     onMemberId: applyMemberId,
@@ -338,7 +366,7 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     apiKey: state.agent.api_key,
     deviceId: state.agent.device_id,
     clientVersion: state.agent.app_version,
-    cfAccess: state.cf_access,
+    cfAccess: cfAccessWrapped,
     // Wire the SDK's built-in frontend-link builder (frontendUrl(p)) to the
     // configured SPA mount point — enables clickable /workspace links.
     frontendBasePath: state.server.frontend_base_path,
@@ -349,7 +377,7 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
 
   // Config provider for the config-coupled service methods (comm dm_* / owner).
   const configProvider = {
-    enabledOrgs: () => state.orgs.slice(),
+    enabledOrgs: () => activeOrgs(),
     getOrgByOrgId: orgByOrgId,
     updateConfig: (fn) => {
       const cfg = { orgs: Object.fromEntries(state.orgs.map((o) => [o.org_id, o])) };
@@ -376,13 +404,35 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
 
   // ── SDK callbacks ─────────────────────────────────────────────────────────
   // The SDK keys per-org runtime records by org_id — hand it the same
-  // org_id-keyed view of the on-disk store.
-  const loadConfig = () => ({ orgs: Object.fromEntries(state.orgs.map((o) => [o.org_id, o])) });
+  // org_id-keyed view of the on-disk store (enabled orgs only).
+  const loadConfig = () => ({ orgs: Object.fromEntries(activeOrgs().map((o) => [o.org_id, o])) });
+
+  // Legacy per-org session keys (pre org_id-keying): explicit slug, else
+  // slugify(org_name). org_id itself is excluded (that's the new key).
+  const legacySessionKeys = (orgId) => {
+    const org = orgByOrgId(orgId);
+    if (!org) return [];
+    return [org._legacySlug, legacySlugify(org.org_name)].filter((k) => k && k !== orgId);
+  };
 
   const loadSession = async (orgId) => {
     try {
       const raw = await storage.get(path.join('sessions', `${orgId}.json`));
-      return raw ? JSON.parse(raw) : {};
+      if (raw) return JSON.parse(raw);
+      // One-time forward-migration: before the org_id-keying refactor, sessions
+      // were stored as `sessions/<slug>.json`. If a legacy-keyed session exists,
+      // copy it to the org_id key so the `/sync` cursor survives the upgrade —
+      // otherwise the cursor resets and already-delivered messages get re-fetched
+      // (duplicate delivery). Copy-forward only; the old file is left in place.
+      for (const legacy of legacySessionKeys(orgId)) {
+        const old = await storage.get(path.join('sessions', `${legacy}.json`));
+        if (old != null) {
+          await storage.set(path.join('sessions', `${orgId}.json`), old);
+          logger?.info?.(`migrated session sessions/${legacy}.json → sessions/${orgId}.json`);
+          return JSON.parse(old);
+        }
+      }
+      return {};
     } catch { return {}; }
   };
   const saveSession = async (orgId, partial) => {
@@ -450,7 +500,8 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     http,
     tokenManager,
     services,
-    orgConfigs: state.orgs,
+    // enabled orgs only — the SDK connects to what's here; `enabled:false` opts out.
+    orgConfigs: activeOrgs(),
     callbacks,
     persist,
     resolveDefaultOrgId,
