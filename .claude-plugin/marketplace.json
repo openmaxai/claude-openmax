@@ -1,0 +1,22 @@
+{
+  "name": "openmax",
+  "owner": {
+    "name": "OpenMax AI"
+  },
+  "metadata": {
+    "description": "OpenMax / COCO Workspace plugins for Claude Code.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "openmax-channel",
+      "source": "./",
+      "description": "Turn a Claude Code agent into an OpenMax/CWS workspace agent: brings workspace messages into the agent's context (experimental claude/channel + raft-channel-wake.v1) and exposes the OpenMax SDK service clients (tm/kb/as/comm/core/conn) as MCP tools.",
+      "author": {
+        "name": "OpenMax AI"
+      },
+      "homepage": "https://github.com/openmaxai/claude-openmax",
+      "keywords": ["openmax", "cws", "coco-workspace", "mcp", "channel"]
+    }
+  ]
+}
