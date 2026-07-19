@@ -12,6 +12,7 @@
  */
 
 import { buildSessionStartOutput } from './orientation.js';
+import { ensureRegistered } from './auto-register.js';
 
 const STDIN_TIMEOUT_MS = 3000;
 
@@ -29,6 +30,8 @@ async function main() {
   const input = await readStdin(STDIN_TIMEOUT_MS);
   let payload;
   try { payload = JSON.parse(input); } catch { return; }
+  // Auto-register on first session (idempotent, best-effort — never throws).
+  await ensureRegistered().catch(() => undefined);
   const out = buildSessionStartOutput(payload);
   if (out) process.stdout.write(out + '\n');
 }
