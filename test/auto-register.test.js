@@ -103,3 +103,51 @@ test('when an invite block is present, also accepts the invitation and clears it
   assert.equal(cfg.invite, undefined, 'one-time invite block should be cleared after accept');
   assert.equal(existsSync(cfgPath), true);
 });
+
+test('legacy-shape config: writes the key where the runtime reads it (auth.apiKey)', async () => {
+  // Legacy marker: top-level `auth`. Runtime translateLegacy() reads api_key from auth.apiKey.
+  const cfgPath = seedConfig({ auth: {}, agent: { identity_id: '', api_key: '' } });
+  const wrote = await runWith(cfgPath, () => withFetch(
+    (url) => url.endsWith('/auth/register/agent') ? jsonRes(200, { identity_id: 'id-L', api_key: 'cwsk_legacy' }) : jsonRes(404, {}),
+    () => ensureRegistered(),
+  ));
+  assert.equal(wrote, true);
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  assert.equal(cfg.auth.apiKey, 'cwsk_legacy', 'legacy runtime reads auth.apiKey');
+  assert.equal(cfg.agent.api_key, 'cwsk_legacy');
+});
+
+test('legacy-shape config already keyed in auth.apiKey is idempotent (no re-register)', async () => {
+  const cfgPath = seedConfig({ auth: { apiKey: 'cwsk_existing' }, agent: { api_key: '' } });
+  const wrote = await runWith(cfgPath, () => withFetch(
+    () => { throw new Error('fetch must not be called — already registered via auth.apiKey'); },
+    (calls) => ensureRegistered().then((w) => { assert.equal(calls.length, 0); return w; }),
+  ));
+  assert.equal(wrote, false);
+});
+
+test('accepts an invitation even when api_key already exists (retry across sessions)', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have', identity_id: 'id-x' }, invite: { invitation_id: 'inv-9', token: 'tok-9' } });
+  const wrote = await runWith(cfgPath, () => withFetch((url) => {
+    if (url.endsWith('/auth/register/agent')) throw new Error('must NOT register when key exists');
+    if (url.endsWith('/auth/agent/token')) return jsonRes(200, { access_token: 'acc-9' });
+    if (url.includes('/invitations/inv-9/accept')) return jsonRes(200, { ok: true });
+    return jsonRes(404, {});
+  }, (calls) => ensureRegistered().then((w) => {
+    assert.ok(calls.some((c) => c.url.includes('/invitations/inv-9/accept')), 'should accept the invitation');
+    assert.ok(!calls.some((c) => c.url.endsWith('/auth/register/agent')), 'should not re-register');
+    return w;
+  })));
+  assert.equal(wrote, false, 'no new registration credentials were written');
+  assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).invite, undefined, 'invite cleared after accept');
+});
+
+test('invite is NOT cleared when acceptance fails (so it retries next session)', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' }, invite: { invitation_id: 'inv-f', token: 'tok-f' } });
+  await runWith(cfgPath, () => withFetch((url) => {
+    if (url.endsWith('/auth/agent/token')) return jsonRes(200, { access_token: 'acc' });
+    if (url.includes('/invitations/inv-f/accept')) return jsonRes(500, { error: 'boom' });
+    return jsonRes(404, {});
+  }, () => ensureRegistered()));
+  assert.deepEqual(JSON.parse(readFileSync(cfgPath, 'utf8')).invite, { invitation_id: 'inv-f', token: 'tok-f' }, 'invite retained on failure');
+});

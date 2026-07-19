@@ -30,10 +30,13 @@ async function main() {
   const input = await readStdin(STDIN_TIMEOUT_MS);
   let payload;
   try { payload = JSON.parse(input); } catch { return; }
-  // Auto-register on first session (idempotent, best-effort — never throws).
-  await ensureRegistered().catch(() => undefined);
+  // Emit orientation FIRST so network work can never delay/starve it past the
+  // SessionStart hook timeout.
   const out = buildSessionStartOutput(payload);
   if (out) process.stdout.write(out + '\n');
+  // Auto-register on first session (idempotent, best-effort, never throws), with
+  // a total network budget kept safely below the hook timeout (hooks.json: 10s).
+  await ensureRegistered({ deadlineMs: 8000 }).catch(() => undefined);
 }
 
 main().catch(() => undefined).finally(() => process.exit(0));
