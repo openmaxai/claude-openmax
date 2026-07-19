@@ -29,10 +29,11 @@ jobs:
           node-version: ${{ matrix.node }}
           registry-url: 'https://registry.npmjs.org'
 
-      # package-lock.json is intentionally gitignored in this repo, so `npm ci`
-      # (which requires a committed lockfile) is not usable — install fresh.
+      # Deterministic install from the committed lockfile — pins the entire tree
+      # (incl. esbuild + transitives) so the rebuilt bundle byte-matches the
+      # committed dist/.
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Run tests
         run: npm test
