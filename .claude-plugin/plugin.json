@@ -9,7 +9,7 @@
     "openmax": {
       "command": "node",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/src/index.js"
+        "${CLAUDE_PLUGIN_ROOT}/dist/index.mjs"
       ]
     }
   }

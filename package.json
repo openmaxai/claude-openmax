@@ -17,11 +17,16 @@
   "scripts": {
     "test": "node --test",
     "start": "node src/index.js",
-    "bridge": "node src/bridge.js"
+    "bridge": "node src/bridge.js",
+    "build": "node scripts/build.js",
+    "prepack": "node scripts/build.js"
   },
   "dependencies": {
-    "@openmaxai/openmax-agent-sdk": "^0.1.0-alpha.2",
-    "@modelcontextprotocol/sdk": "^1.22.0"
+    "@modelcontextprotocol/sdk": "^1.22.0",
+    "@openmaxai/openmax-agent-sdk": "^0.1.0-alpha.2"
   },
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
 }

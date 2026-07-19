@@ -127,6 +127,21 @@ claude plugin marketplace add --scope local /path/to/claude-openmax   # local ch
 # or point Claude Code at .claude-plugin/plugin.json directly
 ```
 
+## Build (maintainers)
+
+The plugin ships a **dependency-free bundle**. Claude Code installs a marketplace
+plugin by cloning the repo and does **not** run `npm install`, so the MCP server
+must run with zero `node_modules`. `scripts/build.js` (esbuild) inlines every
+dependency into `dist/index.mjs` (the MCP server, referenced by
+`.claude-plugin/plugin.json`) and `dist/bridge.mjs` (the split-topology bridge).
+
+```bash
+npm run build     # rebuild dist/ after changing src/ or bumping a dependency
+```
+
+`dist/` is committed (it is the shipped artifact); CI rebuilds it and fails if the
+committed bundle is stale, and smoke-tests that it loads with no `node_modules`.
+
 Split topology (resident bridge + channel-only plugin):
 
 ```bash

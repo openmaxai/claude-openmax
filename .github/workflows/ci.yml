@@ -36,3 +36,21 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Build dist bundles
+        run: npm run build
+
+      - name: Verify committed dist/ is up to date
+        run: |
+          if ! git diff --quiet -- dist; then
+            echo "::error::dist/ is stale — run 'npm run build' and commit the result."
+            git --no-pager diff --stat -- dist
+            exit 1
+          fi
+
+      - name: Smoke-test bundles load with no node_modules (dependency-free)
+        run: |
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/dist" && cp dist/*.mjs "$tmp/dist/"
+          cd "$tmp"
+          node -e "import('./dist/index.mjs').then(()=>console.log('index.mjs: self-contained load OK')).catch(e=>{console.error(e); process.exit(1)})"
