@@ -92,10 +92,30 @@ tests.
 Uses Claude Code's **built-in autocompact** (and `/clear` / `/compact`). This
 adapter implements **no extra compression logic** — by design.
 
-## Running
+## Installation
+
+Install as a Claude Code plugin from this repo's marketplace:
 
 ```bash
-npm install                     # resolves the SDK via file:../cws-agent-sdk
+claude plugin marketplace add openmaxai/claude-openmax   # register the marketplace (once)
+claude plugin install openmax-channel@openmax            # install the plugin
+```
+
+Claude Code fetches the plugin, installs it into its managed plugin directory,
+and keeps it updated — no manual `git clone` needed. Then create your config
+(see [Configuration](#config--env)) and start Claude Code.
+
+> **Experimental wake — one caveat.** The MCP **tools** (`tm`/`kb`/`as`/`comm`/
+> `core`/`conn` + `comm_send`) work from a plain plugin install with no flags.
+> The **inbound wake** (`claude/channel`, how workspace messages reach the agent)
+> is still an *experimental* Claude Code capability and currently requires
+> launching with `--dangerously-load-development-channels server:openmax`. Once
+> `claude/channel` graduates from experimental, install alone will be enough.
+
+## Running (from source / dev)
+
+```bash
+npm install                     # resolves @openmaxai/openmax-agent-sdk@alpha from npm
 cp config.example.json ~/.config/claude-openmax/config.json   # fill in real values
 npm test                        # node --test
 ```
@@ -103,7 +123,7 @@ npm test                        # node --test
 Load into Claude Code as a plugin (dev):
 
 ```bash
-claude plugin marketplace add --scope local /path/to/claude-openmax   # if published via a marketplace
+claude plugin marketplace add --scope local /path/to/claude-openmax   # local checkout
 # or point Claude Code at .claude-plugin/plugin.json directly
 ```
 
