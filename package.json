@@ -22,8 +22,8 @@
     "prepack": "node scripts/build.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.22.0",
-    "@openmaxai/openmax-agent-sdk": "^0.1.0-alpha.2"
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@openmaxai/openmax-agent-sdk": "0.1.0-alpha.3"
   },
   "license": "UNLICENSED",
   "devDependencies": {
