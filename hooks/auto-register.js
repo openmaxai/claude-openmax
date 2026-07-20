@@ -25,6 +25,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 const PLACEHOLDER_API_KEYS = new Set(['', 'cwsk_replace_me']);
 const DEFAULT_TOTAL_BUDGET_MS = 8000;
@@ -163,4 +164,15 @@ async function maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecr
     writeConfig0600(configPath, cfg);
     log(`invitation ${invitationId} accepted; invite block cleared`);
   } catch (e) { log(`could not clear invite block: ${e.message}`); }
+}
+
+// Standalone pre-register step: `node hooks/auto-register.js`. Lets onboarding
+// register + accept the invitation BEFORE the first real Claude Code session, so
+// the openmax MCP server comes up already-credentialed (no first-session bootstrap
+// gap). Imported as a module (by session-hook.js) this block is a no-op.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  ensureRegistered()
+    .then((wrote) => process.stderr.write(`[claude-openmax auto-register] ${wrote ? 'registered + config updated' : 'no-op (already registered / nothing to do)'}\n`))
+    .catch((e) => process.stderr.write(`[claude-openmax auto-register] error: ${e?.message || e}\n`))
+    .finally(() => process.exit(0));
 }
