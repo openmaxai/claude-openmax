@@ -24,7 +24,7 @@ export function defaultDataDir() {
 /**
  * @param {object} [opts]
  * @param {string} [opts.dataDir]  root data dir (default XDG / ~/.local/share/claude-openmax)
- * @returns {import('@openmaxai/openmax-agent-sdk').StorageProvider & {downloadDir:Function, listCredentials:Function, clearCredentials:Function, dataDir:string, sessionPath:Function}}
+ * @returns {import('@openmaxai/openmax-agent-sdk').StorageProvider & {downloadDir:Function, listCredentials:Function, clearCredentials:Function, dataDir:string, sessionPath:Function, remove:Function}}
  */
 export function createFileStorage(opts = {}) {
   const dataDir = opts.dataDir || defaultDataDir();
@@ -55,6 +55,21 @@ export function createFileStorage(opts = {}) {
       const tmp = `${file}.tmp-${process.pid}`;
       fs.writeFileSync(tmp, String(value), { mode: 0o600 });
       fs.renameSync(tmp, file);
+    },
+
+    // Delete a stored key (best-effort). Returns true if a file was removed,
+    // false if it was already absent. Never throws. Used by the stale-token-cache
+    // guard (token-guard.js) to purge a stale JWT/session/inbox before connecting.
+    async remove(key) {
+      const file = resolve(key);
+      try {
+        if (!fs.existsSync(file)) return false;
+        fs.rmSync(file, { force: true });
+        return true;
+      } catch (e) {
+        if (e.code === 'ENOENT') return false;
+        return false;
+      }
     },
 
     // AsService download target (falls back to os.tmpdir() if absent — we
