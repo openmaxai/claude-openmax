@@ -21649,7 +21649,7 @@ var CwsAgentBridge = class {
 };
 
 // src/config.js
-var DEFAULT_APP_VERSION = "claude-openmax/0.1.0";
+var DEFAULT_APP_VERSION = "claude-openmax/1.0.0";
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
 function legacySlugify(s) {
   return String(s ?? "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -25296,7 +25296,7 @@ function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
 }
 
 // src/create-bridge.js
-var PKG_VERSION = "0.1.0-alpha.0";
+var PKG_VERSION = "1.0.0";
 function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
   return new CwsAgentBridge({
     http: runtime.http,
@@ -25388,7 +25388,7 @@ function writeJson(res, status, value) {
 }
 
 // src/index.js
-var PKG_VERSION2 = "0.1.0-alpha.0";
+var PKG_VERSION2 = "1.0.0";
 async function main() {
   const logger = createStderrLogger();
   const mode = process.env.CLAUDE_OPENMAX_MODE || "inproc";
