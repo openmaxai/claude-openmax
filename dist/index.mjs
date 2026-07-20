@@ -2289,7 +2289,7 @@ var require_websocket = __commonJS({
     var http2 = __require("http");
     var net = __require("net");
     var tls = __require("tls");
-    var { randomBytes, createHash } = __require("crypto");
+    var { randomBytes, createHash: createHash2 } = __require("crypto");
     var { Duplex, Readable } = __require("stream");
     var { URL: URL2 } = __require("url");
     var PerMessageDeflate2 = require_permessage_deflate();
@@ -2957,7 +2957,7 @@ var require_websocket = __commonJS({
           abortHandshake(websocket, socket, "Invalid Upgrade header");
           return;
         }
-        const digest = createHash("sha1").update(key + GUID).digest("base64");
+        const digest = createHash2("sha1").update(key + GUID).digest("base64");
         if (res.headers["sec-websocket-accept"] !== digest) {
           abortHandshake(websocket, socket, "Invalid Sec-WebSocket-Accept header");
           return;
@@ -3326,7 +3326,7 @@ var require_websocket_server = __commonJS({
     var EventEmitter = __require("events");
     var http2 = __require("http");
     var { Duplex } = __require("stream");
-    var { createHash } = __require("crypto");
+    var { createHash: createHash2 } = __require("crypto");
     var extension2 = require_extension();
     var PerMessageDeflate2 = require_permessage_deflate();
     var subprotocol2 = require_subprotocol();
@@ -3633,7 +3633,7 @@ var require_websocket_server = __commonJS({
           );
         }
         if (this._state > RUNNING) return abortHandshake(socket, 503);
-        const digest = createHash("sha1").update(key + GUID).digest("base64");
+        const digest = createHash2("sha1").update(key + GUID).digest("base64");
         const headers = [
           "HTTP/1.1 101 Switching Protocols",
           "Upgrade: websocket",
@@ -17674,6 +17674,9 @@ async function writeApiKeyMarkers({ storage, orgIds, apiKey, logger }) {
   }
 }
 
+// node_modules/@openmaxai/openmax-agent-sdk/src/index.js
+import { createRequire } from "node:module";
+
 // node_modules/@openmaxai/openmax-agent-sdk/src/providers.js
 var consoleLogger = {
   info: (...a) => console.log(...a),
@@ -18539,6 +18542,7 @@ var CwsHttpClient = class {
 };
 
 // node_modules/@openmaxai/openmax-agent-sdk/src/transport/token.js
+import { createHash } from "node:crypto";
 var REFRESH_MARGIN_MS = 6e4;
 var LOG = "[token]";
 var REDIRECT_STATUSES2 = /* @__PURE__ */ new Set([301, 302, 303, 307, 308]);
@@ -18588,6 +18592,10 @@ function toMs(val) {
   if (!val) return 0;
   if (typeof val === "number") return val;
   return new Date(val).getTime() || 0;
+}
+function apiKeyFingerprint2(apiKey) {
+  if (!apiKey) return "";
+  return createHash("sha256").update(String(apiKey)).digest("hex").slice(0, 8);
 }
 function decodeJwtClaims(jwt) {
   try {
@@ -18646,6 +18654,29 @@ var TokenManager = class {
   _resolveOrgId(orgId) {
     if (orgId) return orgId;
     return this._resolveDefaultOrgId();
+  }
+  // ── api_key binding (stale-JWT / wrong-identity guard) ───────────────────────
+  /** Fingerprint of the currently configured api_key (''' if none). */
+  _currentFp() {
+    return apiKeyFingerprint2(this._resolveApiKey());
+  }
+  /**
+   * Is a cached token record still usable for the current api_key? A record is
+   * valid only when its stored fingerprint matches the current api_key's. A
+   * mismatch means the api_key changed (the JWT belongs to a different identity);
+   * a legacy record with no `apiKeyFp` predates this binding and is treated as a
+   * miss so it is safely re-exchanged. When no api_key is configured we cannot
+   * compare, so we leave the record as-is (a downstream exchange fails loudly).
+   */
+  _cacheValidForApiKey(state) {
+    if (!state) return false;
+    const fp = this._currentFp();
+    if (!fp) return true;
+    if (state.apiKeyFp === fp) return true;
+    this._logger.error(
+      `${LOG} api_key changed (record fp=${state.apiKeyFp ?? "(none)"} != current fp=${fp}); discarding cached token`
+    );
+    return false;
   }
   // ── inflight dedup ──────────────────────────────────────────────────────────
   _withInflight(key, factory) {
@@ -18776,7 +18807,8 @@ var TokenManager = class {
         access_token: d.access_token,
         access_token_expires_at: toMs(d.access_token_expires_at),
         refresh_token: d.refresh_token,
-        refresh_token_expires_at: toMs(d.refresh_token_expires_at)
+        refresh_token_expires_at: toMs(d.refresh_token_expires_at),
+        apiKeyFp: apiKeyFingerprint2(apiKey)
       };
       this._stateByOrg.set(oid, state);
       await this._writeDisk(oid, state);
@@ -18789,6 +18821,7 @@ var TokenManager = class {
     const oid = orgIdArg || "";
     return this._withInflight(`refresh:${oid}`, async () => {
       let s = this._stateByOrg.get(oid) || await this._readDisk(oid);
+      if (s && !this._cacheValidForApiKey(s)) s = null;
       if (!s?.refresh_token) return this.exchange(oid);
       try {
         const body = oid ? { refresh_token: s.refresh_token, org_id: oid } : { refresh_token: s.refresh_token };
@@ -18799,7 +18832,8 @@ var TokenManager = class {
           access_token: d.access_token,
           access_token_expires_at: toMs(d.access_token_expires_at),
           refresh_token: d.refresh_token ?? s.refresh_token,
-          refresh_token_expires_at: toMs(d.refresh_token_expires_at) || s.refresh_token_expires_at
+          refresh_token_expires_at: toMs(d.refresh_token_expires_at) || s.refresh_token_expires_at,
+          apiKeyFp: this._currentFp()
         };
         this._stateByOrg.set(oid, state);
         await this._writeDisk(oid, state);
@@ -18823,8 +18857,13 @@ var TokenManager = class {
   async getAccessToken(orgIdArg) {
     const oid = orgIdArg || "";
     let s = this._stateByOrg.get(oid);
+    if (s && !this._cacheValidForApiKey(s)) {
+      this._stateByOrg.delete(oid);
+      s = null;
+    }
     if (!s) {
       s = await this._readDisk(oid);
+      if (s && !this._cacheValidForApiKey(s)) s = null;
       if (s) this._stateByOrg.set(oid, s);
     }
     const now = Date.now();
@@ -21611,6 +21650,9 @@ var CwsAgentBridge = class {
     rec.onFrame(frame);
   }
 };
+
+// node_modules/@openmaxai/openmax-agent-sdk/src/index.js
+var SDK_VERSION = createRequire(import.meta.url)("../package.json").version;
 
 // src/config.js
 var DEFAULT_APP_VERSION = "claude-openmax/0.1.0";
