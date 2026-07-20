@@ -28,6 +28,7 @@ import { createInboundDelivery } from './inbound-delivery.js';
 import { createMcpTools } from './mcp-tools.js';
 import { createBridge } from './create-bridge.js';
 import { startWakeServer } from './wake-server.js';
+import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 
 const PKG_VERSION = '0.1.0-alpha.0';
 
@@ -113,7 +114,16 @@ async function main() {
   await channel.connect(new StdioServerTransport());
 
   if (bridge) {
+    // Belt-and-suspenders for the org-keyed token cache bug: if agent.api_key
+    // changed since the last successful connect, purge the org's cached
+    // token/session/inbox BEFORE connecting so a fresh JWT is exchanged for the
+    // CURRENT identity (see token-guard.js). Never throws.
+    const orgIds = runtime.orgConfigs.map((o) => o.org_id);
+    await guardStaleTokenCache({ storage, orgIds, apiKey: config.agent.api_key, logger });
     await bridge.start();
+    // Record the api_key fingerprint now that we've connected, so a later
+    // api_key change is detectable on the next bootstrap.
+    await writeApiKeyMarkers({ storage, orgIds, apiKey: config.agent.api_key, logger });
     logger.info('bridge started; inbound wakes will flow into the Claude Code context');
   }
 

@@ -58,6 +58,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { identityIdFromMe, purgeOrgTokenCache } from './token-guard.js';
+
 import {
   CwsHttpClient,
   TokenManager,
@@ -444,6 +446,23 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     // Hydrate the authoritative self display_name from cws-core (/me).
     try {
       const me = await http.getForOrg(orgConfig.org_id, http.apiPath('/me'));
+      // ── identity mismatch guard (belt-and-suspenders) ─────────────────────
+      // If a specific identity is configured and /me comes back as a DIFFERENT
+      // identity, the org-keyed token cache handed us a STALE JWT (minted with a
+      // previous api_key) — we are connected as the WRONG identity. Warn LOUDLY
+      // and purge this org's cached token/session/inbox so the next bootstrap
+      // re-exchanges a fresh JWT for the correct identity.
+      const wanted = state.agent.identity_id;
+      const got = identityIdFromMe(me);
+      if (wanted && got && wanted !== got) {
+        logger?.error?.(
+          `[IDENTITY MISMATCH] org=${orgConfig.org_id}: configured agent.identity_id=${wanted} `
+          + `but /me reports ${got}. A STALE org-keyed JWT (minted with a previous api_key) is in `
+          + 'use — the agent is running as the WRONG identity. Purging cached token/session/inbox for '
+          + 'this org; restart to re-exchange a fresh JWT for the correct identity.',
+        );
+        await purgeOrgTokenCache({ storage, orgId: orgConfig.org_id, logger, reason: 'identity_id mismatch vs /me' });
+      }
       const name = me?.display_name || me?.username || '';
       if (name) {
         const org = orgByOrgId(orgConfig.org_id);

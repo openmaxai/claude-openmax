@@ -3907,6 +3907,93 @@ var init_as = __esm({
 import fs4 from "node:fs";
 import path4 from "node:path";
 
+// src/token-guard.js
+import crypto from "node:crypto";
+var IDENTITY_SLOT = "_identity";
+var tokenKey = (id) => `tokens/${id}.json`;
+var sessionKey = (id) => `sessions/${id}.json`;
+var inboxKey = (id) => `inbox-${id}.json`;
+var markerKey = (id) => `apikey-fp/${id}.json`;
+function apiKeyFingerprint(apiKey) {
+  if (!apiKey) return "";
+  return crypto.createHash("sha256").update(String(apiKey)).digest("hex").slice(0, 8);
+}
+function identityIdFromMe(me) {
+  return me?.identity_id || me?.identity?.id || "";
+}
+async function safeRemove(storage, key) {
+  try {
+    if (typeof storage.remove === "function") return await storage.remove(key);
+    await storage.set(key, "");
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function purgeOrgTokenCache({ storage, orgId, logger, reason }) {
+  const removed = [];
+  for (const key of [tokenKey(orgId), sessionKey(orgId), inboxKey(orgId)]) {
+    if (await safeRemove(storage, key)) removed.push(key);
+  }
+  if (removed.length) {
+    logger?.warn?.(
+      `token-guard: purged cached ${removed.join(", ")} for org=${orgId}${reason ? ` (${reason})` : ""}`
+    );
+  }
+  return removed;
+}
+async function guardStaleTokenCache({ storage, orgIds, apiKey, logger }) {
+  const fp = apiKeyFingerprint(apiKey);
+  const ids = /* @__PURE__ */ new Set([IDENTITY_SLOT, ...(orgIds || []).filter(Boolean)]);
+  const purgedOrgs = [];
+  for (const orgId of ids) {
+    try {
+      let stored = null;
+      const rawMarker = await storage.get(markerKey(orgId));
+      if (rawMarker) {
+        try {
+          stored = JSON.parse(rawMarker)?.fp ?? null;
+        } catch {
+          stored = null;
+        }
+      }
+      let purge;
+      if (stored) {
+        purge = stored !== fp;
+      } else {
+        purge = await storage.get(tokenKey(orgId)) != null;
+      }
+      if (purge) {
+        await purgeOrgTokenCache({
+          storage,
+          orgId,
+          logger,
+          reason: `api_key fingerprint ${stored || "<none>"} \u2192 ${fp || "<none>"}`
+        });
+        purgedOrgs.push(orgId);
+      }
+    } catch (e) {
+      try {
+        await purgeOrgTokenCache({ storage, orgId, logger, reason: `guard read error: ${e.message}` });
+        purgedOrgs.push(orgId);
+      } catch {
+      }
+    }
+  }
+  return purgedOrgs;
+}
+async function writeApiKeyMarkers({ storage, orgIds, apiKey, logger }) {
+  const fp = apiKeyFingerprint(apiKey);
+  const ids = /* @__PURE__ */ new Set([IDENTITY_SLOT, ...(orgIds || []).filter(Boolean)]);
+  for (const orgId of ids) {
+    try {
+      await storage.set(markerKey(orgId), JSON.stringify({ fp, updated_at: (/* @__PURE__ */ new Date()).toISOString() }));
+    } catch (e) {
+      logger?.warn?.(`token-guard: failed to persist api_key marker for org=${orgId}: ${e.message}`);
+    }
+  }
+}
+
 // node_modules/@openmaxai/openmax-agent-sdk/src/providers.js
 var consoleLogger = {
   info: (...a) => console.log(...a),
@@ -8116,6 +8203,14 @@ function buildRuntime({ config, file, storage, logger, httpClient }) {
   const syncSelf = async (orgConfig) => {
     try {
       const me = await http.getForOrg(orgConfig.org_id, http.apiPath("/me"));
+      const wanted = state.agent.identity_id;
+      const got = identityIdFromMe(me);
+      if (wanted && got && wanted !== got) {
+        logger?.error?.(
+          `[IDENTITY MISMATCH] org=${orgConfig.org_id}: configured agent.identity_id=${wanted} but /me reports ${got}. A STALE org-keyed JWT (minted with a previous api_key) is in use \u2014 the agent is running as the WRONG identity. Purging cached token/session/inbox for this org; restart to re-exchange a fresh JWT for the correct identity.`
+        );
+        await purgeOrgTokenCache({ storage, orgId: orgConfig.org_id, logger, reason: "identity_id mismatch vs /me" });
+      }
       const name = me?.display_name || me?.username || "";
       if (name) {
         const org = orgByOrgId(orgConfig.org_id);
@@ -8233,6 +8328,20 @@ function createFileStorage(opts = {}) {
       const tmp = `${file}.tmp-${process.pid}`;
       fs5.writeFileSync(tmp, String(value), { mode: 384 });
       fs5.renameSync(tmp, file);
+    },
+    // Delete a stored key (best-effort). Returns true if a file was removed,
+    // false if it was already absent. Never throws. Used by the stale-token-cache
+    // guard (token-guard.js) to purge a stale JWT/session/inbox before connecting.
+    async remove(key) {
+      const file = resolve(key);
+      try {
+        if (!fs5.existsSync(file)) return false;
+        fs5.rmSync(file, { force: true });
+        return true;
+      } catch (e) {
+        if (e.code === "ENOENT") return false;
+        return false;
+      }
     },
     // AsService download target (falls back to os.tmpdir() if absent — we
     // provide a stable per-adapter dir instead).
@@ -8427,7 +8536,10 @@ async function main() {
     // WS config (ws_url + device_id + app_version + cf_access + tuning).
     wsConfig: runtime.wsConfig
   });
+  const orgIds = runtime.orgConfigs.map((o) => o.org_id);
+  await guardStaleTokenCache({ storage, orgIds, apiKey: config.agent.api_key, logger });
   await bridge.start();
+  await writeApiKeyMarkers({ storage, orgIds, apiKey: config.agent.api_key, logger });
   logger.info(`bridge started; posting wakes to ${endpoint}`);
   const shutdown = async () => {
     try {
