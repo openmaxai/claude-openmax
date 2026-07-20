@@ -72,7 +72,7 @@ import {
   createConnService,
 } from '@openmaxai/openmax-agent-sdk';
 
-const DEFAULT_APP_VERSION = 'claude-openmax/0.1.0';
+const DEFAULT_APP_VERSION = 'claude-openmax/1.0.0';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 
 /**

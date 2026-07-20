@@ -30,7 +30,7 @@ import { createBridge } from './create-bridge.js';
 import { startWakeServer } from './wake-server.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 
-const PKG_VERSION = '0.1.0-alpha.0';
+const PKG_VERSION = '1.0.0';
 
 async function main() {
   const logger = createStderrLogger();
