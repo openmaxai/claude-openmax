@@ -3994,9 +3994,6 @@ async function writeApiKeyMarkers({ storage, orgIds, apiKey, logger }) {
   }
 }
 
-// node_modules/@openmaxai/openmax-agent-sdk/src/index.js
-import { createRequire } from "node:module";
-
 // node_modules/@openmaxai/openmax-agent-sdk/src/providers.js
 var consoleLogger = {
   info: (...a) => console.log(...a),
@@ -7970,9 +7967,6 @@ var CwsAgentBridge = class {
     rec.onFrame(frame);
   }
 };
-
-// node_modules/@openmaxai/openmax-agent-sdk/src/index.js
-var SDK_VERSION = createRequire(import.meta.url)("../package.json").version;
 
 // src/config.js
 var DEFAULT_APP_VERSION = "claude-openmax/0.1.0";

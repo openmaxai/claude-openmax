@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
-    "@openmaxai/openmax-agent-sdk": "1.0.0"
+    "@openmaxai/openmax-agent-sdk": "1.0.1"
   },
   "license": "UNLICENSED",
   "devDependencies": {
