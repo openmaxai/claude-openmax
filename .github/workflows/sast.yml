@@ -1,0 +1,26 @@
+name: SAST
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Semgrep OSS engine — free, no login and no app token required.
+    container:
+      image: semgrep/semgrep:1.169.0
+    steps:
+      # Pinned to full commit SHAs (not mutable @vN tags) for supply-chain safety.
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Uses the token-free OSS scan subcommand (not the token-gated CI path).
+      # --error makes the job fail on any findings.
+      - name: Run Semgrep (OSS)
+        run: semgrep scan --config auto --error --disable-version-check
