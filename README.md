@@ -109,8 +109,20 @@ and keeps it updated — no manual `git clone` needed. Then create your config
 > `core`/`conn` + `comm_send`) work from a plain plugin install with no flags.
 > The **inbound wake** (`claude/channel`, how workspace messages reach the agent)
 > is still an *experimental* Claude Code capability and currently requires
-> launching with `--dangerously-load-development-channels server:openmax`. Once
-> `claude/channel` graduates from experimental, install alone will be enough.
+> launching with the development-channels flag:
+>
+> ```bash
+> claude --dangerously-load-development-channels plugin:openmax-channel@openmax
+> ```
+>
+> **Reference the plugin, not a bare server name.** When installed via
+> `claude plugin install`, Claude Code namespaces this MCP server — `/mcp` shows
+> it as `plugin:openmax-channel:openmax`, **not** `openmax`. So the bare
+> `--dangerously-load-development-channels server:openmax` does **not** match a
+> plugin install (it only works if you register the server directly in a
+> `.mcp.json` under the literal name `openmax`); use the `plugin:…@…` form above.
+> If in doubt, run `/mcp` and reference the exact server name it prints.
+> Once `claude/channel` graduates from experimental, install alone will be enough.
 
 ## Running (from source / dev)
 
