@@ -180,6 +180,8 @@ orgs:    { "<org_id>": { enabled?, org_id, org_name?,
              self:  { member_id, name, display_name },
              access:{ dmPolicy, dmAllowFrom?, groupPolicy?, groups?:{ "<convId>": { mode, allowFrom } } } } }
 wake:    { endpoint }                                   // claude-openmax ONLY (openmax has no wake)
+receiveReaction?: "eyes" | false                        // "processing" reaction code; false/"" disables (default "eyes")
+receiveReactionTimeoutMs?: 120000                       // auto-remove timeout when no reply arrives (default 120000)
 metricsReport?: { dashboardApiKey }                     // RESERVED / forward-compat — inert (no reporter yet)
 ws?:     { reconnectMaxMs?, heartbeatIntervalMs?, pingIntervalMs? }   // claude-openmax WS tuning knobs
 ```
@@ -205,6 +207,19 @@ Lead agent = the agent itself).
 **`server.frontend_base_path`** is wired into the SDK's `CwsHttpClient.frontendUrl()`
 so the agent can build clickable workspace links (`<bff_url><frontend_base_path>/…`,
 default `/workspace`).
+
+**`receiveReaction` / `receiveReactionTimeoutMs`** — the "processing" receive
+acknowledgement. On inbound delivery the adapter adds a reaction (default `eyes`
+👀) to the message and arms a timer; when the agent replies for that conversation
+(`comm_send`) the reaction is removed, and if no reply lands within
+`receiveReactionTimeoutMs` (default `120000`) it is removed automatically. On
+startup the adapter clears **all** leftover reaction markers (removing the
+reaction server-side), so a process that died mid-flight never leaves a stuck 👀.
+Set `receiveReaction` to `false` (or `""`) to disable the feature entirely. The
+code must be one of the cws-comm registry keys (`thumbs_up`, `smile`, `heart`,
+`tada`, `eyes`, `joy`, `fire`, `white_check_mark`) — `eyes` is used because the
+hourglass ⏳ is not registered. The reaction work is strictly fire-and-forget and
+never delays message delivery or the reply send.
 
 ### Migrating from the openmax (`zylos-openmax`) component
 

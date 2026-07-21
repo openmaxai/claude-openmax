@@ -3,7 +3,32 @@ import assert from 'node:assert/strict';
 
 import { createInboundDelivery } from '../src/inbound-delivery.js';
 
-const inbound = { messageId: 'msg1', conversationId: 'conv1', senderId: 'm1', text: 'hi' };
+const inbound = { orgId: 'org1', messageId: 'msg1', conversationId: 'conv1', senderId: 'm1', text: 'hi' };
+
+test('applies the receive-reaction (orgId, conversationId, messageId) after a successful wake', async () => {
+  const applied = [];
+  const reactions = { applyOnReceive: (orgId, convId, msgId) => applied.push({ orgId, convId, msgId }) };
+  const del = createInboundDelivery({ wake: async () => ({ runtimeSession: 's' }), reactions });
+  const res = await del.deliver(inbound);
+  assert.equal(res.ok, true);
+  assert.deepEqual(applied, [{ orgId: 'org1', convId: 'conv1', msgId: 'msg1' }]);
+});
+
+test('does NOT apply the receive-reaction when the wake fails', async () => {
+  let applied = false;
+  const reactions = { applyOnReceive: () => { applied = true; } };
+  const del = createInboundDelivery({ wake: async () => { throw new Error('boom'); }, reactions });
+  const res = await del.deliver(inbound);
+  assert.equal(res.ok, false);
+  assert.equal(applied, false);
+});
+
+test('a throwing reaction manager never affects the ok:true delivery result', async () => {
+  const reactions = { applyOnReceive: () => { throw new Error('reaction blew up'); } };
+  const del = createInboundDelivery({ wake: async () => ({ runtimeSession: 's' }), reactions });
+  const res = await del.deliver(inbound);
+  assert.deepEqual(res, { ok: true, runtimeSession: 's' });
+});
 
 test('ok:true ONLY when the wake injection resolves; carries runtimeSession', async () => {
   const calls = [];

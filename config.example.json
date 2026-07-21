@@ -38,6 +38,8 @@
   "wake": {
     "endpoint": "http://127.0.0.1:47600/wake"
   },
+  "receiveReaction": "eyes",
+  "receiveReactionTimeoutMs": 120000,
   "metricsReport": {
     "dashboardApiKey": ""
   },

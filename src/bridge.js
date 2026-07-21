@@ -18,6 +18,7 @@ import { createFileStorage } from './storage.js';
 import { createStderrLogger, createEmptyRuntimeState } from './providers.js';
 import { createInboundDelivery } from './inbound-delivery.js';
 import { createBridge } from './create-bridge.js';
+import { createReactionManager } from './reactions.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 
 async function httpWake(endpoint, token, wakeReq) {
@@ -54,8 +55,22 @@ async function main() {
   // effort and non-blocking: leadAgentId for the guided-autonomy flow == this.
   runtime.resolveIdentityId().catch(() => {});
 
+  // Receive-reaction ("processing" 👀) manager. In split topology the reply that
+  // clears a reaction is handled by the channel process (src/index.js
+  // channel-only) via the shared storage markers; this bridge process owns the
+  // apply-on-receive + auto-timeout + startup cleanup. Fire-and-forget.
+  const reactions = createReactionManager({
+    http: runtime.http,
+    storage,
+    code: runtime.reactionConfig.code,
+    timeoutMs: runtime.reactionConfig.timeoutMs,
+    logger,
+  });
+  reactions.cleanupOnStartup().catch(() => {});
+
   const inbound = createInboundDelivery({
     wake: (wakeReq) => httpWake(endpoint, token, wakeReq),
+    reactions,
     logger,
   });
 

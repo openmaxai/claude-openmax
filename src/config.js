@@ -75,6 +75,32 @@ import {
 const DEFAULT_APP_VERSION = 'claude-openmax/1.0.0';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 
+// Receive-reaction ("processing" 👀) feature defaults. `receiveReaction` is the
+// reaction code applied to an inbound message on delivery (removed on reply or
+// timeout); set it to false / '' to disable the whole feature. The reaction
+// registry supported by cws-comm is 8 keys (thumbs_up/smile/heart/tada/eyes/
+// joy/fire/white_check_mark) — ⏳ is NOT registered, so 'eyes' (👀) is the
+// closest "received / processing" acknowledgement. `receiveReactionTimeoutMs`
+// is the auto-remove timeout when the LLM never replies. See src/reactions.js.
+const DEFAULT_RECEIVE_REACTION = 'eyes';
+const DEFAULT_RECEIVE_REACTION_TIMEOUT_MS = 120000;
+
+/**
+ * Resolve the tri-state `receiveReaction` config: `undefined` (unset) → default
+ * on with 'eyes'; `false` / '' → disabled; any string → that code.
+ */
+function normalizeReceiveReaction(value) {
+  if (value === undefined) return DEFAULT_RECEIVE_REACTION;
+  if (value === false || value === '' || value === null) return false;
+  return String(value);
+}
+
+function normalizeReactionTimeout(value) {
+  return Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : DEFAULT_RECEIVE_REACTION_TIMEOUT_MS;
+}
+
 /**
  * MIGRATION-ONLY slugify. Before the org_id-keying refactor, per-org session
  * files were keyed by a derived slug (`explicit slug || slugify(org_name) ||
@@ -148,6 +174,8 @@ function translateLegacy(raw) {
     cf_access: raw.cf_access,
     orgs: orgsMap,
     wake: raw.wake || {},
+    ...(raw.receiveReaction !== undefined ? { receiveReaction: raw.receiveReaction } : {}),
+    ...(raw.receiveReactionTimeoutMs !== undefined ? { receiveReactionTimeoutMs: raw.receiveReactionTimeoutMs } : {}),
     metricsReport: raw.metricsReport,
     ws: {
       reconnectMaxMs: ws.reconnectMaxMs,
@@ -218,6 +246,10 @@ export function normalizeConfig(raw, { logger } = {}) {
     cf_access: src.cf_access,
     orgs,
     wake: src.wake || {},
+    // Receive-reaction feature (claude-openmax-specific; openmax uses
+    // config.message.receive_reaction_code). Tri-state code + timeout.
+    receiveReaction: normalizeReceiveReaction(src.receiveReaction),
+    receiveReactionTimeoutMs: normalizeReactionTimeout(src.receiveReactionTimeoutMs),
     // RESERVED / forward-compat: claude-openmax has no metrics reporter yet, so
     // this is accepted and persisted but otherwise INERT.
     metricsReport: src.metricsReport,
@@ -286,6 +318,8 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     cf_access: config.cf_access,
     orgs: cloneOrgs(config.orgs),
     wake: config.wake,
+    receiveReaction: config.receiveReaction,
+    receiveReactionTimeoutMs: config.receiveReactionTimeoutMs,
     metricsReport: config.metricsReport,
     ws: { ...config.ws },
   };
@@ -310,6 +344,8 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
         // orgs: org_id-keyed map (openmax shape)
         orgs: Object.fromEntries(state.orgs.map((o) => [o.org_id, serializeOrg(o)])),
         ...(state.wake !== undefined ? { wake: state.wake } : {}),
+        ...(state.receiveReaction !== undefined ? { receiveReaction: state.receiveReaction } : {}),
+        ...(state.receiveReactionTimeoutMs !== undefined ? { receiveReactionTimeoutMs: state.receiveReactionTimeoutMs } : {}),
         ...(state.metricsReport !== undefined ? { metricsReport: state.metricsReport } : {}),
         ...(hasWsTuning(state.ws) ? { ws: state.ws } : {}),
       };
@@ -526,6 +562,13 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     resolveDefaultOrgId,
     configProvider,
     wsConfig,
+    // Receive-reaction ("processing" 👀) config, resolved to what
+    // createReactionManager expects: `code` is '' when the feature is disabled
+    // (state.receiveReaction === false), else the reaction code string.
+    reactionConfig: {
+      code: state.receiveReaction === false ? '' : (state.receiveReaction || ''),
+      timeoutMs: state.receiveReactionTimeoutMs,
+    },
     applyMemberId,
     // Current cached identity_id (may be '' until resolveIdentityId() runs). The
     // guided-autonomy flow's leadAgentId (tm issueCreate lead agent = self) is
