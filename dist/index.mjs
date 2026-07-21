@@ -21651,6 +21651,16 @@ var CwsAgentBridge = class {
 // src/config.js
 var DEFAULT_APP_VERSION = "claude-openmax/1.0.0";
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
+var DEFAULT_RECEIVE_REACTION = "eyes";
+var DEFAULT_RECEIVE_REACTION_TIMEOUT_MS = 12e4;
+function normalizeReceiveReaction(value) {
+  if (value === void 0) return DEFAULT_RECEIVE_REACTION;
+  if (value === false || value === "" || value === null) return false;
+  return String(value);
+}
+function normalizeReactionTimeout(value) {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_RECEIVE_REACTION_TIMEOUT_MS;
+}
 function legacySlugify(s) {
   return String(s ?? "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
@@ -21706,6 +21716,8 @@ function translateLegacy(raw) {
     cf_access: raw.cf_access,
     orgs: orgsMap,
     wake: raw.wake || {},
+    ...raw.receiveReaction !== void 0 ? { receiveReaction: raw.receiveReaction } : {},
+    ...raw.receiveReactionTimeoutMs !== void 0 ? { receiveReactionTimeoutMs: raw.receiveReactionTimeoutMs } : {},
     metricsReport: raw.metricsReport,
     ws: {
       reconnectMaxMs: ws.reconnectMaxMs,
@@ -21760,6 +21772,10 @@ function normalizeConfig(raw, { logger } = {}) {
     cf_access: src.cf_access,
     orgs,
     wake: src.wake || {},
+    // Receive-reaction feature (claude-openmax-specific; openmax uses
+    // config.message.receive_reaction_code). Tri-state code + timeout.
+    receiveReaction: normalizeReceiveReaction(src.receiveReaction),
+    receiveReactionTimeoutMs: normalizeReactionTimeout(src.receiveReactionTimeoutMs),
     // RESERVED / forward-compat: claude-openmax has no metrics reporter yet, so
     // this is accepted and persisted but otherwise INERT.
     metricsReport: src.metricsReport,
@@ -21795,6 +21811,8 @@ function buildRuntime({ config: config2, file, storage, logger, httpClient }) {
     cf_access: config2.cf_access,
     orgs: cloneOrgs(config2.orgs),
     wake: config2.wake,
+    receiveReaction: config2.receiveReaction,
+    receiveReactionTimeoutMs: config2.receiveReactionTimeoutMs,
     metricsReport: config2.metricsReport,
     ws: { ...config2.ws }
   };
@@ -21816,6 +21834,8 @@ function buildRuntime({ config: config2, file, storage, logger, httpClient }) {
         // orgs: org_id-keyed map (openmax shape)
         orgs: Object.fromEntries(state.orgs.map((o) => [o.org_id, serializeOrg(o)])),
         ...state.wake !== void 0 ? { wake: state.wake } : {},
+        ...state.receiveReaction !== void 0 ? { receiveReaction: state.receiveReaction } : {},
+        ...state.receiveReactionTimeoutMs !== void 0 ? { receiveReactionTimeoutMs: state.receiveReactionTimeoutMs } : {},
         ...state.metricsReport !== void 0 ? { metricsReport: state.metricsReport } : {},
         ...hasWsTuning(state.ws) ? { ws: state.ws } : {}
       };
@@ -21987,6 +22007,13 @@ function buildRuntime({ config: config2, file, storage, logger, httpClient }) {
     resolveDefaultOrgId,
     configProvider,
     wsConfig,
+    // Receive-reaction ("processing" 👀) config, resolved to what
+    // createReactionManager expects: `code` is '' when the feature is disabled
+    // (state.receiveReaction === false), else the reaction code string.
+    reactionConfig: {
+      code: state.receiveReaction === false ? "" : state.receiveReaction || "",
+      timeoutMs: state.receiveReactionTimeoutMs
+    },
     applyMemberId,
     // Current cached identity_id (may be '' until resolveIdentityId() runs). The
     // guided-autonomy flow's leadAgentId (tm issueCreate lead agent = self) is
@@ -24106,7 +24133,8 @@ function createInboundDelivery({
   logger,
   runtimeSession,
   previewMax,
-  retryAfterMs = DEFAULT_RETRY_AFTER_MS
+  retryAfterMs = DEFAULT_RETRY_AFTER_MS,
+  reactions
 } = {}) {
   if (typeof wake !== "function") throw new Error("createInboundDelivery requires a wake(wakeRequest) function");
   return {
@@ -24120,6 +24148,11 @@ function createInboundDelivery({
       }
       try {
         const res = await wake(wakeReq);
+        try {
+          reactions?.applyOnReceive?.(inbound.orgId, wakeReq.conversationId, wakeReq.messageId);
+        } catch (e) {
+          logger?.warn?.(`inbound.deliver: reaction apply threw (ignored): ${e.message}`);
+        }
         const session = res && res.runtimeSession || runtimeSession;
         return session ? { ok: true, runtimeSession: session } : { ok: true };
       } catch (e) {
@@ -25229,7 +25262,7 @@ function okResult(value) {
 function errResult(message) {
   return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
 }
-function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
+function createMcpTools({ services, bridge, defaultOrgId, reactions, logger } = {}) {
   if (!services) throw new Error("createMcpTools requires services");
   const defs = [];
   for (const key of SERVICE_KEYS) {
@@ -25271,6 +25304,12 @@ function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
           orgId: orgId || defaultOrgId,
           replyTo
         });
+        try {
+          const convId = String(endpoint).split("|")[0];
+          reactions?.clearForConversation?.(convId, "reply");
+        } catch (e) {
+          logger?.warn?.(`comm_send: reaction clear threw (ignored): ${e.message}`);
+        }
         return okResult(res);
       }
       if (SERVICE_KEYS.includes(name)) {
@@ -25322,6 +25361,155 @@ function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfi
       version: PKG_VERSION
     }
   });
+}
+
+// src/reactions.js
+var REACTIONS_MARKER_KEY = "reactions/active.json";
+var DEFAULT_REMOVE_RETRY_MS = 1e3;
+function createReactionManager({
+  http: http2,
+  storage,
+  code,
+  timeoutMs = 12e4,
+  logger,
+  removeRetryMs = DEFAULT_REMOVE_RETRY_MS
+} = {}) {
+  const enabled = !!code && !!http2 && typeof http2.postForOrg === "function";
+  const active = /* @__PURE__ */ new Map();
+  let markerChain = Promise.resolve();
+  const info = (...a) => logger?.info?.("[reactions]", ...a);
+  const warn = (...a) => logger?.warn?.("[reactions]", ...a);
+  const apiPath = (p) => typeof http2?.apiPath === "function" ? http2.apiPath(p) : p;
+  async function readMarkers() {
+    try {
+      const raw = await storage.get(REACTIONS_MARKER_KEY);
+      if (!raw) return {};
+      const obj = JSON.parse(raw);
+      return obj && typeof obj === "object" ? obj : {};
+    } catch {
+      return {};
+    }
+  }
+  function mutateMarkers(fn) {
+    markerChain = markerChain.then(async () => {
+      const cur = await readMarkers();
+      const next = fn({ ...cur }) || cur;
+      try {
+        await storage.set(REACTIONS_MARKER_KEY, JSON.stringify(next));
+      } catch (e) {
+        warn(`marker persist failed: ${e.message}`);
+      }
+    }).catch(() => {
+    });
+    return markerChain;
+  }
+  const deleteMarker = (messageId) => mutateMarkers((m) => {
+    delete m[messageId];
+    return m;
+  });
+  function doRemove(orgId, messageId, rcode) {
+    return http2.delForOrg(orgId, apiPath(`/messages/${messageId}/reactions/${rcode}`));
+  }
+  function serverRemove(orgId, messageId, rcode, reason) {
+    return doRemove(orgId, messageId, rcode).then(() => {
+      info(`reaction removed msg=${messageId} (${reason})`);
+      return deleteMarker(messageId);
+    }).catch((e) => {
+      warn(`reaction remove failed msg=${messageId}: ${e.message}, retrying...`);
+      return new Promise((r) => setTimeout(r, removeRetryMs)).then(
+        () => doRemove(orgId, messageId, rcode).then(() => deleteMarker(messageId)).catch((e2) => warn(`reaction remove retry failed msg=${messageId}: ${e2.message}`))
+      );
+    });
+  }
+  function applyOnReceive(orgId, conversationId, messageId) {
+    if (!enabled || !orgId || !messageId) return Promise.resolve();
+    return http2.postForOrg(orgId, apiPath(`/messages/${messageId}/reactions`), { reaction_code: code }).then(() => {
+      info(`reacted '${code}' org=${orgId} msg=${messageId}`);
+      const timer = setTimeout(() => {
+        removeReaction(messageId, "timeout");
+      }, timeoutMs);
+      if (typeof timer.unref === "function") timer.unref();
+      active.set(messageId, { orgId, conversationId, code, timer });
+      return mutateMarkers((m) => {
+        m[messageId] = { orgId, conversationId, code, ts: Date.now() };
+        return m;
+      });
+    }).catch((e) => warn(`react-on-receive failed msg=${messageId}: ${e.message}`));
+  }
+  function removeReaction(messageId, reason) {
+    if (!messageId) return Promise.resolve();
+    const state = active.get(messageId);
+    if (state) {
+      clearTimeout(state.timer);
+      active.delete(messageId);
+      return serverRemove(state.orgId, messageId, state.code, reason);
+    }
+    return readMarkers().then((m) => {
+      const mk = m[messageId];
+      if (mk?.orgId && mk?.code) return serverRemove(mk.orgId, messageId, mk.code, reason);
+      return deleteMarker(messageId);
+    });
+  }
+  function clearForConversation(conversationId, reason = "reply") {
+    if (!conversationId) return Promise.resolve();
+    const ids = /* @__PURE__ */ new Set();
+    for (const [msgId, st] of active) {
+      if (st.conversationId === conversationId) ids.add(msgId);
+    }
+    const memPromises = [...ids].map((id) => removeReaction(id, reason));
+    const markerPromise = readMarkers().then((m) => {
+      const extra = Object.entries(m).filter(([id, mk]) => mk?.conversationId === conversationId && !ids.has(id)).map(([id]) => id);
+      return Promise.all(extra.map((id) => removeReaction(id, reason)));
+    }).catch(() => {
+    });
+    return Promise.all([...memPromises, markerPromise]);
+  }
+  const clearForMessage = (messageId, reason = "reply") => removeReaction(messageId, reason);
+  async function cleanupOnStartup() {
+    let markers;
+    try {
+      markers = await readMarkers();
+    } catch {
+      return { removed: 0 };
+    }
+    const ids = Object.keys(markers);
+    if (ids.length === 0) return { removed: 0 };
+    info(`startup cleanup: removing ${ids.length} leftover reaction(s)`);
+    await Promise.all(
+      ids.map(async (id) => {
+        const mk = markers[id];
+        if (!mk?.orgId || !mk?.code) return;
+        try {
+          await doRemove(mk.orgId, id, mk.code);
+        } catch (e) {
+          warn(`startup remove failed msg=${id}: ${e.message}, retrying...`);
+          try {
+            await doRemove(mk.orgId, id, mk.code);
+          } catch (e2) {
+            warn(`startup remove retry failed msg=${id}: ${e2.message}`);
+          }
+        }
+      })
+    );
+    try {
+      await storage.set(REACTIONS_MARKER_KEY, JSON.stringify({}));
+    } catch (e) {
+      warn(`startup marker clear failed: ${e.message}`);
+    }
+    active.clear();
+    return { removed: ids.length };
+  }
+  return {
+    enabled,
+    markerKey: REACTIONS_MARKER_KEY,
+    applyOnReceive,
+    removeReaction,
+    clearForConversation,
+    clearForMessage,
+    cleanupOnStartup,
+    // Test/introspection seam only.
+    _activeCount: () => active.size
+  };
 }
 
 // src/wake-server.js
@@ -25399,6 +25587,15 @@ async function main() {
   const runtime = buildRuntime({ config: config2, file, storage, logger });
   runtime.resolveIdentityId().catch(() => {
   });
+  const reactions = createReactionManager({
+    http: runtime.http,
+    storage,
+    code: runtime.reactionConfig.code,
+    timeoutMs: runtime.reactionConfig.timeoutMs,
+    logger
+  });
+  reactions.cleanupOnStartup().catch(() => {
+  });
   const debounceMs = Number(process.env.CLAUDE_OPENMAX_DEBOUNCE_MS || "0");
   const channel = new ClaudeChannel({
     name: "openmax",
@@ -25411,6 +25608,7 @@ async function main() {
     bridge: null,
     // set after the bridge exists (comm_send needs it)
     defaultOrgId: runtime.resolveDefaultOrgId(),
+    reactions,
     logger
   });
   channel.registerTools(defs, handler);
@@ -25434,6 +25632,7 @@ async function main() {
     const inbound = createInboundDelivery({
       wake: (req) => notifier.notify(req).then(() => ({ runtimeSession: channel.runtimeSession })),
       runtimeSession: channel.runtimeSession,
+      reactions,
       logger
     });
     bridge = createBridge({
@@ -25450,6 +25649,7 @@ async function main() {
       services: runtime.services,
       bridge,
       defaultOrgId: runtime.resolveDefaultOrgId(),
+      reactions,
       logger
     });
     channel.registerTools(withBridge.defs, withBridge.handler);

@@ -323,3 +323,48 @@ test('loadSession prefers an existing org_id session over any legacy file', asyn
   const rt = buildRuntime({ config, file, storage, logger: silentLogger, httpClient: {} });
   assert.deepEqual(await rt.callbacks.loadSession('org-uuid-1'), { cursor: 100 }); // no clobber
 });
+
+// ── receive-reaction config ────────────────────────────────────────────────────
+test('normalizeConfig: receiveReaction defaults on with eyes + 120000ms', () => {
+  const c = normalizeConfig(newShape(), { logger: silentLogger });
+  assert.equal(c.receiveReaction, 'eyes');
+  assert.equal(c.receiveReactionTimeoutMs, 120000);
+});
+
+test('normalizeConfig: receiveReaction:false disables the feature', () => {
+  const c = normalizeConfig(newShape({ receiveReaction: false }), { logger: silentLogger });
+  assert.equal(c.receiveReaction, false);
+});
+
+test('normalizeConfig: empty-string receiveReaction disables the feature', () => {
+  const c = normalizeConfig(newShape({ receiveReaction: '' }), { logger: silentLogger });
+  assert.equal(c.receiveReaction, false);
+});
+
+test('normalizeConfig: custom reaction code + timeout are honored', () => {
+  const c = normalizeConfig(newShape({ receiveReaction: 'fire', receiveReactionTimeoutMs: 30000 }), { logger: silentLogger });
+  assert.equal(c.receiveReaction, 'fire');
+  assert.equal(c.receiveReactionTimeoutMs, 30000);
+});
+
+test('normalizeConfig: invalid/zero timeout falls back to the 120000ms default', () => {
+  const c = normalizeConfig(newShape({ receiveReactionTimeoutMs: 0 }), { logger: silentLogger });
+  assert.equal(c.receiveReactionTimeoutMs, 120000);
+});
+
+test('buildRuntime exposes reactionConfig (code + timeoutMs); false → empty code', () => {
+  const file = tmpFile();
+  const on = buildRuntime({ config: normalizeConfig(newShape(), { logger: silentLogger }), file, storage: storageStub, logger: silentLogger, httpClient: {} });
+  assert.deepEqual(on.reactionConfig, { code: 'eyes', timeoutMs: 120000 });
+  const off = buildRuntime({ config: normalizeConfig(newShape({ receiveReaction: false }), { logger: silentLogger }), file, storage: storageStub, logger: silentLogger, httpClient: {} });
+  assert.equal(off.reactionConfig.code, '');
+});
+
+test('persist round-trips receiveReaction settings to disk', () => {
+  const file = tmpFile();
+  const rt = buildRuntime({ config: normalizeConfig(newShape({ receiveReaction: 'heart', receiveReactionTimeoutMs: 45000 }), { logger: silentLogger }), file, storage: storageStub, logger: silentLogger, httpClient: {} });
+  rt.persist();
+  const out = readJSON(file);
+  assert.equal(out.receiveReaction, 'heart');
+  assert.equal(out.receiveReactionTimeoutMs, 45000);
+});

@@ -1164,10 +1164,12 @@ function errResult(message) {
  * @param {{tm,kb,as,comm,core,conn}} opts.services  SDK service client instances
  * @param {import('@openmaxai/openmax-agent-sdk').CwsAgentBridge} [opts.bridge]  for comm_send endpoint parsing
  * @param {string} [opts.defaultOrgId]
+ * @param {object} [opts.reactions]  ReactionManager — when present, a successful
+ *        comm_send clears the "processing" 👀 reaction for that conversation.
  * @param {object} [opts.logger]
  * @returns {{defs: object[], handler: (name:string, args:object)=>Promise<object>}}
  */
-export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
+export function createMcpTools({ services, bridge, defaultOrgId, reactions, logger } = {}) {
   if (!services) throw new Error('createMcpTools requires services');
 
   const defs = [];
@@ -1214,6 +1216,16 @@ export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) 
           orgId: orgId || defaultOrgId,
           replyTo,
         });
+        // Reply sent → clear the "processing" 👀 reaction for this conversation.
+        // The endpoint is `<conversationId>[|reply:..][|thread:..][|parent:..]`,
+        // so the conversationId is the part before the first '|'. Fire-and-forget:
+        // never let a reaction cleanup failure affect the send result.
+        try {
+          const convId = String(endpoint).split('|')[0];
+          reactions?.clearForConversation?.(convId, 'reply');
+        } catch (e) {
+          logger?.warn?.(`comm_send: reaction clear threw (ignored): ${e.message}`);
+        }
         return okResult(res);
       }
 

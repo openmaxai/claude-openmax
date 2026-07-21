@@ -31,6 +31,9 @@ const DEFAULT_RETRY_AFTER_MS = 5000;
  * @param {string} [opts.runtimeSession]  fallback runtime session key
  * @param {number} [opts.previewMax]      contentPreview cap
  * @param {number} [opts.retryAfterMs]    default backoff hint on failure
+ * @param {object} [opts.reactions]       ReactionManager (createReactionManager);
+ *        when present we apply the "processing" 👀 reaction AFTER a successful
+ *        wake. Strictly fire-and-forget — it never affects the deliver() result.
  * @returns {{deliver: (inbound:object)=>Promise<{ok:boolean, runtimeSession?:string, failureClass?:string, retryAfterMs?:number}>}}
  */
 export function createInboundDelivery({
@@ -39,6 +42,7 @@ export function createInboundDelivery({
   runtimeSession,
   previewMax,
   retryAfterMs = DEFAULT_RETRY_AFTER_MS,
+  reactions,
 } = {}) {
   if (typeof wake !== 'function') throw new Error('createInboundDelivery requires a wake(wakeRequest) function');
 
@@ -57,6 +61,15 @@ export function createInboundDelivery({
 
       try {
         const res = await wake(wakeReq);
+        // Acknowledge receipt by reacting to the inbound message — ONLY once the
+        // wake genuinely landed in the runtime's visible context (ok:true
+        // invariant). Fire-and-forget: a reaction failure must never delay or
+        // downgrade the delivery result. orgId comes off the normalized inbound.
+        try {
+          reactions?.applyOnReceive?.(inbound.orgId, wakeReq.conversationId, wakeReq.messageId);
+        } catch (e) {
+          logger?.warn?.(`inbound.deliver: reaction apply threw (ignored): ${e.message}`);
+        }
         const session = (res && res.runtimeSession) || runtimeSession;
         return session ? { ok: true, runtimeSession: session } : { ok: true };
       } catch (e) {

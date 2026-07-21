@@ -27,6 +27,7 @@ import { DebouncedWakeNotifier } from './notifier.js';
 import { createInboundDelivery } from './inbound-delivery.js';
 import { createMcpTools } from './mcp-tools.js';
 import { createBridge } from './create-bridge.js';
+import { createReactionManager } from './reactions.js';
 import { startWakeServer } from './wake-server.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 
@@ -46,6 +47,19 @@ async function main() {
   // effort and non-blocking: leadAgentId for the guided-autonomy flow == this.
   runtime.resolveIdentityId().catch(() => {});
 
+  // ── Receive-reaction ("processing" 👀) manager ─────────────────────────────
+  // Applied on inbound delivery, cleared on reply (comm_send) or timeout. On
+  // startup we clear ALL leftover markers so a mid-flight crash can't leave a
+  // stuck 👀. Fire-and-forget everywhere; disabled when reactionConfig.code is ''.
+  const reactions = createReactionManager({
+    http: runtime.http,
+    storage,
+    code: runtime.reactionConfig.code,
+    timeoutMs: runtime.reactionConfig.timeoutMs,
+    logger,
+  });
+  reactions.cleanupOnStartup().catch(() => {});
+
   // ── MCP channel (claude/channel push + tools) ──────────────────────────────
   const debounceMs = Number(process.env.CLAUDE_OPENMAX_DEBOUNCE_MS || '0');
   const channel = new ClaudeChannel({
@@ -59,6 +73,7 @@ async function main() {
     services: runtime.services,
     bridge: null,               // set after the bridge exists (comm_send needs it)
     defaultOrgId: runtime.resolveDefaultOrgId(),
+    reactions,
     logger,
   });
   channel.registerTools(defs, handler);
@@ -87,6 +102,7 @@ async function main() {
     const inbound = createInboundDelivery({
       wake: (req) => notifier.notify(req).then(() => ({ runtimeSession: channel.runtimeSession })),
       runtimeSession: channel.runtimeSession,
+      reactions,
       logger,
     });
     bridge = createBridge({
@@ -104,6 +120,7 @@ async function main() {
       services: runtime.services,
       bridge,
       defaultOrgId: runtime.resolveDefaultOrgId(),
+      reactions,
       logger,
     });
     channel.registerTools(withBridge.defs, withBridge.handler);

@@ -19,6 +19,25 @@ test('registers one dispatch tool per available service + comm_send', () => {
   assert.deepEqual(names, ['comm', 'comm_send', 'core', 'tm']);
 });
 
+test('comm_send clears the receive-reaction for the endpoint conversation', async () => {
+  const cleared = [];
+  const reactions = { clearForConversation: (convId, reason) => cleared.push({ convId, reason }) };
+  const bridge = { send: async () => ({ ok: true, messageId: 'reply1' }) };
+  const { handler } = createMcpTools({ services: fakeServices(), bridge, reactions, defaultOrgId: 'org1' });
+
+  // endpoint carries reply/thread suffixes → only the conversationId prefix is used
+  const res = await handler('comm_send', { endpoint: 'conv1|reply:msg9', content: 'hi' });
+  assert.equal(parse(res).ok, true);
+  assert.deepEqual(cleared, [{ convId: 'conv1', reason: 'reply' }]);
+});
+
+test('comm_send works without a reactions manager wired', async () => {
+  const bridge = { send: async () => ({ ok: true }) };
+  const { handler } = createMcpTools({ services: fakeServices(), bridge, defaultOrgId: 'org1' });
+  const res = await handler('comm_send', { endpoint: 'conv1', content: 'hi' });
+  assert.equal(parse(res).ok, true);
+});
+
 test('dispatch: {method:"list"} enumerates callable verbs (excludes private)', async () => {
   const { handler } = createMcpTools({ services: fakeServices() });
   const res = await handler('tm', { method: 'list' });
