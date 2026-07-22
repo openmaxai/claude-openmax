@@ -43,12 +43,14 @@ async function httpWake(endpoint, token, wakeReq) {
 
 async function main() {
   const { config, file } = loadAdapterConfig();
-  // Tee logs to a file (stderr is swallowed inside the MCP host). Same logger is
+  // File logging is OPT-IN (CLAUDE_OPENMAX_LOG_FILE). When on, the SAME logger is
   // handed to buildRuntime AND the SDK bridge, so adapter + SDK lines co-locate.
-  const logFile = resolveLogFilePath(file);
-  const logger = createStderrLogger('[claude-openmax-bridge]', { logFile });
+  const logFile = resolveLogFilePath();
+  const logger = createStderrLogger('[claude-openmax-bridge]', logFile ? { logFile } : {});
   logger.info(`config file: ${file}`);
-  logger.info(`log file: ${logFile}${process.env.CLAUDE_OPENMAX_LOG_FILE ? ' (from CLAUDE_OPENMAX_LOG_FILE)' : ' (default: next to config.json; override with CLAUDE_OPENMAX_LOG_FILE)'}`);
+  logger.info(logFile
+    ? `file logging ENABLED → ${logFile} (0600, 10MB cap, secrets scrubbed)`
+    : 'file logging OFF (stderr only) — set CLAUDE_OPENMAX_LOG_FILE to enable');
   const endpoint = config.wake?.endpoint;
   if (!endpoint) throw new Error('config.wake.endpoint is required for the split-topology bridge');
   const token = process.env.CLAUDE_OPENMAX_WAKE_TOKEN || config.wake?.token;

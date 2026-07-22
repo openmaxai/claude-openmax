@@ -59,6 +59,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { identityIdFromMe, purgeOrgTokenCache } from './token-guard.js';
+import { safeJson, redactSecretsDeep } from './redact.js';
 
 import {
   CwsHttpClient,
@@ -126,16 +127,16 @@ export function resolveConfigPath(explicit) {
 }
 
 /**
- * Resolve the diagnostic log-file path. `CLAUDE_OPENMAX_LOG_FILE` overrides;
- * otherwise the log sits next to the config file (same data dir) as
- * `claude-openmax.log`, so it is trivially findable given the config path.
+ * Resolve the diagnostic log-file path. File logging is OPT-IN: it is enabled
+ * ONLY when `CLAUDE_OPENMAX_LOG_FILE` is set, and returns `null` otherwise
+ * (stderr-only — the default for a released plugin, so no unbounded file grows
+ * on every user's machine). Returning a path here does not itself open a file;
+ * the entry points pass it to the logger only when non-null.
  *
- * @param {string} [configFile]  the resolved config path (from loadAdapterConfig);
- *        defaults to resolveConfigPath() so the two always share a directory.
+ * @returns {string|null} absolute log-file path, or null when file logging is off.
  */
-export function resolveLogFilePath(configFile) {
-  return process.env.CLAUDE_OPENMAX_LOG_FILE
-    || path.join(path.dirname(configFile || resolveConfigPath()), 'claude-openmax.log');
+export function resolveLogFilePath() {
+  return process.env.CLAUDE_OPENMAX_LOG_FILE || null;
 }
 
 export function loadAdapterConfig(explicitPath) {
@@ -619,7 +620,7 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
       // Purpose: from the log alone, tell exactly which step of applying a
       // workspace policy/access change failed / why it "doesn't take effect".
       const dataKeys = (data && typeof data === 'object') ? Object.keys(data) : [];
-      logger?.info?.(`[onConfigEvent] event=${event} org=${orgConfig.org_id} dataKeys=${safeJson(dataKeys)} data=${safeJson(redactSecrets(data))}`);
+      logger?.info?.(`[onConfigEvent] event=${event} org=${orgConfig.org_id} dataKeys=${safeJson(dataKeys)} data=${safeJson(redactSecretsDeep(data))}`);
 
       // owner_changed is SECURITY-SENSITIVE. The frame carries a
       // new_owner_member_id, but owner is the DM-access trust anchor, so a forged
@@ -719,17 +720,3 @@ function pickAccess(data) {
   return out;
 }
 
-// ── diagnostic-logging helpers (no runtime behavior) ─────────────────────────
-/** JSON.stringify that never throws (falls back to String). */
-function safeJson(v) {
-  try { return JSON.stringify(v); } catch { return String(v); }
-}
-/** Shallow copy with secret-ish keys masked, so config-event data can be logged. */
-function redactSecrets(obj) {
-  if (!obj || typeof obj !== 'object') return obj;
-  const out = Array.isArray(obj) ? [...obj] : { ...obj };
-  for (const k of Object.keys(out)) {
-    if (/(key|secret|token|password)/i.test(k)) out[k] = '[redacted]';
-  }
-  return out;
-}

@@ -49,25 +49,22 @@ function newShape(over = {}) {
   };
 }
 
-// ── diagnostic log-file path resolution ─────────────────────────────────────────
-test('resolveLogFilePath: defaults to claude-openmax.log next to the config file', () => {
+// ── diagnostic log-file path resolution (OPT-IN) ─────────────────────────────────
+test('resolveLogFilePath: returns null when CLAUDE_OPENMAX_LOG_FILE is unset (file logging OFF)', () => {
   const prev = process.env.CLAUDE_OPENMAX_LOG_FILE;
   delete process.env.CLAUDE_OPENMAX_LOG_FILE;
   try {
-    assert.equal(
-      resolveLogFilePath('/some/dir/config.json'),
-      path.join('/some/dir', 'claude-openmax.log'),
-    );
+    assert.equal(resolveLogFilePath(), null);
   } finally {
     if (prev === undefined) delete process.env.CLAUDE_OPENMAX_LOG_FILE; else process.env.CLAUDE_OPENMAX_LOG_FILE = prev;
   }
 });
 
-test('resolveLogFilePath: CLAUDE_OPENMAX_LOG_FILE overrides', () => {
+test('resolveLogFilePath: returns CLAUDE_OPENMAX_LOG_FILE when set (opt-in)', () => {
   const prev = process.env.CLAUDE_OPENMAX_LOG_FILE;
   process.env.CLAUDE_OPENMAX_LOG_FILE = '/var/log/custom.log';
   try {
-    assert.equal(resolveLogFilePath('/some/dir/config.json'), '/var/log/custom.log');
+    assert.equal(resolveLogFilePath(), '/var/log/custom.log');
   } finally {
     if (prev === undefined) delete process.env.CLAUDE_OPENMAX_LOG_FILE; else process.env.CLAUDE_OPENMAX_LOG_FILE = prev;
   }

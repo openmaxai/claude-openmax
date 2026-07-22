@@ -36,13 +36,15 @@ const PKG_VERSION = '1.1.0-beta.1';
 async function main() {
   const mode = process.env.CLAUDE_OPENMAX_MODE || 'inproc';
   const { config, file } = loadAdapterConfig();
-  // Tee logs to a file (stderr is swallowed inside the MCP host). Same logger is
+  // File logging is OPT-IN (CLAUDE_OPENMAX_LOG_FILE). When on, the SAME logger is
   // handed to buildRuntime AND the SDK bridge, so adapter + SDK lines co-locate.
-  const logFile = resolveLogFilePath(file);
-  const logger = createStderrLogger('[claude-openmax]', { logFile });
+  const logFile = resolveLogFilePath();
+  const logger = createStderrLogger('[claude-openmax]', logFile ? { logFile } : {});
   logger.info(`starting claude-openmax v${PKG_VERSION} (mode=${mode})`);
   logger.info(`config file: ${file}`);
-  logger.info(`log file: ${logFile}${process.env.CLAUDE_OPENMAX_LOG_FILE ? ' (from CLAUDE_OPENMAX_LOG_FILE)' : ' (default: next to config.json; override with CLAUDE_OPENMAX_LOG_FILE)'}`);
+  logger.info(logFile
+    ? `file logging ENABLED → ${logFile} (0600, 10MB cap, secrets scrubbed)`
+    : 'file logging OFF (stderr only) — set CLAUDE_OPENMAX_LOG_FILE to enable');
 
   const storage = createFileStorage();
   const runtimeState = createEmptyRuntimeState();

@@ -15,13 +15,10 @@
  * Mirrors the openmax component's `owner-config-sync` periodic task (5 min).
  */
 
+import { safeJson } from './redact.js';
+
 const DEFAULT_OWNER_SYNC_INTERVAL_MS = 5 * 60 * 1000;  // 5 min — matches the openmax component
 const DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS = 10 * 1000; // let connect + self-name hydration settle first
-
-/** JSON.stringify that never throws (falls back to String) — for diagnostic logs. */
-function safeJson(v) {
-  try { return JSON.stringify(v); } catch { return String(v); }
-}
 
 /**
  * Arm the periodic owner pull-sync. Returns a `{ stop }` handle; call stop() on

@@ -17674,6 +17674,45 @@ async function writeApiKeyMarkers({ storage, orgIds, apiKey, logger }) {
   }
 }
 
+// src/redact.js
+function safeJson(v) {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+var SECRET_KEY_RE = /(api[_-]?key|apikey|secret|client[_-]?secret|token|password|passwd|authorization|bearer)/i;
+function redactSecretsDeep(obj, _seen = /* @__PURE__ */ new WeakSet()) {
+  if (!obj || typeof obj !== "object") return obj;
+  if (_seen.has(obj)) return "[circular]";
+  _seen.add(obj);
+  if (Array.isArray(obj)) return obj.map((v) => redactSecretsDeep(v, _seen));
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (SECRET_KEY_RE.test(k)) out[k] = "[redacted]";
+    else out[k] = v && typeof v === "object" ? redactSecretsDeep(v, _seen) : v;
+  }
+  return out;
+}
+var LINE_PATTERNS = [
+  // JWT (three base64url segments) → mask entirely.
+  [/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted-jwt]"],
+  // CWS API keys (cwsk_...).
+  [/cwsk_[A-Za-z0-9_-]+/g, "[redacted-key]"],
+  // Authorization: Bearer <token>.
+  [/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[redacted]"],
+  // Labeled secrets in JSON or key=value form: keep the "key:" / "key=" prefix
+  // (and an opening quote if present), mask the value up to the next delimiter.
+  [/(["']?(?:api[_-]?key|apikey|client[_-]?secret|secret|password|passwd|token)["']?\s*[:=]\s*["']?)([^"'\s,;}]+)/gi, "$1[redacted]"]
+];
+function scrubLine(line) {
+  if (typeof line !== "string" || !line) return line;
+  let out = line;
+  for (const [re, repl] of LINE_PATTERNS) out = out.replace(re, repl);
+  return out;
+}
+
 // node_modules/@openmaxai/openmax-agent-sdk/src/providers.js
 var consoleLogger = {
   info: (...a) => console.log(...a),
@@ -21669,8 +21708,8 @@ function resolveConfigPath(explicit) {
     "config.json"
   );
 }
-function resolveLogFilePath(configFile) {
-  return process.env.CLAUDE_OPENMAX_LOG_FILE || path4.join(path4.dirname(configFile || resolveConfigPath()), "claude-openmax.log");
+function resolveLogFilePath() {
+  return process.env.CLAUDE_OPENMAX_LOG_FILE || null;
 }
 function loadAdapterConfig(explicitPath) {
   const file = resolveConfigPath(explicitPath);
@@ -22013,7 +22052,7 @@ function buildRuntime({ config: config2, file, storage, logger, httpClient, owne
     },
     onConfigEvent: async (orgConfig, { event, data }) => {
       const dataKeys = data && typeof data === "object" ? Object.keys(data) : [];
-      logger?.info?.(`[onConfigEvent] event=${event} org=${orgConfig.org_id} dataKeys=${safeJson(dataKeys)} data=${safeJson(redactSecrets(data))}`);
+      logger?.info?.(`[onConfigEvent] event=${event} org=${orgConfig.org_id} dataKeys=${safeJson(dataKeys)} data=${safeJson(redactSecretsDeep(data))}`);
       if (event === "agent.config.owner_changed") {
         logger?.info?.(`[onConfigEvent] ${event} \u2192 routing to syncOwnerFromCore (pull-not-trust; frame owner ignored) org=${orgConfig.org_id}`);
         const res = await syncOwnerFromCore(orgConfig);
@@ -22091,21 +22130,6 @@ function pickAccess(data) {
   }
   return out;
 }
-function safeJson(v) {
-  try {
-    return JSON.stringify(v);
-  } catch {
-    return String(v);
-  }
-}
-function redactSecrets(obj) {
-  if (!obj || typeof obj !== "object") return obj;
-  const out = Array.isArray(obj) ? [...obj] : { ...obj };
-  for (const k of Object.keys(out)) {
-    if (/(key|secret|token|password)/i.test(k)) out[k] = "[redacted]";
-  }
-  return out;
-}
 
 // src/storage.js
 import fs5 from "node:fs";
@@ -22178,15 +22202,27 @@ function createFileStorage(opts = {}) {
 // src/providers.js
 import fs6 from "node:fs";
 import path6 from "node:path";
+var LOG_FILE_MODE = 384;
+var LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
 function createStderrLogger(prefix = "[claude-openmax]", { logFile } = {}) {
   let appendToFile = null;
   if (logFile) {
     try {
-      fs6.mkdirSync(path6.dirname(logFile), { recursive: true });
-      const fd = fs6.openSync(logFile, "a");
+      fs6.mkdirSync(path6.dirname(logFile), { recursive: true, mode: 448 });
+      try {
+        if (fs6.statSync(logFile).size > LOG_FILE_MAX_BYTES) {
+          fs6.renameSync(logFile, `${logFile}.1`);
+        }
+      } catch {
+      }
+      const fd = fs6.openSync(logFile, "a", LOG_FILE_MODE);
+      try {
+        fs6.chmodSync(logFile, LOG_FILE_MODE);
+      } catch {
+      }
       appendToFile = (line) => {
         try {
-          fs6.writeSync(fd, line);
+          fs6.writeSync(fd, scrubLine(line));
         } catch {
         }
       };
@@ -25444,19 +25480,12 @@ function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfi
 // src/owner-sync.js
 var DEFAULT_OWNER_SYNC_INTERVAL_MS = 5 * 60 * 1e3;
 var DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS = 10 * 1e3;
-function safeJson2(v) {
-  try {
-    return JSON.stringify(v);
-  } catch {
-    return String(v);
-  }
-}
 function startOwnerSync({ runtime, logger, intervalMs = DEFAULT_OWNER_SYNC_INTERVAL_MS, initialDelayMs = DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS }) {
   const tick = () => {
     const orgs = runtime.orgConfigs;
     logger?.info?.(`[owner-sync] tick start \u2014 ${orgs.length} active org(s)`);
     for (const orgConfig of orgs) {
-      Promise.resolve().then(() => runtime.syncOwnerFromCore(orgConfig)).then((res) => logger?.info?.(`[owner-sync] org=${orgConfig.org_id} result=${safeJson2(res)}`)).catch((e) => logger?.warn?.(`[owner-sync] org=${orgConfig.org_id} FAILED: ${e.message}`));
+      Promise.resolve().then(() => runtime.syncOwnerFromCore(orgConfig)).then((res) => logger?.info?.(`[owner-sync] org=${orgConfig.org_id} result=${safeJson(res)}`)).catch((e) => logger?.warn?.(`[owner-sync] org=${orgConfig.org_id} FAILED: ${e.message}`));
     }
   };
   const timers = [];
@@ -25552,11 +25581,11 @@ var PKG_VERSION2 = "1.1.0-beta.1";
 async function main() {
   const mode = process.env.CLAUDE_OPENMAX_MODE || "inproc";
   const { config: config2, file } = loadAdapterConfig();
-  const logFile = resolveLogFilePath(file);
-  const logger = createStderrLogger("[claude-openmax]", { logFile });
+  const logFile = resolveLogFilePath();
+  const logger = createStderrLogger("[claude-openmax]", logFile ? { logFile } : {});
   logger.info(`starting claude-openmax v${PKG_VERSION2} (mode=${mode})`);
   logger.info(`config file: ${file}`);
-  logger.info(`log file: ${logFile}${process.env.CLAUDE_OPENMAX_LOG_FILE ? " (from CLAUDE_OPENMAX_LOG_FILE)" : " (default: next to config.json; override with CLAUDE_OPENMAX_LOG_FILE)"}`);
+  logger.info(logFile ? `file logging ENABLED \u2192 ${logFile} (0600, 10MB cap, secrets scrubbed)` : "file logging OFF (stderr only) \u2014 set CLAUDE_OPENMAX_LOG_FILE to enable");
   const storage = createFileStorage();
   const runtimeState = createEmptyRuntimeState();
   const runtime = buildRuntime({ config: config2, file, storage, logger });
