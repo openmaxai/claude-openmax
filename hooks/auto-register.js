@@ -124,9 +124,13 @@ export async function ensureRegistered(opts = {}) {
       // and legacy auth.apiKey too when the config is OLD-shape.
       cfg.agent = { ...(cfg.agent || {}), identity_id: identityId, api_key: newKey };
       if (legacy) cfg.auth = { ...(cfg.auth || {}), apiKey: newKey };
-      // Only persist cf_access when we actually have BOTH creds — never write an
-      // empty {client_id:'', client_secret:''} block back (public/prod has none).
+      // Persist cf_access only with BOTH creds (INT behind Cloudflare Access).
+      // Without them, STRIP any existing empty/partial block (e.g. the blank
+      // cf_access that config.example.json seeds) so it never lingers — a stale
+      // empty block would otherwise make the runtime emit empty CF-Access headers
+      // on public/prod.
       if (cfId && cfSecret) cfg.cf_access = { client_id: cfId, client_secret: cfSecret };
+      else delete cfg.cf_access;
       cfg.server = { ...(cfg.server || {}), bff_url: cfg.server?.bff_url || bffUrl };
       try { writeConfig0600(configPath, cfg); }
       catch (e) { log(`persist failed: ${e.message}`); return false; }

@@ -96,6 +96,33 @@ test('registers WITHOUT CF-Access creds (public/prod): no CF headers, no cf_acce
   assert.equal(statSync(cfgPath).mode & 0o777, 0o600, 'secret-bearing config must be 0600');
 });
 
+test('strips a pre-existing EMPTY cf_access block on register (e.g. from config.example.json template)', async () => {
+  // config.example.json seeds cf_access:{client_id:'',client_secret:''}. A public/prod
+  // install derived from it must not keep that empty block — it would otherwise make the
+  // runtime emit empty CF-Access headers. Registration must proceed AND drop the block.
+  const cfgPath = seedConfig();
+  const blankCf = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  blankCf.cf_access = { client_id: '', client_secret: '' };
+  writeFileSync(cfgPath, JSON.stringify(blankCf, null, 2), { mode: 0o644 });
+  const wrote = await runWith(cfgPath, () => withFetch(
+    (url) => url.endsWith('/auth/register/agent')
+      ? jsonRes(200, { identity_id: 'id-empty', api_key: 'cwsk_empty' })
+      : jsonRes(404, {}),
+    (calls) => ensureRegistered().then((w) => {
+      const reg = calls.find((c) => c.url.endsWith('/auth/register/agent'));
+      assert.ok(reg, 'should POST /auth/register/agent despite empty cf_access');
+      const h = reg.opts.headers;
+      assert.equal(h['CF-Access-Client-Id'], undefined, 'blank creds → no CF-Access-Client-Id');
+      assert.equal(h['CF-Access-Client-Secret'], undefined, 'blank creds → no CF-Access-Client-Secret');
+      return w;
+    }),
+  ));
+  assert.equal(wrote, true);
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  assert.equal(cfg.agent.api_key, 'cwsk_empty');
+  assert.equal(cfg.cf_access, undefined, 'pre-existing empty cf_access must be STRIPPED, not kept');
+});
+
 test('registers WITH CF-Access creds present: sends CF headers (INT regression guard)', async () => {
   const cfgPath = seedConfig(); // seedConfig includes cf_access {cf-id, cf-secret}
   const wrote = await runWith(cfgPath, () => withFetch(
