@@ -532,7 +532,7 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
       // task / owner_changed handler. A timeout lands here exactly like any other
       // fetch failure: keep the local owner, return {changed:false}, retry next tick.
       member = await withTimeout(
-        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${selfMemberId}`)),
+        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${encodeURIComponent(selfMemberId)}`)),
         ownerSyncTimeoutMs,
         `syncOwnerFromCore self-member fetch (org=${orgConfig.org_id})`,
       );
@@ -547,25 +547,44 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
     if (!coreOwnerId) return { changed: false, reason: 'core has no owner bound' };
 
     const localOwnerId = org?.owner?.member_id || '';
-    if (coreOwnerId === localOwnerId) return { changed: false, ownerMemberId: coreOwnerId }; // already in sync
+    const localOwnerName = org?.owner?.name || '';
+    // Fully in sync (id matches AND we already have a name) → nothing to do.
+    // We deliberately do NOT early-return when the id matches but the local name
+    // is EMPTY: a prior owner-name fetch may have timed out/failed and persisted
+    // an empty name, and this is the path that backfills it on a later tick.
+    if (coreOwnerId === localOwnerId && localOwnerName) {
+      return { changed: false, ownerMemberId: coreOwnerId };
+    }
 
     // Owner display name is cosmetic — a lookup failure (incl. timeout) must not
     // block the bind; we proceed with an empty name and let a later sync fill it.
     let ownerName = '';
     try {
       const ownerMember = await withTimeout(
-        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${coreOwnerId}`)),
+        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${encodeURIComponent(coreOwnerId)}`)),
         ownerSyncTimeoutMs,
         `syncOwnerFromCore owner-name fetch (org=${orgConfig.org_id})`,
       );
       ownerName = ownerMember?.display_name || ownerMember?.username || '';
     } catch { /* display name is cosmetic */ }
 
+    // Only write when something ACTUALLY changed — a new owner id, or a non-empty
+    // fetched name that differs from the local one (the backfill case). If core
+    // still returns no name for an already-bound owner, we skip the write so a
+    // steady state does not re-persist an empty name on every periodic tick.
+    const idChanged = coreOwnerId !== localOwnerId;
+    const nameChanged = !!ownerName && ownerName !== localOwnerName;
+    if (!idChanged && !nameChanged) {
+      return { changed: false, ownerMemberId: coreOwnerId };
+    }
+
     // Persist to config.json AND mutate the live captured orgConfig in place so
     // the SDK's owner-gated access decisions see the new owner without a restart.
+    // (For a same-id name backfill, ownerName is guaranteed non-empty here; for an
+    // owner change we bind whatever name we resolved — possibly '' if it failed.)
     configProvider.setOwner(orgConfig.org_id, coreOwnerId, ownerName);
     orgConfig.owner = { member_id: coreOwnerId, name: ownerName };
-    logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || '(none)'} → ${coreOwnerId}${ownerName ? ` (${ownerName})` : ''}`);
+    logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || '(none)'} → ${coreOwnerId}${ownerName ? ` (${ownerName})` : ''}${idChanged ? '' : ' (name backfill)'}`);
     return { changed: true, ownerMemberId: coreOwnerId, ownerName, previousOwnerMemberId: localOwnerId };
   };
 

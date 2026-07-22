@@ -8279,7 +8279,7 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
     let member;
     try {
       member = await withTimeout(
-        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${selfMemberId}`)),
+        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${encodeURIComponent(selfMemberId)}`)),
         ownerSyncTimeoutMs,
         `syncOwnerFromCore self-member fetch (org=${orgConfig.org_id})`
       );
@@ -8290,20 +8290,28 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
     const coreOwnerId = member?.owner_member_id || "";
     if (!coreOwnerId) return { changed: false, reason: "core has no owner bound" };
     const localOwnerId = org?.owner?.member_id || "";
-    if (coreOwnerId === localOwnerId) return { changed: false, ownerMemberId: coreOwnerId };
+    const localOwnerName = org?.owner?.name || "";
+    if (coreOwnerId === localOwnerId && localOwnerName) {
+      return { changed: false, ownerMemberId: coreOwnerId };
+    }
     let ownerName = "";
     try {
       const ownerMember = await withTimeout(
-        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${coreOwnerId}`)),
+        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${encodeURIComponent(coreOwnerId)}`)),
         ownerSyncTimeoutMs,
         `syncOwnerFromCore owner-name fetch (org=${orgConfig.org_id})`
       );
       ownerName = ownerMember?.display_name || ownerMember?.username || "";
     } catch {
     }
+    const idChanged = coreOwnerId !== localOwnerId;
+    const nameChanged = !!ownerName && ownerName !== localOwnerName;
+    if (!idChanged && !nameChanged) {
+      return { changed: false, ownerMemberId: coreOwnerId };
+    }
     configProvider.setOwner(orgConfig.org_id, coreOwnerId, ownerName);
     orgConfig.owner = { member_id: coreOwnerId, name: ownerName };
-    logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || "(none)"} \u2192 ${coreOwnerId}${ownerName ? ` (${ownerName})` : ""}`);
+    logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || "(none)"} \u2192 ${coreOwnerId}${ownerName ? ` (${ownerName})` : ""}${idChanged ? "" : " (name backfill)"}`);
     return { changed: true, ownerMemberId: coreOwnerId, ownerName, previousOwnerMemberId: localOwnerId };
   };
   const callbacks = {

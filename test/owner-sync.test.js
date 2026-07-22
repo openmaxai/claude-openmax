@@ -91,6 +91,40 @@ test('syncOwnerFromCore: no-op when core owner already matches local owner', asy
   assert.equal(res.ownerMemberId, 'OWNER-CORE');
 });
 
+test('syncOwnerFromCore: backfills an EMPTY owner name when the id already matches (prior name lookup had failed)', async () => {
+  const file = tmpFile();
+  const raw = shapeWithSelf();
+  // Owner already bound, but the name is empty (a previous owner-name fetch
+  // timed out/failed). The id-match early-return must NOT block the backfill.
+  raw.orgs['org-uuid-1'].owner = { member_id: 'OWNER-CORE', name: '' };
+  const config = normalizeConfig(raw, { logger: silentLogger });
+  const rt = buildRuntime({
+    config, file, storage: storageStub, logger: silentLogger,
+    httpClient: coreHttp({ ownerMemberId: 'OWNER-CORE', ownerName: 'Alice' }), // name now resolves
+  });
+  const res = await rt.syncOwnerFromCore(rt.orgConfigs[0]);
+  assert.equal(res.changed, true);
+  assert.equal(res.ownerMemberId, 'OWNER-CORE');
+  assert.equal(res.ownerName, 'Alice');
+  assert.equal(readJSON(file).orgs['org-uuid-1'].owner.name, 'Alice'); // backfilled + persisted
+  assert.equal(rt.orgConfigs[0].owner.name, 'Alice');                  // live orgConfig updated too
+});
+
+test('syncOwnerFromCore: no redundant persist when id matches and core still returns no name', async () => {
+  const file = tmpFile();
+  const raw = shapeWithSelf();
+  raw.orgs['org-uuid-1'].owner = { member_id: 'OWNER-CORE', name: '' };
+  const config = normalizeConfig(raw, { logger: silentLogger });
+  const rt = buildRuntime({
+    config, file, storage: storageStub, logger: silentLogger,
+    httpClient: coreHttp({ ownerMemberId: 'OWNER-CORE', ownerName: '' }), // core has the id but no name
+  });
+  const res = await rt.syncOwnerFromCore(rt.orgConfigs[0]);
+  assert.equal(res.changed, false);
+  // persist() writes the config file; a no-change tick must not create it.
+  assert.equal(fs.existsSync(file), false);
+});
+
 test('syncOwnerFromCore: never CLEARS a local owner when core reports none', async () => {
   const file = tmpFile();
   const raw = shapeWithSelf();
