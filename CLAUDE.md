@@ -133,11 +133,13 @@ Do **NOT** bump `.claude-plugin/marketplace.json` `metadata.version` for a plugi
 code release — that is the marketplace *catalog* document version, independent of
 the plugin. Bump it only when the marketplace catalog itself changes.
 
-**Release steps (after merge):** create the git tag + GitHub release. The
-canonical claude-plugin update-detection tag convention is
-`{plugin-name}--v{version}` (i.e. `openmax-channel--v<version>`); this repo's
-earlier releases used plain `v<version>` tags — which convention to standardize
-on is an open project decision.
+**Release steps (after merge):** create the git tag + GitHub release. Tag each
+release as `{plugin-name}--v{version}` — for this plugin that is
+`openmax-channel--v<version>` (e.g. `openmax-channel--v1.1.0-beta.1`), matching the
+`version` in that commit's `.claude-plugin/plugin.json`. This is the tag convention
+Claude Code's `claude plugin` uses for semver-based update detection. (Decided
+2026-07-22: standardize on `openmax-channel--v` going forward; the earlier plain
+`v<version>` tags predate this convention.)
 
 **Betas:** use a semver prerelease version (`-beta.N`) and mark the GitHub
 release as *prerelease*. Default `^`/`~` install ranges exclude prereleases, so a
