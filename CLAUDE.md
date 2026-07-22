@@ -112,3 +112,33 @@ not after the fact.
 - Report outcomes, not internal tool mechanics, back to the user.
 - Use the `tm` / `kb` tools for all task/KB operations. Discover a verb's fields
   with `{ "method":"list" }` instead of guessing param names.
+
+## Release / Versioning
+
+On **every** version change, bump the version in **all** of these — they are not
+kept in sync automatically:
+
+- **`.claude-plugin/plugin.json`** — **authoritative.** This is the version
+  Claude Code's `claude plugin` command reads to identify, track, and update the
+  installed plugin.
+- **`package.json`** + **`package-lock.json`** (both root `version` entries) —
+  npm / runtime version; the adapter also reports it as `app_version`.
+- **`PKG_VERSION`** literals in **`src/index.js`** and **`src/create-bridge.js`**.
+- **`DEFAULT_APP_VERSION`** in **`src/config.js`** (`claude-openmax/<version>`).
+- Then run **`npm run build`** to regenerate **`dist/index.mjs`** +
+  **`dist/bridge.mjs`** (both git-tracked — commit them).
+- Add a **`CHANGELOG.md`** entry (Keep a Changelog style).
+
+Do **NOT** bump `.claude-plugin/marketplace.json` `metadata.version` for a plugin
+code release — that is the marketplace *catalog* document version, independent of
+the plugin. Bump it only when the marketplace catalog itself changes.
+
+**Release steps (after merge):** create the git tag + GitHub release. The
+canonical claude-plugin update-detection tag convention is
+`{plugin-name}--v{version}` (i.e. `openmax-channel--v<version>`); this repo's
+earlier releases used plain `v<version>` tags — which convention to standardize
+on is an open project decision.
+
+**Betas:** use a semver prerelease version (`-beta.N`) and mark the GitHub
+release as *prerelease*. Default `^`/`~` install ranges exclude prereleases, so a
+beta does not reach normal users unless they explicitly opt in.
