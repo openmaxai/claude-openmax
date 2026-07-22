@@ -59,6 +59,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { identityIdFromMe, purgeOrgTokenCache } from './token-guard.js';
+import { safeJson, redactSecretsDeep } from './redact.js';
 
 import {
   CwsHttpClient,
@@ -72,7 +73,7 @@ import {
   createConnService,
 } from '@openmaxai/openmax-agent-sdk';
 
-const DEFAULT_APP_VERSION = 'claude-openmax/1.1.0-beta.1';
+const DEFAULT_APP_VERSION = 'claude-openmax/1.1.0';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 
 // Hard cap on how long a single owner-sync core HTTP call may block the caller
@@ -123,6 +124,19 @@ export function resolveConfigPath(explicit) {
     || path.join(process.env.CLAUDE_OPENMAX_DATA_DIR
       || path.join(process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`, 'claude-openmax'),
     'config.json');
+}
+
+/**
+ * Resolve the diagnostic log-file path. File logging is OPT-IN: it is enabled
+ * ONLY when `CLAUDE_OPENMAX_LOG_FILE` is set, and returns `null` otherwise
+ * (stderr-only — the default for a released plugin, so no unbounded file grows
+ * on every user's machine). Returning a path here does not itself open a file;
+ * the entry points pass it to the logger only when non-null.
+ *
+ * @returns {string|null} absolute log-file path, or null when file logging is off.
+ */
+export function resolveLogFilePath() {
+  return process.env.CLAUDE_OPENMAX_LOG_FILE || null;
 }
 
 export function loadAdapterConfig(explicitPath) {
@@ -356,8 +370,11 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
       // identity_id cache / config events) — a credential-exposure regression.
       fs.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 0o600 });
       fs.renameSync(tmp, file);
+      logger?.info?.(`config persisted to ${file}`);
     } catch (e) {
-      logger?.warn?.(`config persist failed: ${e.message}`);
+      // Observability: a swallowed warn hid persist failures. Surface it at ERROR
+      // with the target path + the error (behavior unchanged — still non-fatal).
+      logger?.error?.(`config persist FAILED to ${file}: ${e.message}`);
     }
   };
 
@@ -599,7 +616,12 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
       if (org) { org.owner = { ...(org.owner || {}), name }; persist(); }
     },
     onConfigEvent: async (orgConfig, { event, data }) => {
-      logger?.info?.(`config event ${event} for org=${orgConfig.org_id}`);
+      // ── DIAGNOSTIC LOGGING (logging-only; control flow + mutations unchanged) ──
+      // Purpose: from the log alone, tell exactly which step of applying a
+      // workspace policy/access change failed / why it "doesn't take effect".
+      const dataKeys = (data && typeof data === 'object') ? Object.keys(data) : [];
+      logger?.info?.(`[onConfigEvent] event=${event} org=${orgConfig.org_id} dataKeys=${safeJson(dataKeys)} data=${safeJson(redactSecretsDeep(data))}`);
+
       // owner_changed is SECURITY-SENSITIVE. The frame carries a
       // new_owner_member_id, but owner is the DM-access trust anchor, so a forged
       // or replayed frame must never be able to rebind us to an attacker. We do
@@ -608,14 +630,32 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
       // frame's owner fields entirely (pull-not-trust — parity with the openmax
       // component's owner_changed handling).
       if (event === 'agent.config.owner_changed') {
-        await syncOwnerFromCore(orgConfig); // never throws; result is best-effort
+        logger?.info?.(`[onConfigEvent] ${event} → routing to syncOwnerFromCore (pull-not-trust; frame owner ignored) org=${orgConfig.org_id}`);
+        const res = await syncOwnerFromCore(orgConfig); // never throws; result is best-effort
+        logger?.info?.(`[onConfigEvent] owner_changed syncOwnerFromCore result org=${orgConfig.org_id}: ${safeJson(res)}`);
         return;
       }
       // Other agent.config.* → mirror access fields into the org's access block.
       const org = orgByOrgId(orgConfig.org_id);
+      if (!org) {
+        logger?.warn?.(`[onConfigEvent] org NOT resolved by orgByOrgId(${orgConfig.org_id}) — access change is NOT applied/persisted (event effectively dropped). Known state.orgs ids=${safeJson(state.orgs.map((o) => o.org_id))}`);
+      }
       if (org && data && typeof data === 'object') {
-        org.access = { ...(org.access || {}), ...pickAccess(data) };
+        // The SDK hands us ITS orgConfig object; we mutate the INTERNAL state.orgs
+        // record resolved here. If they are DIFFERENT objects, the SDK's live
+        // access gate reads orgConfig.access — NOT our mutated org.access — which
+        // is a prime suspect for "the config change doesn't take effect".
+        const sameRef = org === orgConfig;
+        const picked = pickAccess(data);
+        const droppedKeys = dataKeys.filter((k) => !(k in picked));
+        logger?.info?.(`[onConfigEvent] resolved internal org=${orgConfig.org_id}; sameObjectAsSdkOrgConfig=${sameRef}`);
+        logger?.info?.(`[onConfigEvent] pickAccess picked=${safeJson(picked)} droppedIncomingKeys=${safeJson(droppedKeys)} (only dmPolicy/dmAllowFrom/groupPolicy are picked; 'groups' and others are DROPPED by design)`);
+        logger?.info?.(`[onConfigEvent] org.access BEFORE=${safeJson(org.access)} | sdk orgConfig.access=${safeJson(orgConfig.access)}`);
+        org.access = { ...(org.access || {}), ...picked };
+        logger?.info?.(`[onConfigEvent] org.access AFTER=${safeJson(org.access)}${sameRef ? '' : ' | sdk orgConfig.access UNCHANGED (different object) → SDK gate will not see this until reload'}`);
         persist();
+      } else if (org) {
+        logger?.warn?.(`[onConfigEvent] data missing or not an object (data=${safeJson(data)}) — nothing to apply org=${orgConfig.org_id}`);
       }
     },
     onConnectionEvent: (orgConfig) => logger?.info?.(`connection event for org=${orgConfig.org_id} (Cat.B no-op)`),

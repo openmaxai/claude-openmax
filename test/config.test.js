@@ -8,6 +8,7 @@ import {
   normalizeConfig,
   buildRuntime,
   resolveAndCacheIdentityId,
+  resolveLogFilePath,
 } from '../src/config.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -47,6 +48,27 @@ function newShape(over = {}) {
     ...over,
   };
 }
+
+// ── diagnostic log-file path resolution (OPT-IN) ─────────────────────────────────
+test('resolveLogFilePath: returns null when CLAUDE_OPENMAX_LOG_FILE is unset (file logging OFF)', () => {
+  const prev = process.env.CLAUDE_OPENMAX_LOG_FILE;
+  delete process.env.CLAUDE_OPENMAX_LOG_FILE;
+  try {
+    assert.equal(resolveLogFilePath(), null);
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_OPENMAX_LOG_FILE; else process.env.CLAUDE_OPENMAX_LOG_FILE = prev;
+  }
+});
+
+test('resolveLogFilePath: returns CLAUDE_OPENMAX_LOG_FILE when set (opt-in)', () => {
+  const prev = process.env.CLAUDE_OPENMAX_LOG_FILE;
+  process.env.CLAUDE_OPENMAX_LOG_FILE = '/var/log/custom.log';
+  try {
+    assert.equal(resolveLogFilePath(), '/var/log/custom.log');
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_OPENMAX_LOG_FILE; else process.env.CLAUDE_OPENMAX_LOG_FILE = prev;
+  }
+});
 
 // ── new-shape parsing ──────────────────────────────────────────────────────────
 test('normalizeConfig: parses new openmax-mirrored shape', () => {

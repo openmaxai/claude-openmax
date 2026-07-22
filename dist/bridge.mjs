@@ -3784,8 +3784,8 @@ var init_as = __esm({
         this.http = http;
         this.storage = storage;
       }
-      _p(path6) {
-        return this.http.apiPath(path6);
+      _p(path7) {
+        return this.http.apiPath(path7);
       }
       async _resolveDownloadDir() {
         if (this.storage && typeof this.storage.downloadDir === "function") {
@@ -3992,6 +3992,45 @@ async function writeApiKeyMarkers({ storage, orgIds, apiKey, logger }) {
       logger?.warn?.(`token-guard: failed to persist api_key marker for org=${orgId}: ${e.message}`);
     }
   }
+}
+
+// src/redact.js
+function safeJson(v) {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+var SECRET_KEY_RE = /(api[_-]?key|apikey|secret|client[_-]?secret|token|password|passwd|authorization|bearer)/i;
+function redactSecretsDeep(obj, _seen = /* @__PURE__ */ new WeakSet()) {
+  if (!obj || typeof obj !== "object") return obj;
+  if (_seen.has(obj)) return "[circular]";
+  _seen.add(obj);
+  if (Array.isArray(obj)) return obj.map((v) => redactSecretsDeep(v, _seen));
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (SECRET_KEY_RE.test(k)) out[k] = "[redacted]";
+    else out[k] = v && typeof v === "object" ? redactSecretsDeep(v, _seen) : v;
+  }
+  return out;
+}
+var LINE_PATTERNS = [
+  // JWT (three base64url segments) → mask entirely.
+  [/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted-jwt]"],
+  // CWS API keys (cwsk_...).
+  [/cwsk_[A-Za-z0-9_-]+/g, "[redacted-key]"],
+  // Authorization: Bearer <token>.
+  [/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[redacted]"],
+  // Labeled secrets in JSON or key=value form: keep the "key:" / "key=" prefix
+  // (and an opening quote if present), mask the value up to the next delimiter.
+  [/(["']?(?:api[_-]?key|apikey|client[_-]?secret|secret|password|passwd|token)["']?\s*[:=]\s*["']?)([^"'\s,;}]+)/gi, "$1[redacted]"]
+];
+function scrubLine(line) {
+  if (typeof line !== "string" || !line) return line;
+  let out = line;
+  for (const [re, repl] of LINE_PATTERNS) out = out.replace(re, repl);
+  return out;
 }
 
 // node_modules/@openmaxai/openmax-agent-sdk/src/providers.js
@@ -4438,9 +4477,9 @@ function rewriteInitForRedirect(init, status) {
   if (!downgradeToGet) return init;
   return { ...init, method: "GET", body: void 0, headers: stripBodyHeaders(init.headers) };
 }
-function buildUrl(baseUrl, path6, query) {
+function buildUrl(baseUrl, path7, query) {
   const base = (baseUrl || "").replace(/\/$/, "");
-  let url = path6.startsWith("http") ? path6 : `${base}${path6}`;
+  let url = path7.startsWith("http") ? path7 : `${base}${path7}`;
   if (!query) return url;
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
@@ -4652,8 +4691,8 @@ var CwsHttpClient = class {
     }
   }
   // ── generic request impl (baseUrl + headers injected by caller) ─────────────
-  async _doRequest(baseUrl, method, path6, { body, query, extraHeaders, orgId } = {}) {
-    const url = buildUrl(baseUrl, path6, query);
+  async _doRequest(baseUrl, method, path7, { body, query, extraHeaders, orgId } = {}) {
+    const url = buildUrl(baseUrl, path7, query);
     const trusted = this._isTrustedTarget(url);
     const sendOnce = async () => {
       const headers = {
@@ -4719,8 +4758,8 @@ var CwsHttpClient = class {
     return true;
   }
   // ── cws-core client (D8 envelope unwrap) ────────────────────────────────────
-  async _request(method, path6, opts = {}) {
-    const result = await this._doRequest(this._resolveBaseUrl(), method, path6, {
+  async _request(method, path7, opts = {}) {
+    const result = await this._doRequest(this._resolveBaseUrl(), method, path7, {
       ...opts,
       extraHeaders: { ...this._resolveCoreHeaders(), ...opts.extraHeaders || {} }
     });
@@ -4733,41 +4772,41 @@ var CwsHttpClient = class {
     return result;
   }
   // Default-org variants (use COCO_ORG_ID env or resolveDefaultOrgId).
-  get(path6, query) {
-    return this._request("GET", path6, { query });
+  get(path7, query) {
+    return this._request("GET", path7, { query });
   }
-  post(path6, body) {
-    return this._request("POST", path6, { body });
+  post(path7, body) {
+    return this._request("POST", path7, { body });
   }
-  patch(path6, body) {
-    return this._request("PATCH", path6, { body });
+  patch(path7, body) {
+    return this._request("PATCH", path7, { body });
   }
-  put(path6, body) {
-    return this._request("PUT", path6, { body });
+  put(path7, body) {
+    return this._request("PUT", path7, { body });
   }
-  del(path6) {
-    return this._request("DELETE", path6);
+  del(path7) {
+    return this._request("DELETE", path7);
   }
   // Org-aware variants — resolve the JWT against that specific org's cache.
-  getForOrg(orgId, path6, query) {
-    return this._request("GET", path6, { query, orgId });
+  getForOrg(orgId, path7, query) {
+    return this._request("GET", path7, { query, orgId });
   }
-  postForOrg(orgId, path6, body) {
-    return this._request("POST", path6, { body, orgId });
+  postForOrg(orgId, path7, body) {
+    return this._request("POST", path7, { body, orgId });
   }
   // Org-scoped GET that also attaches caller-supplied request headers (e.g.
   // cws-connect's X-Channel-Bind-Token). Same JWT resolution + D8 unwrap.
-  getForOrgWithHeaders(orgId, path6, extraHeaders, query) {
-    return this._request("GET", path6, { query, orgId, extraHeaders });
+  getForOrgWithHeaders(orgId, path7, extraHeaders, query) {
+    return this._request("GET", path7, { query, orgId, extraHeaders });
   }
-  patchForOrg(orgId, path6, body) {
-    return this._request("PATCH", path6, { body, orgId });
+  patchForOrg(orgId, path7, body) {
+    return this._request("PATCH", path7, { body, orgId });
   }
-  putForOrg(orgId, path6, body) {
-    return this._request("PUT", path6, { body, orgId });
+  putForOrg(orgId, path7, body) {
+    return this._request("PUT", path7, { body, orgId });
   }
-  delForOrg(orgId, path6) {
-    return this._request("DELETE", path6, { orgId });
+  delForOrg(orgId, path7) {
+    return this._request("DELETE", path7, { orgId });
   }
   /**
    * Prefix a logical path with the cws-core API prefix.
@@ -4781,24 +4820,24 @@ var CwsHttpClient = class {
    * Build a browser-navigable frontend URL. The frontend SPA is mounted at
    * `frontendBasePath` (default /workspace) on the same origin as the bff URL.
    */
-  frontendUrl(path6) {
+  frontendUrl(path7) {
     const base = this._resolveBaseUrl().replace(/\/$/, "");
     const prefix = (this._frontendBasePath || "/workspace").replace(/\/$/, "");
-    const p = path6 && !path6.startsWith("/") ? `/${path6}` : path6 || "";
+    const p = path7 && !path7.startsWith("/") ? `/${path7}` : path7 || "";
     return `${base}${prefix}${p}`;
   }
   // ── org-scoped clients for KB and AS routes ─────────────────────────────────
   _makeClient(baseUrl, scopeHeaders, orgId) {
-    const wrap = (method) => (path6, second) => {
+    const wrap = (method) => (path7, second) => {
       const opts = method === "GET" ? { query: second } : { body: second };
-      return this._doRequest(baseUrl, method, path6, { ...opts, extraHeaders: scopeHeaders, orgId });
+      return this._doRequest(baseUrl, method, path7, { ...opts, extraHeaders: scopeHeaders, orgId });
     };
     return {
       get: wrap("GET"),
       post: wrap("POST"),
       patch: wrap("PATCH"),
       put: wrap("PUT"),
-      del: (path6) => this._doRequest(baseUrl, "DELETE", path6, { extraHeaders: scopeHeaders, orgId }),
+      del: (path7) => this._doRequest(baseUrl, "DELETE", path7, { extraHeaders: scopeHeaders, orgId }),
       baseUrl,
       headers: scopeHeaders,
       orgId
@@ -5529,8 +5568,8 @@ var TmService = class {
     if (!http) throw new Error("TmService requires a CwsHttpClient");
     this.http = http;
   }
-  _p(path6) {
-    return this.http.apiPath(path6);
+  _p(path7) {
+    return this.http.apiPath(path7);
   }
   // ===========================================================================
   //  PROJECT
@@ -5819,8 +5858,8 @@ var KbService = class {
     this.http = http;
     this.as = as;
   }
-  _p(path6) {
-    return this.http.apiPath(path6);
+  _p(path7) {
+    return this.http.apiPath(path7);
   }
   _requireKbId(params) {
     const id = params.kbId || params.kb_id;
@@ -6093,8 +6132,8 @@ var CommService = class {
     this.http = http;
     this.config = config;
   }
-  _p(path6) {
-    return this.http.apiPath(path6);
+  _p(path7) {
+    return this.http.apiPath(path7);
   }
   _requireConfig(method) {
     if (!this.config) {
@@ -6296,8 +6335,8 @@ var CoreService = class {
     this.config = config;
     this.agentDomainProvider = agentDomain;
   }
-  _p(path6) {
-    return this.http.apiPath(path6);
+  _p(path7) {
+    return this.http.apiPath(path7);
   }
   // ---- Identity ------------------------------------------------------------
   me() {
@@ -6477,8 +6516,8 @@ var ConnService = class {
     this.storage = storage;
     this._resolveSelfMemberId = resolveSelfMemberId;
   }
-  _p(path6) {
-    return this.http.apiPath(path6);
+  _p(path7) {
+    return this.http.apiPath(path7);
   }
   _agentId(params) {
     const explicit = params.agentMemberId || params.agent_member_id;
@@ -6753,8 +6792,8 @@ var SyncEngine = class {
   _warn(...a) {
     this.logger?.warn?.(...a);
   }
-  _p(path6) {
-    return this.http.apiPath(path6);
+  _p(path7) {
+    return this.http.apiPath(path7);
   }
   /**
    * Reconnect catch-up: page `/sync` from `sessionRef.sync_seq`, feed each event
@@ -7969,7 +8008,7 @@ var CwsAgentBridge = class {
 };
 
 // src/config.js
-var DEFAULT_APP_VERSION = "claude-openmax/1.1.0-beta.1";
+var DEFAULT_APP_VERSION = "claude-openmax/1.1.0";
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
 var OWNER_SYNC_HTTP_TIMEOUT_MS = 1e4;
 function withTimeout(promise, ms, label) {
@@ -7988,6 +8027,9 @@ function resolveConfigPath(explicit) {
     process.env.CLAUDE_OPENMAX_DATA_DIR || path4.join(process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`, "claude-openmax"),
     "config.json"
   );
+}
+function resolveLogFilePath() {
+  return process.env.CLAUDE_OPENMAX_LOG_FILE || null;
 }
 function loadAdapterConfig(explicitPath) {
   const file = resolveConfigPath(explicitPath);
@@ -8152,8 +8194,9 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
       const tmp = `${file}.tmp-${process.pid}`;
       fs4.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 384 });
       fs4.renameSync(tmp, file);
+      logger?.info?.(`config persisted to ${file}`);
     } catch (e) {
-      logger?.warn?.(`config persist failed: ${e.message}`);
+      logger?.error?.(`config persist FAILED to ${file}: ${e.message}`);
     }
   };
   const orgByOrgId = (id) => state.orgs.find((o) => o.org_id === id);
@@ -8328,15 +8371,30 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
       }
     },
     onConfigEvent: async (orgConfig, { event, data }) => {
-      logger?.info?.(`config event ${event} for org=${orgConfig.org_id}`);
+      const dataKeys = data && typeof data === "object" ? Object.keys(data) : [];
+      logger?.info?.(`[onConfigEvent] event=${event} org=${orgConfig.org_id} dataKeys=${safeJson(dataKeys)} data=${safeJson(redactSecretsDeep(data))}`);
       if (event === "agent.config.owner_changed") {
-        await syncOwnerFromCore(orgConfig);
+        logger?.info?.(`[onConfigEvent] ${event} \u2192 routing to syncOwnerFromCore (pull-not-trust; frame owner ignored) org=${orgConfig.org_id}`);
+        const res = await syncOwnerFromCore(orgConfig);
+        logger?.info?.(`[onConfigEvent] owner_changed syncOwnerFromCore result org=${orgConfig.org_id}: ${safeJson(res)}`);
         return;
       }
       const org = orgByOrgId(orgConfig.org_id);
+      if (!org) {
+        logger?.warn?.(`[onConfigEvent] org NOT resolved by orgByOrgId(${orgConfig.org_id}) \u2014 access change is NOT applied/persisted (event effectively dropped). Known state.orgs ids=${safeJson(state.orgs.map((o) => o.org_id))}`);
+      }
       if (org && data && typeof data === "object") {
-        org.access = { ...org.access || {}, ...pickAccess(data) };
+        const sameRef = org === orgConfig;
+        const picked = pickAccess(data);
+        const droppedKeys = dataKeys.filter((k) => !(k in picked));
+        logger?.info?.(`[onConfigEvent] resolved internal org=${orgConfig.org_id}; sameObjectAsSdkOrgConfig=${sameRef}`);
+        logger?.info?.(`[onConfigEvent] pickAccess picked=${safeJson(picked)} droppedIncomingKeys=${safeJson(droppedKeys)} (only dmPolicy/dmAllowFrom/groupPolicy are picked; 'groups' and others are DROPPED by design)`);
+        logger?.info?.(`[onConfigEvent] org.access BEFORE=${safeJson(org.access)} | sdk orgConfig.access=${safeJson(orgConfig.access)}`);
+        org.access = { ...org.access || {}, ...picked };
+        logger?.info?.(`[onConfigEvent] org.access AFTER=${safeJson(org.access)}${sameRef ? "" : " | sdk orgConfig.access UNCHANGED (different object) \u2192 SDK gate will not see this until reload"}`);
         persist();
+      } else if (org) {
+        logger?.warn?.(`[onConfigEvent] data missing or not an object (data=${safeJson(data)}) \u2014 nothing to apply org=${orgConfig.org_id}`);
       }
     },
     onConnectionEvent: (orgConfig) => logger?.info?.(`connection event for org=${orgConfig.org_id} (Cat.B no-op)`),
@@ -8462,11 +8520,43 @@ function createFileStorage(opts = {}) {
 }
 
 // src/providers.js
-function createStderrLogger(prefix = "[claude-openmax]") {
+import fs6 from "node:fs";
+import path6 from "node:path";
+var LOG_FILE_MODE = 384;
+var LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
+function createStderrLogger(prefix = "[claude-openmax]", { logFile } = {}) {
+  let appendToFile = null;
+  if (logFile) {
+    try {
+      fs6.mkdirSync(path6.dirname(logFile), { recursive: true, mode: 448 });
+      try {
+        if (fs6.statSync(logFile).size > LOG_FILE_MAX_BYTES) {
+          fs6.renameSync(logFile, `${logFile}.1`);
+        }
+      } catch {
+      }
+      const fd = fs6.openSync(logFile, "a", LOG_FILE_MODE);
+      try {
+        fs6.chmodSync(logFile, LOG_FILE_MODE);
+      } catch {
+      }
+      appendToFile = (line) => {
+        try {
+          fs6.writeSync(fd, scrubLine(line));
+        } catch {
+        }
+      };
+    } catch (e) {
+      process.stderr.write(`${(/* @__PURE__ */ new Date()).toISOString()} ${prefix} WARN failed to open log file ${logFile}: ${e.message} \u2014 logging to stderr only
+`);
+    }
+  }
   const emit = (level, args) => {
     const line = args.map((a) => typeof a === "string" ? a : safeStringify(a)).join(" ");
-    process.stderr.write(`${(/* @__PURE__ */ new Date()).toISOString()} ${prefix} ${level} ${line}
-`);
+    const out = `${(/* @__PURE__ */ new Date()).toISOString()} ${prefix} ${level} ${line}
+`;
+    process.stderr.write(out);
+    if (appendToFile) appendToFile(out);
   };
   return {
     info: (...a) => emit("INFO", a),
@@ -8477,6 +8567,8 @@ function createStderrLogger(prefix = "[claude-openmax]") {
     log: (...a) => emit("LOG", a),
     warn: (...a) => emit("WARN", a),
     error: (...a) => emit("ERROR", a),
+    // Kept a no-op: the SDK can call debug() very frequently, and flooding the
+    // diagnostic log file would bury the signal. Adapter diagnostics use info/warn.
     debug: () => {
     }
   };
@@ -8559,7 +8651,7 @@ function createInboundDelivery({
 }
 
 // src/create-bridge.js
-var PKG_VERSION = "1.1.0-beta.1";
+var PKG_VERSION = "1.1.0";
 function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
   return new CwsAgentBridge({
     http: runtime.http,
@@ -8592,8 +8684,10 @@ var DEFAULT_OWNER_SYNC_INTERVAL_MS = 5 * 60 * 1e3;
 var DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS = 10 * 1e3;
 function startOwnerSync({ runtime, logger, intervalMs = DEFAULT_OWNER_SYNC_INTERVAL_MS, initialDelayMs = DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS }) {
   const tick = () => {
-    for (const orgConfig of runtime.orgConfigs) {
-      Promise.resolve().then(() => runtime.syncOwnerFromCore(orgConfig)).catch((e) => logger?.warn?.(`periodic owner-sync failed for org=${orgConfig.org_id}: ${e.message}`));
+    const orgs = runtime.orgConfigs;
+    logger?.info?.(`[owner-sync] tick start \u2014 ${orgs.length} active org(s)`);
+    for (const orgConfig of orgs) {
+      Promise.resolve().then(() => runtime.syncOwnerFromCore(orgConfig)).then((res) => logger?.info?.(`[owner-sync] org=${orgConfig.org_id} result=${safeJson(res)}`)).catch((e) => logger?.warn?.(`[owner-sync] org=${orgConfig.org_id} FAILED: ${e.message}`));
     }
   };
   const timers = [];
@@ -8645,8 +8739,11 @@ async function httpWake(endpoint, token, wakeReq) {
   return { runtimeSession: payload.runtimeSession };
 }
 async function main() {
-  const logger = createStderrLogger("[claude-openmax-bridge]");
   const { config, file } = loadAdapterConfig();
+  const logFile = resolveLogFilePath();
+  const logger = createStderrLogger("[claude-openmax-bridge]", logFile ? { logFile } : {});
+  logger.info(`config file: ${file}`);
+  logger.info(logFile ? `file logging ENABLED \u2192 ${logFile} (0600, 10MB cap, secrets scrubbed)` : "file logging OFF (stderr only) \u2014 set CLAUDE_OPENMAX_LOG_FILE to enable");
   const endpoint = config.wake?.endpoint;
   if (!endpoint) throw new Error("config.wake.endpoint is required for the split-topology bridge");
   const token = process.env.CLAUDE_OPENMAX_WAKE_TOKEN || config.wake?.token;

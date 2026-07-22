@@ -19,7 +19,7 @@
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { loadAdapterConfig, buildRuntime } from './config.js';
+import { loadAdapterConfig, buildRuntime, resolveLogFilePath } from './config.js';
 import { createFileStorage } from './storage.js';
 import { createStderrLogger, createEmptyRuntimeState } from './providers.js';
 import { ClaudeChannel } from './channel.js';
@@ -31,14 +31,21 @@ import { startOwnerSync } from './owner-sync.js';
 import { startWakeServer } from './wake-server.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 
-const PKG_VERSION = '1.1.0-beta.1';
+const PKG_VERSION = '1.1.0';
 
 async function main() {
-  const logger = createStderrLogger();
   const mode = process.env.CLAUDE_OPENMAX_MODE || 'inproc';
-  logger.info(`starting claude-openmax v${PKG_VERSION} (mode=${mode})`);
-
   const { config, file } = loadAdapterConfig();
+  // File logging is OPT-IN (CLAUDE_OPENMAX_LOG_FILE). When on, the SAME logger is
+  // handed to buildRuntime AND the SDK bridge, so adapter + SDK lines co-locate.
+  const logFile = resolveLogFilePath();
+  const logger = createStderrLogger('[claude-openmax]', logFile ? { logFile } : {});
+  logger.info(`starting claude-openmax v${PKG_VERSION} (mode=${mode})`);
+  logger.info(`config file: ${file}`);
+  logger.info(logFile
+    ? `file logging ENABLED → ${logFile} (0600, 10MB cap, secrets scrubbed)`
+    : 'file logging OFF (stderr only) — set CLAUDE_OPENMAX_LOG_FILE to enable');
+
   const storage = createFileStorage();
   const runtimeState = createEmptyRuntimeState();
   const runtime = buildRuntime({ config, file, storage, logger });
