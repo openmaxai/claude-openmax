@@ -635,28 +635,56 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
         logger?.info?.(`[onConfigEvent] owner_changed syncOwnerFromCore result org=${orgConfig.org_id}: ${safeJson(res)}`);
         return;
       }
-      // Other agent.config.* → mirror access fields into the org's access block.
+      // Other agent.config.* → map the event's REAL payload fields into the org's
+      // access block (event-type-aware; see applyConfigAccessEvent). The old code
+      // ran a generic pickAccess that only copied literal dmPolicy/dmAllowFrom/
+      // groupPolicy keys and DROPPED policy/scope/action/conversation_ids/… — so a
+      // workspace group/DM policy change arrived, picked {}, and never took effect.
       const org = orgByOrgId(orgConfig.org_id);
       if (!org) {
         logger?.warn?.(`[onConfigEvent] org NOT resolved by orgByOrgId(${orgConfig.org_id}) — access change is NOT applied/persisted (event effectively dropped). Known state.orgs ids=${safeJson(state.orgs.map((o) => o.org_id))}`);
+        return;
       }
-      if (org && data && typeof data === 'object') {
-        // The SDK hands us ITS orgConfig object; we mutate the INTERNAL state.orgs
-        // record resolved here. If they are DIFFERENT objects, the SDK's live
-        // access gate reads orgConfig.access — NOT our mutated org.access — which
-        // is a prime suspect for "the config change doesn't take effect".
-        const sameRef = org === orgConfig;
-        const picked = pickAccess(data);
-        const droppedKeys = dataKeys.filter((k) => !(k in picked));
-        logger?.info?.(`[onConfigEvent] resolved internal org=${orgConfig.org_id}; sameObjectAsSdkOrgConfig=${sameRef}`);
-        logger?.info?.(`[onConfigEvent] pickAccess picked=${safeJson(picked)} droppedIncomingKeys=${safeJson(droppedKeys)} (only dmPolicy/dmAllowFrom/groupPolicy are picked; 'groups' and others are DROPPED by design)`);
-        logger?.info?.(`[onConfigEvent] org.access BEFORE=${safeJson(org.access)} | sdk orgConfig.access=${safeJson(orgConfig.access)}`);
-        org.access = { ...(org.access || {}), ...picked };
-        logger?.info?.(`[onConfigEvent] org.access AFTER=${safeJson(org.access)}${sameRef ? '' : ' | sdk orgConfig.access UNCHANGED (different object) → SDK gate will not see this until reload'}`);
-        persist();
-      } else if (org) {
+      if (!data || typeof data !== 'object') {
         logger?.warn?.(`[onConfigEvent] data missing or not an object (data=${safeJson(data)}) — nothing to apply org=${orgConfig.org_id}`);
+        return;
       }
+
+      // "Not for us" guard (parity with zylos-openmax handleConfigUpdate): a config
+      // event may carry a target agent_member_id; if it names a DIFFERENT member than
+      // us, skip it. Only enforced when we actually know our own member_id — before
+      // the token exchange writes it back (applyMemberId) self.member_id is '' and we
+      // must not drop events on an empty comparison.
+      const selfMemberId = org.self?.member_id || orgConfig.self?.member_id || '';
+      if (data.agent_member_id && selfMemberId && data.agent_member_id !== selfMemberId) {
+        logger?.info?.(`[onConfigEvent] event=${event} not for us (target=${data.agent_member_id}, self=${selfMemberId}) — skip org=${orgConfig.org_id}`);
+        return;
+      }
+
+      // The SDK hands us ITS orgConfig object; we mutate the INTERNAL state.orgs
+      // record resolved here (that is what persist() serializes). In this adapter
+      // they are normally the SAME object (loadConfig/orgConfigs hand out the live
+      // state.orgs refs), but we do not assume it: after mutating org.access we also
+      // point orgConfig.access at it when they differ, so the SDK's live access gate
+      // reflects the change immediately without a reload (mirrors zylos-openmax's
+      // "sync the live reference directly" epilogue).
+      const sameRef = org === orgConfig;
+      org.access = org.access || {};
+      logger?.info?.(`[onConfigEvent] resolved internal org=${orgConfig.org_id}; sameObjectAsSdkOrgConfig=${sameRef}`);
+      logger?.info?.(`[onConfigEvent] org.access BEFORE=${safeJson(org.access)} | sdk orgConfig.access=${safeJson(orgConfig.access)}`);
+
+      const result = applyConfigAccessEvent(org.access, event, data);
+      if (!result.applied) {
+        logger?.warn?.(`[onConfigEvent] ${result.unknown ? '' : `${event}: `}${result.reason} — nothing applied org=${orgConfig.org_id} (org.access unchanged=${safeJson(org.access)})`);
+        return;
+      }
+
+      // Sync the SDK's live access reference when it is a different object.
+      if (!sameRef) orgConfig.access = org.access;
+
+      logger?.info?.(`[onConfigEvent] applied: ${result.summary} (by ${data.changed_by || '?'}) org=${orgConfig.org_id}`);
+      logger?.info?.(`[onConfigEvent] org.access AFTER=${safeJson(org.access)}${sameRef ? '' : ' | sdk orgConfig.access synced to internal record → live gate updated immediately'}`);
+      persist();
     },
     onConnectionEvent: (orgConfig) => logger?.info?.(`connection event for org=${orgConfig.org_id} (Cat.B no-op)`),
     onChannelEvent: (orgConfig) => logger?.info?.(`channel event for org=${orgConfig.org_id} (Cat.B no-op)`),
@@ -712,10 +740,117 @@ function hasWsTuning(ws) {
   return !!ws && (ws.reconnectMaxMs != null || ws.heartbeatIntervalMs != null || ws.pingIntervalMs != null);
 }
 
-function pickAccess(data) {
-  const out = {};
-  for (const k of ['dmPolicy', 'dmAllowFrom', 'groupPolicy']) {
-    if (data[k] !== undefined) out[k] = data[k];
+// Validation sets, mirrored 1:1 from the proven zylos-openmax comm-bridge
+// handleConfigUpdate. Values outside these sets are rejected (event dropped
+// with a warning) rather than written into the access block.
+const VALID_DM_POLICIES = new Set(['open', 'allowlist', 'owner']);
+const VALID_GROUP_SCOPES = new Set(['open', 'allowlist', 'disabled']);
+const VALID_GROUP_MODES = new Set(['smart', 'mention', 'silent']);
+
+/**
+ * Apply ONE `agent.config.*` policy/access event to an `access` block IN PLACE,
+ * mapping each event type's REAL payload fields onto the claude-openmax access
+ * shape ({dmPolicy, dmAllowFrom, groupPolicy, groups:{<convId>:{mode,allowFrom}}}).
+ *
+ * This replaces the old generic `pickAccess` (which only copied literal
+ * dmPolicy/dmAllowFrom/groupPolicy keys and silently DROPPED the real event
+ * fields — policy/scope/action/member_ids/conversation_id(s)/allow_from/mode —
+ * so a workspace policy change never took effect). It is an event-type-aware
+ * switch mirroring zylos-openmax's handleConfigUpdate.
+ *
+ * Does NOT persist and does NOT touch the SDK's live orgConfig — the caller owns
+ * both (so the mutation, the live-gate sync, and persist() stay together and the
+ * diagnostic logging can wrap them). owner_changed is handled separately by the
+ * caller (pull-not-trust) and is intentionally NOT a case here.
+ *
+ * @param {object} access  the org's access block, mutated in place (caller ensures it exists)
+ * @param {string} event   the agent.config.* event name
+ * @param {object} data    the event payload (already known to be a non-null object)
+ * @returns {{applied:boolean, summary?:string, reason?:string, unknown?:boolean}}
+ *   applied:true + a human summary when a change was written; applied:false with a
+ *   reason (and unknown:true for an unrecognized event) when nothing was applied.
+ */
+function applyConfigAccessEvent(access, event, data) {
+  switch (event) {
+    case 'agent.config.dm_policy_changed': {
+      const { policy } = data;
+      if (!VALID_DM_POLICIES.has(policy)) return { applied: false, reason: `invalid dm policy "${policy}"` };
+      access.dmPolicy = policy;
+      return { applied: true, summary: `dmPolicy → ${policy}` };
+    }
+
+    case 'agent.config.dm_allowlist_changed': {
+      const { action, member_ids: memberIds } = data;
+      if (!Array.isArray(memberIds) || !memberIds.length) return { applied: false, reason: 'missing or empty member_ids' };
+      access.dmAllowFrom = access.dmAllowFrom || [];
+      if (action === 'add') {
+        const existing = new Set(access.dmAllowFrom);
+        for (const id of memberIds) if (!existing.has(id)) access.dmAllowFrom.push(id);
+      } else if (action === 'remove') {
+        const toRemove = new Set(memberIds);
+        access.dmAllowFrom = access.dmAllowFrom.filter((id) => !toRemove.has(id));
+      } else if (action === 'set') {
+        access.dmAllowFrom = [...memberIds];
+      } else {
+        return { applied: false, reason: `unknown action "${action}"` };
+      }
+      return { applied: true, summary: `dmAllowFrom ${action} ${memberIds.length} member(s)` };
+    }
+
+    case 'agent.config.group_mode_changed': {
+      const { mode, conversation_id: convId } = data;
+      if (!VALID_GROUP_MODES.has(mode)) return { applied: false, reason: `invalid mode "${mode}"` };
+      if (!convId) return { applied: false, reason: 'missing conversation_id' };
+      access.groups = access.groups || {};
+      if (mode === 'silent') {
+        delete access.groups[convId];
+      } else {
+        access.groups[convId] = access.groups[convId] || { allowFrom: ['*'] };
+        access.groups[convId].mode = mode;
+      }
+      return { applied: true, summary: `group ${convId} mode → ${mode}` };
+    }
+
+    case 'agent.config.group_allowfrom_changed': {
+      const { allow_from: allowFrom, conversation_id: convId } = data;
+      if (!convId) return { applied: false, reason: 'missing conversation_id' };
+      if (!Array.isArray(allowFrom)) return { applied: false, reason: 'allow_from is not an array' };
+      access.groups = access.groups || {};
+      if (!access.groups[convId]) {
+        access.groups[convId] = { mode: 'mention', allowFrom: [...allowFrom] };
+      } else {
+        access.groups[convId].allowFrom = [...allowFrom];
+      }
+      return { applied: true, summary: `group ${convId} allowFrom → ${safeJson(allowFrom)}` };
+    }
+
+    case 'agent.config.group_scope_changed': {
+      const { scope } = data;
+      if (!VALID_GROUP_SCOPES.has(scope)) return { applied: false, reason: `invalid scope "${scope}"` };
+      access.groupPolicy = scope;
+      return { applied: true, summary: `groupPolicy → ${scope}` };
+    }
+
+    case 'agent.config.group_allowlist_changed': {
+      const { action, conversation_ids: convIds } = data;
+      if (!Array.isArray(convIds)) return { applied: false, reason: 'conversation_ids is not an array' };
+      if (!['add', 'remove', 'set'].includes(action)) return { applied: false, reason: `unknown action "${action}"` };
+      access.groups = access.groups || {};
+      if (action === 'add') {
+        for (const id of convIds) {
+          if (!access.groups[id]) access.groups[id] = { mode: 'mention', allowFrom: ['*'] };
+        }
+      } else if (action === 'remove') {
+        for (const id of convIds) delete access.groups[id];
+      } else { // 'set'
+        const old = access.groups;
+        access.groups = {};
+        for (const id of convIds) access.groups[id] = old[id] || { mode: 'mention', allowFrom: ['*'] };
+      }
+      return { applied: true, summary: `group_allowlist ${action} ${convIds.length} conversation(s)` };
+    }
+
+    default:
+      return { applied: false, unknown: true, reason: `unknown config event "${event}"` };
   }
-  return out;
 }

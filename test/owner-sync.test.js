@@ -240,16 +240,159 @@ test('onConfigEvent(owner_changed): does NOT write the frame owner into the acce
 });
 
 // A non-owner config event still mirrors access fields (regression guard for the
-// early-return added by owner_changed).
+// early-return added by owner_changed). dm_policy_changed carries the REAL field
+// `policy` (not a literal `dmPolicy`) — the whole point of the event-type mapping.
 test('onConfigEvent(non-owner event): still mirrors access fields', async () => {
   const file = tmpFile();
   const config = normalizeConfig(shapeWithSelf(), { logger: silentLogger });
   const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger, httpClient: {} });
   await rt.callbacks.onConfigEvent(rt.orgConfigs[0], {
     event: 'agent.config.dm_policy_changed',
-    data: { dmPolicy: 'open' },
+    data: { policy: 'open' },
   });
   assert.equal(readJSON(file).orgs['org-uuid-1'].access.dmPolicy, 'open');
+});
+
+// ── event-type-aware access mapping (regression: pickAccess dropped real fields) ─
+// Each case sends the WIRE payload the OpenMax workspace UI actually emits and
+// asserts the org's access block + the SDK's live orgConfig.access both change and
+// are persisted. Uses an httpClient:{} stub so no network is touched.
+function accessRuntime() {
+  const file = tmpFile();
+  const config = normalizeConfig(shapeWithSelf(), { logger: silentLogger });
+  const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger, httpClient: {} });
+  return { file, rt, org: rt.orgConfigs[0] };
+}
+
+test('onConfigEvent(group_scope_changed): sets groupPolicy (the live bug repro)', async () => {
+  const { file, rt, org } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_scope_changed',
+    data: { scope: 'allowlist' },
+  });
+  assert.equal(org.access.groupPolicy, 'allowlist');            // live SDK gate sees it
+  assert.equal(readJSON(file).orgs['org-uuid-1'].access.groupPolicy, 'allowlist'); // persisted
+});
+
+test('onConfigEvent(group_scope_changed): rejects an invalid scope (nothing applied)', async () => {
+  const { file, rt, org } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_scope_changed',
+    data: { scope: 'bogus' },
+  });
+  assert.equal(org.access.groupPolicy, 'allowlist');            // unchanged from shapeWithSelf default
+  // An invalid event applies nothing and never calls persist() → no file written.
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('onConfigEvent(group_allowlist_changed add): adds group entries with defaults', async () => {
+  const { file, rt, org } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_allowlist_changed',
+    data: { action: 'add', conversation_ids: ['conv-A', 'conv-B'] },
+  });
+  assert.deepEqual(org.access.groups['conv-A'], { mode: 'mention', allowFrom: ['*'] });
+  assert.deepEqual(org.access.groups['conv-B'], { mode: 'mention', allowFrom: ['*'] });
+  assert.deepEqual(readJSON(file).orgs['org-uuid-1'].access.groups['conv-A'], { mode: 'mention', allowFrom: ['*'] });
+});
+
+test('onConfigEvent(group_allowlist_changed remove): deletes group entries', async () => {
+  const { file, rt, org } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_allowlist_changed',
+    data: { action: 'add', conversation_ids: ['conv-A', 'conv-B'] },
+  });
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_allowlist_changed',
+    data: { action: 'remove', conversation_ids: ['conv-A'] },
+  });
+  assert.equal(org.access.groups['conv-A'], undefined);
+  assert.ok(org.access.groups['conv-B']);
+  assert.equal(readJSON(file).orgs['org-uuid-1'].access.groups['conv-A'], undefined);
+});
+
+test('onConfigEvent(group_allowlist_changed set): replaces the whole allowlist, preserving existing entry settings', async () => {
+  const { file, rt, org } = accessRuntime();
+  // seed conv-A with a non-default mode, then `set` to [conv-A, conv-C]
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_mode_changed',
+    data: { mode: 'smart', conversation_id: 'conv-A' },
+  });
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_allowlist_changed',
+    data: { action: 'set', conversation_ids: ['conv-A', 'conv-C'] },
+  });
+  assert.deepEqual(Object.keys(org.access.groups).sort(), ['conv-A', 'conv-C']);
+  assert.equal(org.access.groups['conv-A'].mode, 'smart');        // preserved existing settings
+  assert.deepEqual(org.access.groups['conv-C'], { mode: 'mention', allowFrom: ['*'] }); // fresh default
+  assert.deepEqual(Object.keys(readJSON(file).orgs['org-uuid-1'].access.groups).sort(), ['conv-A', 'conv-C']);
+});
+
+test('onConfigEvent(dm_policy_changed): sets dmPolicy and validates', async () => {
+  const { file, rt, org } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.dm_policy_changed', data: { policy: 'allowlist' } });
+  assert.equal(org.access.dmPolicy, 'allowlist');
+  // invalid policy is rejected — value stays
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.dm_policy_changed', data: { policy: 'nope' } });
+  assert.equal(org.access.dmPolicy, 'allowlist');
+  assert.equal(readJSON(file).orgs['org-uuid-1'].access.dmPolicy, 'allowlist');
+});
+
+test('onConfigEvent(dm_allowlist_changed): add / remove / set on dmAllowFrom', async () => {
+  const { file, rt, org } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.dm_allowlist_changed', data: { action: 'add', member_ids: ['m1', 'm2'] } });
+  assert.deepEqual(org.access.dmAllowFrom, ['m1', 'm2']);
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.dm_allowlist_changed', data: { action: 'add', member_ids: ['m2', 'm3'] } }); // dedupe m2
+  assert.deepEqual(org.access.dmAllowFrom, ['m1', 'm2', 'm3']);
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.dm_allowlist_changed', data: { action: 'remove', member_ids: ['m1'] } });
+  assert.deepEqual(org.access.dmAllowFrom, ['m2', 'm3']);
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.dm_allowlist_changed', data: { action: 'set', member_ids: ['x'] } });
+  assert.deepEqual(org.access.dmAllowFrom, ['x']);
+  assert.deepEqual(readJSON(file).orgs['org-uuid-1'].access.dmAllowFrom, ['x']);
+});
+
+test('onConfigEvent(group_mode_changed): sets a mode, silent deletes the group entry', async () => {
+  const { file, rt, org } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.group_mode_changed', data: { mode: 'smart', conversation_id: 'conv-X' } });
+  assert.deepEqual(org.access.groups['conv-X'], { allowFrom: ['*'], mode: 'smart' });
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.group_mode_changed', data: { mode: 'silent', conversation_id: 'conv-X' } });
+  assert.equal(org.access.groups['conv-X'], undefined);
+  assert.equal(readJSON(file).orgs['org-uuid-1'].access.groups['conv-X'], undefined);
+});
+
+test('onConfigEvent(group_allowfrom_changed): sets allowFrom, creating a mention entry when absent', async () => {
+  const { file, rt, org } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.group_allowfrom_changed', data: { conversation_id: 'conv-Y', allow_from: ['m9'] } });
+  assert.deepEqual(org.access.groups['conv-Y'], { mode: 'mention', allowFrom: ['m9'] });
+  // updating an existing entry replaces allowFrom but keeps mode
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.group_mode_changed', data: { mode: 'smart', conversation_id: 'conv-Y' } });
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.group_allowfrom_changed', data: { conversation_id: 'conv-Y', allow_from: ['*'] } });
+  assert.deepEqual(org.access.groups['conv-Y'], { mode: 'smart', allowFrom: ['*'] });
+  assert.deepEqual(readJSON(file).orgs['org-uuid-1'].access.groups['conv-Y'], { mode: 'smart', allowFrom: ['*'] });
+});
+
+test('onConfigEvent(unknown event): warns and applies nothing', async () => {
+  const { file, rt, org } = accessRuntime();
+  const before = JSON.stringify(org.access);
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.something_new', data: { foo: 'bar' } });
+  assert.equal(JSON.stringify(org.access), before);
+  // Unknown event applies nothing → persist() not called → no file written.
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('onConfigEvent: skips an event addressed to a DIFFERENT agent_member_id', async () => {
+  const { rt, org } = accessRuntime(); // shapeWithSelf → self.member_id = SELF-1
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_scope_changed',
+    data: { scope: 'open', agent_member_id: 'SOMEONE-ELSE' },
+  });
+  assert.equal(org.access.groupPolicy, 'allowlist'); // unchanged — not for us
+  // ...but an event targeting US (or with no target) IS applied
+  await rt.callbacks.onConfigEvent(org, {
+    event: 'agent.config.group_scope_changed',
+    data: { scope: 'open', agent_member_id: 'SELF-1' },
+  });
+  assert.equal(org.access.groupPolicy, 'open');
 });
 
 // ── periodic scheduler: reconciles every active org, then stops cleanly ────────
