@@ -13,8 +13,7 @@
  */
 
 import { CwsAgentBridge } from '@openmaxai/openmax-agent-sdk';
-
-const PKG_VERSION = '1.1.1';
+import { PKG_VERSION } from './version.js';
 
 /**
  * @param {object} params

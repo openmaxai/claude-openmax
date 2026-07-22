@@ -3527,7 +3527,7 @@ var require_websocket_server = __commonJS({
         socket.on("error", socketOnError);
         const key = req.headers["sec-websocket-key"];
         const upgrade = req.headers.upgrade;
-        const version2 = +req.headers["sec-websocket-version"];
+        const version3 = +req.headers["sec-websocket-version"];
         if (req.method !== "GET") {
           const message = "Invalid HTTP method";
           abortHandshakeOrEmitwsClientError(this, req, socket, 405, message);
@@ -3543,7 +3543,7 @@ var require_websocket_server = __commonJS({
           abortHandshakeOrEmitwsClientError(this, req, socket, 400, message);
           return;
         }
-        if (version2 !== 13 && version2 !== 8) {
+        if (version3 !== 13 && version3 !== 8) {
           const message = "Missing or invalid Sec-WebSocket-Version header";
           abortHandshakeOrEmitwsClientError(this, req, socket, 400, message, {
             "Sec-WebSocket-Version": "13, 8"
@@ -3587,7 +3587,7 @@ var require_websocket_server = __commonJS({
         }
         if (this.options.verifyClient) {
           const info = {
-            origin: req.headers[`${version2 === 8 ? "sec-websocket-origin" : "origin"}`],
+            origin: req.headers[`${version3 === 8 ? "sec-websocket-origin" : "origin"}`],
             secure: !!(req.socket.authorized || req.socket.encrypted),
             req
           };
@@ -11693,10 +11693,10 @@ var ksuid = /^[A-Za-z0-9]{27}$/;
 var nanoid = /^[a-zA-Z0-9_-]{21}$/;
 var duration = /^P(?:(\d+W)|(?!.*W)(?=\d|T\d)(\d+Y)?(\d+M)?(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+([.,]\d+)?S)?)?)$/;
 var guid = /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
-var uuid = (version2) => {
-  if (!version2)
+var uuid = (version3) => {
+  if (!version3)
     return /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/;
-  return new RegExp(`^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-${version2}[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$`);
+  return new RegExp(`^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-${version3}[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$`);
 };
 var email = /^(?!\.)(?!.*\.\.)([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$/;
 var _emoji = `^(\\p{Extended_Pictographic}|\\p{Emoji_Component})+$`;
@@ -18295,9 +18295,9 @@ var CwsHttpClient = class {
     if (this._headersOverride) return this._headersOverride;
     const out = {};
     const deviceId = this._deviceId || process.env.COCO_DEVICE_ID || "";
-    const version2 = this._clientVersion || process.env.COCO_CLIENT_VERSION || "";
+    const version3 = this._clientVersion || process.env.COCO_CLIENT_VERSION || "";
     if (deviceId) out["X-Device-Id"] = deviceId;
-    if (version2) out["X-Client-Version"] = version2;
+    if (version3) out["X-Client-Version"] = version3;
     return out;
   }
   // ── RPC log emission (uses injected logger + file sink) ─────────────────────
@@ -20780,7 +20780,7 @@ function createCgroupCollector({
   }
   function read() {
     const errors = [];
-    const version2 = cgroupVersion();
+    const version3 = cgroupVersion();
     let cpuPct = null;
     const { limitCores, found: cpuLimFound } = readCpuLimitCores();
     if (!cpuLimFound) errors.push("cpu_limit_unreadable");
@@ -20814,7 +20814,7 @@ function createCgroupCollector({
       mem_pct: round2(memPct),
       mem_total_bytes: memTotal,
       mem_used_bytes: memUsed,
-      cgroup_version: version2,
+      cgroup_version: version3,
       errors
     };
   }
@@ -20829,13 +20829,13 @@ function selectPrimaryOrg(activeOrgConfigs) {
   const [orgId, orgConfig] = primary;
   return { orgId, orgConfig, selfMemberId: orgConfig.self?.member_id };
 }
-function buildPayload(state, cg, version2 = "0.0.0") {
+function buildPayload(state, cg, version3 = "0.0.0") {
   if (!state) return null;
   const sys = state.system_metrics || {};
   const rt = state.runtime_info || {};
   const containerized = cg.cgroup_version !== "none";
   return {
-    version: version2,
+    version: version3,
     resources: {
       cpu_pct: containerized ? cg.cpu_pct ?? null : sys.cpu_pct ?? null,
       mem_pct: containerized ? cg.mem_pct ?? null : sys.mem_pct ?? null,
@@ -20867,7 +20867,7 @@ function createMetricsReporter(activeOrgConfigs, {
   runtimeState,
   logger = consoleLogger,
   cgroup = createCgroupCollector(),
-  version: version2 = "0.0.0",
+  version: version3 = "0.0.0",
   putForOrg,
   apiPath
 } = {}) {
@@ -20907,7 +20907,7 @@ function createMetricsReporter(activeOrgConfigs, {
       loggedCgroupFallback = true;
       log("cgroup unavailable (non-containerized agent) \u2014 reporting node-level CPU/memory from runtime state");
     }
-    const payload = buildPayload(state, cg, version2);
+    const payload = buildPayload(state, cg, version3);
     if (!payload) return;
     const primary = selectPrimaryOrg(activeOrgConfigs);
     if (!primary) {
@@ -21687,8 +21687,19 @@ var CwsAgentBridge = class {
   }
 };
 
+// src/version.js
+var version2;
+if (true) {
+  version2 = "1.1.1";
+} else {
+  version2 = JSON.parse(
+    readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
+  ).version;
+}
+var PKG_VERSION = version2;
+var DEFAULT_APP_VERSION = `claude-openmax/${version2}`;
+
 // src/config.js
-var DEFAULT_APP_VERSION = "claude-openmax/1.1.1";
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
 var OWNER_SYNC_HTTP_TIMEOUT_MS = 1e4;
 function withTimeout(promise, ms, label) {
@@ -24196,7 +24207,7 @@ var ClaudeChannel = class {
    * @param {object} opts.logger           structured logger (stderr)
    * @param {boolean} [opts.includePreview] inline the message preview in the wake notice (MVP body-in-wake)
    */
-  constructor({ name = "openmax", version: version2 = "0.0.0", logger, includePreview = true } = {}) {
+  constructor({ name = "openmax", version: version3 = "0.0.0", logger, includePreview = true } = {}) {
     this.logger = logger;
     this.includePreview = includePreview;
     this.runtimeSession = `claude_${randomUUID3()}`;
@@ -24206,7 +24217,7 @@ var ClaudeChannel = class {
       throw new Error("no tool handler registered");
     };
     this.server = new Server(
-      { name, version: version2 },
+      { name, version: version3 },
       {
         capabilities: {
           experimental: { "claude/channel": {} },
@@ -25533,7 +25544,6 @@ function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
 }
 
 // src/create-bridge.js
-var PKG_VERSION = "1.1.1";
 function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
   return new CwsAgentBridge({
     http: runtime.http,
@@ -25661,13 +25671,12 @@ function writeJson(res, status, value) {
 }
 
 // src/index.js
-var PKG_VERSION2 = "1.1.1";
 async function main() {
   const mode = process.env.CLAUDE_OPENMAX_MODE || "inproc";
   const { config: config2, file } = loadAdapterConfig();
   const logFile = resolveLogFilePath();
   const logger = createStderrLogger("[claude-openmax]", logFile ? { logFile } : {});
-  logger.info(`starting claude-openmax v${PKG_VERSION2} (mode=${mode})`);
+  logger.info(`starting claude-openmax v${PKG_VERSION} (mode=${mode})`);
   logger.info(`config file: ${file}`);
   logger.info(logFile ? `file logging ENABLED \u2192 ${logFile} (0600, 10MB cap, secrets scrubbed)` : "file logging OFF (stderr only) \u2014 set CLAUDE_OPENMAX_LOG_FILE to enable");
   const storage = createFileStorage();
@@ -25678,7 +25687,7 @@ async function main() {
   const debounceMs = Number(process.env.CLAUDE_OPENMAX_DEBOUNCE_MS || "0");
   const channel = new ClaudeChannel({
     name: "openmax",
-    version: PKG_VERSION2,
+    version: PKG_VERSION,
     logger,
     includePreview: process.env.CLAUDE_OPENMAX_CONTENT_FREE !== "1"
   });

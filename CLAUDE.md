@@ -115,18 +115,27 @@ not after the fact.
 
 ## Release / Versioning
 
-On **every** version change, bump the version in **all** of these — they are not
-kept in sync automatically:
+On a version change, bump the version in these two manifests (they are not kept
+in sync automatically) — everything else derives from `package.json`:
 
 - **`.claude-plugin/plugin.json`** — **authoritative.** This is the version
   Claude Code's `claude plugin` command reads to identify, track, and update the
   installed plugin.
 - **`package.json`** + **`package-lock.json`** (both root `version` entries) —
-  npm / runtime version; the adapter also reports it as `app_version`.
-- **`PKG_VERSION`** literals in **`src/index.js`** and **`src/create-bridge.js`**.
-- **`DEFAULT_APP_VERSION`** in **`src/config.js`** (`claude-openmax/<version>`).
+  npm / runtime version, and the **single source of truth for the JS runtime
+  version**. `src/version.js` exports `PKG_VERSION` + `DEFAULT_APP_VERSION`
+  (`claude-openmax/<version>`), which `src/index.js`, `src/create-bridge.js`, and
+  `src/config.js` import. Do **not** hand-edit version literals in JS — there are
+  none. (`npm version <x> --no-git-tag-version` bumps package.json + lock.)
 - Then run **`npm run build`** to regenerate **`dist/index.mjs`** +
-  **`dist/bridge.mjs`** (both git-tracked — commit them).
+  **`dist/bridge.mjs`** (both git-tracked — commit them). Version resolution has
+  two paths, both rooted in `package.json`: `scripts/build.js` reads the version
+  and passes esbuild `define: { __CLAUDE_OPENMAX_VERSION__ }`, so the **bundled
+  dist inlines the version STRING** (self-contained — no runtime file read, no
+  package.json blob; satisfies the dependency-free bundle smoke test); when run
+  **unbundled from `src/`** the define is absent and `src/version.js` falls back
+  to a runtime `readFileSync` of `package.json` (no JSON import attributes → Node
+  20.0+ compatible, since npm exposes the `src/` bins).
 - Add a **`CHANGELOG.md`** entry (Keep a Changelog style).
 
 Do **NOT** bump `.claude-plugin/marketplace.json` `metadata.version` for a plugin

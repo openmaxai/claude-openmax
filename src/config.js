@@ -72,8 +72,7 @@ import {
   createCoreService,
   createConnService,
 } from '@openmaxai/openmax-agent-sdk';
-
-const DEFAULT_APP_VERSION = 'claude-openmax/1.1.1';
+import { DEFAULT_APP_VERSION } from './version.js';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 
 // Hard cap on how long a single owner-sync core HTTP call may block the caller
