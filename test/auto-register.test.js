@@ -67,15 +67,92 @@ test('is idempotent — a real api_key present means no register call', async ()
   assert.equal(wrote, false);
 });
 
-test('skips (no write) when CF-Access credentials are missing', async () => {
-  const cfgPath = seedConfig({ cf_access: {} });
-  const before = readFileSync(cfgPath, 'utf8');
+test('registers WITHOUT CF-Access creds (public/prod): no CF headers, no cf_access persisted', async () => {
+  // openmax.com is public (not behind Cloudflare Access) — registration must proceed.
+  // Seed a config with NO cf_access key at all (as a public/prod install would have).
+  const cfgPath = seedConfig();
+  const noCf = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  delete noCf.cf_access;
+  writeFileSync(cfgPath, JSON.stringify(noCf, null, 2), { mode: 0o644 });
   const wrote = await runWith(cfgPath, () => withFetch(
-    () => { throw new Error('fetch must not be called without cf_access'); },
-    () => ensureRegistered(),
+    (url) => url.endsWith('/auth/register/agent')
+      ? jsonRes(200, { identity_id: 'id-pub', api_key: 'cwsk_pub' })
+      : jsonRes(404, {}),
+    (calls) => ensureRegistered().then((w) => {
+      const reg = calls.find((c) => c.url.endsWith('/auth/register/agent'));
+      assert.ok(reg, 'should still POST /auth/register/agent without CF creds');
+      const h = reg.opts.headers;
+      assert.equal(h['Content-Type'], 'application/json');
+      assert.equal(h['CF-Access-Client-Id'], undefined, 'no CF-Access-Client-Id without creds');
+      assert.equal(h['CF-Access-Client-Secret'], undefined, 'no CF-Access-Client-Secret without creds');
+      return w;
+    }),
   ));
-  assert.equal(wrote, false);
-  assert.equal(readFileSync(cfgPath, 'utf8'), before);
+  assert.equal(wrote, true);
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  assert.equal(cfg.agent.identity_id, 'id-pub');
+  assert.equal(cfg.agent.api_key, 'cwsk_pub');
+  assert.equal(cfg.cf_access, undefined, 'must NOT write an empty cf_access block');
+  assert.equal(statSync(cfgPath).mode & 0o777, 0o600, 'secret-bearing config must be 0600');
+});
+
+test('registers WITH CF-Access creds present: sends CF headers (INT regression guard)', async () => {
+  const cfgPath = seedConfig(); // seedConfig includes cf_access {cf-id, cf-secret}
+  const wrote = await runWith(cfgPath, () => withFetch(
+    (url) => url.endsWith('/auth/register/agent')
+      ? jsonRes(200, { identity_id: 'id-int', api_key: 'cwsk_int' })
+      : jsonRes(404, {}),
+    (calls) => ensureRegistered().then((w) => {
+      const reg = calls.find((c) => c.url.endsWith('/auth/register/agent'));
+      const h = reg.opts.headers;
+      assert.equal(h['CF-Access-Client-Id'], 'cf-id');
+      assert.equal(h['CF-Access-Client-Secret'], 'cf-secret');
+      return w;
+    }),
+  ));
+  assert.equal(wrote, true);
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  assert.deepEqual(cfg.cf_access, { client_id: 'cf-id', client_secret: 'cf-secret' }, 'cf_access persisted when present');
+});
+
+test('invite-accept proceeds WITHOUT CF creds: token-exchange + accept called, no CF headers', async () => {
+  const cfgPath = seedConfig({
+    cf_access: {},
+    agent: { api_key: 'cwsk_have', identity_id: 'id-x' },
+    invite: { invitation_id: 'inv-pub', token: 'tok-pub' },
+  });
+  await runWith(cfgPath, () => withFetch((url) => {
+    if (url.endsWith('/auth/agent/token')) return jsonRes(200, { access_token: 'acc-pub' });
+    if (url.includes('/invitations/inv-pub/accept')) return jsonRes(200, { ok: true });
+    return jsonRes(404, {});
+  }, (calls) => ensureRegistered().then(() => {
+    const tok = calls.find((c) => c.url.endsWith('/auth/agent/token'));
+    const acc = calls.find((c) => c.url.includes('/invitations/inv-pub/accept'));
+    assert.ok(tok, 'token exchange should be called without CF creds');
+    assert.ok(acc, 'accept should be called without CF creds');
+    assert.equal(tok.opts.headers['CF-Access-Client-Id'], undefined, 'no CF header on token exchange');
+    assert.equal(acc.opts.headers['CF-Access-Client-Id'], undefined, 'no CF header on accept');
+    assert.equal(tok.opts.headers.Authorization, 'Bearer cwsk_have', 'keeps API-key bearer on token exchange');
+    assert.equal(acc.opts.headers.Authorization, 'Bearer acc-pub', 'keeps access-token bearer on accept');
+  })));
+  assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).invite, undefined, 'invite cleared after accept');
+});
+
+test('invite-accept WITH CF creds present still sends CF headers (regression guard)', async () => {
+  const cfgPath = seedConfig({
+    agent: { api_key: 'cwsk_have', identity_id: 'id-x' },
+    invite: { invitation_id: 'inv-int', token: 'tok-int' },
+  });
+  await runWith(cfgPath, () => withFetch((url) => {
+    if (url.endsWith('/auth/agent/token')) return jsonRes(200, { access_token: 'acc-int' });
+    if (url.includes('/invitations/inv-int/accept')) return jsonRes(200, { ok: true });
+    return jsonRes(404, {});
+  }, (calls) => ensureRegistered().then(() => {
+    const tok = calls.find((c) => c.url.endsWith('/auth/agent/token'));
+    const acc = calls.find((c) => c.url.includes('/invitations/inv-int/accept'));
+    assert.equal(tok.opts.headers['CF-Access-Client-Id'], 'cf-id');
+    assert.equal(acc.opts.headers['CF-Access-Client-Id'], 'cf-id');
+  })));
 });
 
 test('placeholder api_key (cwsk_replace_me) is treated as unregistered', async () => {
