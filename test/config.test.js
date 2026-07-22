@@ -8,6 +8,7 @@ import {
   normalizeConfig,
   buildRuntime,
   resolveAndCacheIdentityId,
+  resolveLogFilePath,
 } from '../src/config.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -47,6 +48,30 @@ function newShape(over = {}) {
     ...over,
   };
 }
+
+// ── diagnostic log-file path resolution ─────────────────────────────────────────
+test('resolveLogFilePath: defaults to claude-openmax.log next to the config file', () => {
+  const prev = process.env.CLAUDE_OPENMAX_LOG_FILE;
+  delete process.env.CLAUDE_OPENMAX_LOG_FILE;
+  try {
+    assert.equal(
+      resolveLogFilePath('/some/dir/config.json'),
+      path.join('/some/dir', 'claude-openmax.log'),
+    );
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_OPENMAX_LOG_FILE; else process.env.CLAUDE_OPENMAX_LOG_FILE = prev;
+  }
+});
+
+test('resolveLogFilePath: CLAUDE_OPENMAX_LOG_FILE overrides', () => {
+  const prev = process.env.CLAUDE_OPENMAX_LOG_FILE;
+  process.env.CLAUDE_OPENMAX_LOG_FILE = '/var/log/custom.log';
+  try {
+    assert.equal(resolveLogFilePath('/some/dir/config.json'), '/var/log/custom.log');
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_OPENMAX_LOG_FILE; else process.env.CLAUDE_OPENMAX_LOG_FILE = prev;
+  }
+});
 
 // ── new-shape parsing ──────────────────────────────────────────────────────────
 test('normalizeConfig: parses new openmax-mirrored shape', () => {

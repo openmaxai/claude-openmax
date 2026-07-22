@@ -18,6 +18,11 @@
 const DEFAULT_OWNER_SYNC_INTERVAL_MS = 5 * 60 * 1000;  // 5 min — matches the openmax component
 const DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS = 10 * 1000; // let connect + self-name hydration settle first
 
+/** JSON.stringify that never throws (falls back to String) — for diagnostic logs. */
+function safeJson(v) {
+  try { return JSON.stringify(v); } catch { return String(v); }
+}
+
 /**
  * Arm the periodic owner pull-sync. Returns a `{ stop }` handle; call stop() on
  * shutdown to clear the timers.
@@ -31,12 +36,15 @@ const DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS = 10 * 1000; // let connect + self-nam
  */
 export function startOwnerSync({ runtime, logger, intervalMs = DEFAULT_OWNER_SYNC_INTERVAL_MS, initialDelayMs = DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS }) {
   const tick = () => {
-    for (const orgConfig of runtime.orgConfigs) {
+    const orgs = runtime.orgConfigs;
+    logger?.info?.(`[owner-sync] tick start — ${orgs.length} active org(s)`);
+    for (const orgConfig of orgs) {
       // syncOwnerFromCore is best-effort and never rejects, but guard anyway so
       // one org's failure can never take down the interval.
       Promise.resolve()
         .then(() => runtime.syncOwnerFromCore(orgConfig))
-        .catch((e) => logger?.warn?.(`periodic owner-sync failed for org=${orgConfig.org_id}: ${e.message}`));
+        .then((res) => logger?.info?.(`[owner-sync] org=${orgConfig.org_id} result=${safeJson(res)}`))
+        .catch((e) => logger?.warn?.(`[owner-sync] org=${orgConfig.org_id} FAILED: ${e.message}`));
     }
   };
 

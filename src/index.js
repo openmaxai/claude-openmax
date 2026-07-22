@@ -19,7 +19,7 @@
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { loadAdapterConfig, buildRuntime } from './config.js';
+import { loadAdapterConfig, buildRuntime, resolveLogFilePath } from './config.js';
 import { createFileStorage } from './storage.js';
 import { createStderrLogger, createEmptyRuntimeState } from './providers.js';
 import { ClaudeChannel } from './channel.js';
@@ -34,11 +34,16 @@ import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 const PKG_VERSION = '1.1.0-beta.1';
 
 async function main() {
-  const logger = createStderrLogger();
   const mode = process.env.CLAUDE_OPENMAX_MODE || 'inproc';
-  logger.info(`starting claude-openmax v${PKG_VERSION} (mode=${mode})`);
-
   const { config, file } = loadAdapterConfig();
+  // Tee logs to a file (stderr is swallowed inside the MCP host). Same logger is
+  // handed to buildRuntime AND the SDK bridge, so adapter + SDK lines co-locate.
+  const logFile = resolveLogFilePath(file);
+  const logger = createStderrLogger('[claude-openmax]', { logFile });
+  logger.info(`starting claude-openmax v${PKG_VERSION} (mode=${mode})`);
+  logger.info(`config file: ${file}`);
+  logger.info(`log file: ${logFile}${process.env.CLAUDE_OPENMAX_LOG_FILE ? ' (from CLAUDE_OPENMAX_LOG_FILE)' : ' (default: next to config.json; override with CLAUDE_OPENMAX_LOG_FILE)'}`);
+
   const storage = createFileStorage();
   const runtimeState = createEmptyRuntimeState();
   const runtime = buildRuntime({ config, file, storage, logger });
