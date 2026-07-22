@@ -133,14 +133,46 @@ Do **NOT** bump `.claude-plugin/marketplace.json` `metadata.version` for a plugi
 code release — that is the marketplace *catalog* document version, independent of
 the plugin. Bump it only when the marketplace catalog itself changes.
 
-**Release steps (after merge):** create the git tag + GitHub release. Tag each
-release as `{plugin-name}--v{version}` — for this plugin that is
-`openmax-channel--v<version>` (e.g. `openmax-channel--v1.1.0-beta.1`), matching the
-`version` in that commit's `.claude-plugin/plugin.json`. This is the tag convention
-Claude Code's `claude plugin` uses for semver-based update detection. (Decided
-2026-07-22: standardize on `openmax-channel--v` going forward; the earlier plain
-`v<version>` tags predate this convention.)
+**Release steps (after merge):** the only thing `claude plugin` needs is the **git
+tag** — it resolves versions and detects updates by listing the marketplace repo's
+tags (not the GitHub Releases API). Tag each release as `{plugin-name}--v{version}` —
+for this plugin `openmax-channel--v<version>` (e.g. `openmax-channel--v1.1.0-beta.1`),
+matching the `version` in that commit's `.claude-plugin/plugin.json`. Prefer
+`claude plugin tag --push` to create + push it: it validates that the tag version and
+`plugin.json` agree (so you can't mistag). (Decided 2026-07-22: standardize on
+`openmax-channel--v` going forward; the earlier plain `v<version>` tags predate this
+convention.) A GitHub **Release is optional** — purely human-facing (release notes /
+changelog); create one for visibility, but it is not required for install/update and
+plays no part in version resolution.
 
-**Betas:** use a semver prerelease version (`-beta.N`) and mark the GitHub
-release as *prerelease*. Default `^`/`~` install ranges exclude prereleases, so a
-beta does not reach normal users unless they explicitly opt in.
+**Betas:** use a semver prerelease version (`-beta.N`) in `plugin.json` and in the
+tag (`openmax-channel--v1.1.0-beta.1`). Prerelease exclusion is driven by that semver
+suffix, **not** by any GitHub Release "prerelease" checkbox: default `^`/`~` install
+ranges exclude prereleases, so a beta does not reach normal users unless they opt in
+(a prerelease-aware range, or pinning the tag — see below). If you do publish a GitHub
+Release for a beta, mark it prerelease for human clarity.
+
+## Installing a specific version
+
+`claude plugin install` has **no** `--version` flag — version selection happens at the
+**marketplace** layer, by pinning its git source to a tag/ref. GitHub-shorthand
+sources take `@ref`; full git URLs take `#ref`.
+
+- Latest on the marketplace's default branch (whatever `main` currently is):
+
+  ```
+  claude plugin marketplace add openmaxai/claude-openmax
+  claude plugin install openmax-channel@openmax
+  ```
+
+- A specific version — pin the marketplace to that release tag, e.g. the beta:
+
+  ```
+  claude plugin marketplace add openmaxai/claude-openmax@openmax-channel--v1.1.0-beta.1
+  claude plugin install openmax-channel@openmax
+  ```
+
+Notes: a pinned marketplace is frozen at that ref — to change versions, re-add it
+(optionally `claude plugin marketplace remove openmax` first). Restart Claude Code
+after install/update to apply. `plugin.json` semver ranges only govern plugin-to-plugin
+dependency resolution, not CLI user installs.
