@@ -120,6 +120,47 @@ test('syncOwnerFromCore: short-circuits (no fetch) when self.member_id is not ye
   assert.equal(calls.length, 0); // never hit the network
 });
 
+// ── timeout guard: a hung core fetch must never block; behave like fetch-fail ──
+test('syncOwnerFromCore: self-member fetch exceeding the timeout keeps the local owner (never clears)', async () => {
+  const file = tmpFile();
+  const raw = shapeWithSelf();
+  raw.orgs['org-uuid-1'].owner = { member_id: 'LOCAL-OWNER', name: 'Bob' };
+  const config = normalizeConfig(raw, { logger: silentLogger });
+  // getForOrg resolves far LATER than the timeout — simulates a hung/slow core
+  // connection. (It settles eventually, rather than never, so node:test doesn't
+  // flag a dangling promise at suite exit; the timeout still fires first.)
+  const hangingHttp = { apiPath: (p) => `/api/v1${p}`, getForOrg: () => new Promise((resolve) => { setTimeout(() => resolve({ owner_member_id: 'SLOW' }), 200); }) };
+  const rt = buildRuntime({
+    config, file, storage: storageStub, logger: silentLogger,
+    httpClient: hangingHttp, ownerSyncTimeoutMs: 20, // short timeout keeps the test fast
+  });
+  const res = await rt.syncOwnerFromCore(rt.orgConfigs[0]);
+  assert.equal(res.changed, false);
+  assert.match(res.reason, /timed out/);                          // timeout → fetch-failure path
+  assert.equal(rt.orgConfigs[0].owner.member_id, 'LOCAL-OWNER');  // local owner preserved, not cleared
+});
+
+test('syncOwnerFromCore: owner-NAME fetch timeout is non-fatal — owner still bound (empty name)', async () => {
+  const file = tmpFile();
+  const config = normalizeConfig(shapeWithSelf(), { logger: silentLogger });
+  // self-member resolves (owner=OWNER-CORE); the cosmetic owner-name lookup hangs.
+  const partHangHttp = {
+    apiPath: (p) => `/api/v1${p}`,
+    getForOrg: (_orgId, p) => (p === '/api/v1/members/SELF-1'
+      ? Promise.resolve({ owner_member_id: 'OWNER-CORE' })
+      : new Promise((resolve) => { setTimeout(() => resolve({ display_name: 'Late' }), 200); })),
+  };
+  const rt = buildRuntime({
+    config, file, storage: storageStub, logger: silentLogger,
+    httpClient: partHangHttp, ownerSyncTimeoutMs: 20,
+  });
+  const res = await rt.syncOwnerFromCore(rt.orgConfigs[0]);
+  assert.equal(res.changed, true);
+  assert.equal(res.ownerMemberId, 'OWNER-CORE');
+  assert.equal(res.ownerName, '');                                // cosmetic lookup timed out → empty
+  assert.equal(readJSON(file).orgs['org-uuid-1'].owner.member_id, 'OWNER-CORE'); // still persisted
+});
+
 // ── Logic C: owner_changed handler ignores the pushed frame, re-pulls from core ─
 test('onConfigEvent(owner_changed): IGNORES the forged owner in the frame and binds core\'s owner instead', async () => {
   const file = tmpFile();

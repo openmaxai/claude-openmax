@@ -21651,6 +21651,15 @@ var CwsAgentBridge = class {
 // src/config.js
 var DEFAULT_APP_VERSION = "claude-openmax/1.0.0";
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
+var OWNER_SYNC_HTTP_TIMEOUT_MS = 1e4;
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 function legacySlugify(s) {
   return String(s ?? "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
@@ -21787,7 +21796,7 @@ async function resolveAndCacheIdentityId({ http: http2, agent, persist, logger }
     return "";
   }
 }
-function buildRuntime({ config: config2, file, storage, logger, httpClient }) {
+function buildRuntime({ config: config2, file, storage, logger, httpClient, ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS }) {
   const state = {
     enabled: config2.enabled,
     server: { ...config2.server },
@@ -21949,7 +21958,11 @@ function buildRuntime({ config: config2, file, storage, logger, httpClient }) {
     }
     let member;
     try {
-      member = await http2.getForOrg(orgConfig.org_id, http2.apiPath(`/members/${selfMemberId}`));
+      member = await withTimeout(
+        http2.getForOrg(orgConfig.org_id, http2.apiPath(`/members/${selfMemberId}`)),
+        ownerSyncTimeoutMs,
+        `syncOwnerFromCore self-member fetch (org=${orgConfig.org_id})`
+      );
     } catch (e) {
       logger?.warn?.(`syncOwnerFromCore(${orgConfig.org_id}) fetch self member failed: ${e.message} \u2014 keeping local owner`);
       return { changed: false, reason: `fetch self member failed: ${e.message}` };
@@ -21960,7 +21973,11 @@ function buildRuntime({ config: config2, file, storage, logger, httpClient }) {
     if (coreOwnerId === localOwnerId) return { changed: false, ownerMemberId: coreOwnerId };
     let ownerName = "";
     try {
-      const ownerMember = await http2.getForOrg(orgConfig.org_id, http2.apiPath(`/members/${coreOwnerId}`));
+      const ownerMember = await withTimeout(
+        http2.getForOrg(orgConfig.org_id, http2.apiPath(`/members/${coreOwnerId}`)),
+        ownerSyncTimeoutMs,
+        `syncOwnerFromCore owner-name fetch (org=${orgConfig.org_id})`
+      );
       ownerName = ownerMember?.display_name || ownerMember?.username || "";
     } catch {
     }

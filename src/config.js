@@ -75,6 +75,37 @@ import {
 const DEFAULT_APP_VERSION = 'claude-openmax/1.0.0';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 
+// Hard cap on how long a single owner-sync core HTTP call may block the caller
+// (the periodic owner-sync task and the owner_changed handler). Hardcoded on
+// purpose — no config knob. The SDK's CwsHttpClient uses native fetch with NO
+// timeout and accepts NO AbortSignal, so a hung core connection would otherwise
+// stall these calls forever; see withTimeout().
+const OWNER_SYNC_HTTP_TIMEOUT_MS = 10_000;
+
+/**
+ * Race a promise against a timeout so the caller can never block indefinitely.
+ *
+ * NOTE: CwsHttpClient.getForOrg() cannot be hard-aborted (native fetch, no
+ * AbortSignal), so this does NOT cancel the underlying request — it only stops
+ * the CALLER from waiting. On timeout we reject; the dangling fetch keeps running
+ * and its eventual result is simply discarded (harmless — the caller has already
+ * moved on and will retry on the next tick). Scoped to owner-sync deliberately:
+ * we do NOT wrap the shared CwsHttpClient or global fetch (that would also affect
+ * artifact downloads etc.).
+ *
+ * @param {Promise<any>} promise
+ * @param {number}       ms
+ * @param {string}       label   included in the timeout error message
+ */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.(); // never keep the process alive for this guard timer alone
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * MIGRATION-ONLY slugify. Before the org_id-keying refactor, per-org session
  * files were keyed by a derived slug (`explicit slug || slugify(org_name) ||
@@ -272,8 +303,12 @@ export async function resolveAndCacheIdentityId({ http, agent, persist, logger }
  * @param {object} params.logger
  * @param {object} [params.httpClient]  test seam: inject a CwsHttpClient stub
  *        (defaults to a real CwsHttpClient wired to server.* / agent.* / cf_access).
+ * @param {number} [params.ownerSyncTimeoutMs]  TEST SEAM ONLY — per-call timeout for
+ *        the owner-sync core fetches. Production always uses the hardcoded
+ *        OWNER_SYNC_HTTP_TIMEOUT_MS (no config.json knob); tests override it to
+ *        keep a hanging-stub timeout test fast.
  */
-export function buildRuntime({ config, file, storage, logger, httpClient }) {
+export function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS }) {
   // Mutable in-memory config mirror; persisted back to `file` (in the
   // openmax-mirrored, org_id-keyed on-disk shape) on writes so the SDK's
   // member_id write-back / owner bind / self.name / identity_id / agent.config.*
@@ -493,7 +528,14 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     }
     let member;
     try {
-      member = await http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${selfMemberId}`));
+      // Timeout-guarded so a hung core connection can never block the periodic
+      // task / owner_changed handler. A timeout lands here exactly like any other
+      // fetch failure: keep the local owner, return {changed:false}, retry next tick.
+      member = await withTimeout(
+        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${selfMemberId}`)),
+        ownerSyncTimeoutMs,
+        `syncOwnerFromCore self-member fetch (org=${orgConfig.org_id})`,
+      );
     } catch (e) {
       logger?.warn?.(`syncOwnerFromCore(${orgConfig.org_id}) fetch self member failed: ${e.message} — keeping local owner`);
       return { changed: false, reason: `fetch self member failed: ${e.message}` };
@@ -507,10 +549,15 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     const localOwnerId = org?.owner?.member_id || '';
     if (coreOwnerId === localOwnerId) return { changed: false, ownerMemberId: coreOwnerId }; // already in sync
 
-    // Owner display name is cosmetic — a lookup failure must not block the bind.
+    // Owner display name is cosmetic — a lookup failure (incl. timeout) must not
+    // block the bind; we proceed with an empty name and let a later sync fill it.
     let ownerName = '';
     try {
-      const ownerMember = await http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${coreOwnerId}`));
+      const ownerMember = await withTimeout(
+        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${coreOwnerId}`)),
+        ownerSyncTimeoutMs,
+        `syncOwnerFromCore owner-name fetch (org=${orgConfig.org_id})`,
+      );
       ownerName = ownerMember?.display_name || ownerMember?.username || '';
     } catch { /* display name is cosmetic */ }
 
