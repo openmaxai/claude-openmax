@@ -8008,7 +8008,7 @@ var CwsAgentBridge = class {
 };
 
 // src/config.js
-var DEFAULT_APP_VERSION = "claude-openmax/1.1.0-beta.1";
+var DEFAULT_APP_VERSION = "claude-openmax/1.1.0";
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
 var OWNER_SYNC_HTTP_TIMEOUT_MS = 1e4;
 function withTimeout(promise, ms, label) {
@@ -8651,7 +8651,7 @@ function createInboundDelivery({
 }
 
 // src/create-bridge.js
-var PKG_VERSION = "1.1.0-beta.1";
+var PKG_VERSION = "1.1.0";
 function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
   return new CwsAgentBridge({
     http: runtime.http,
