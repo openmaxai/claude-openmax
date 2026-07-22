@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-07-22
+
+Bug-fix release: agent self-registration and invite-acceptance now work on
+public/production deployments that are not behind Cloudflare Access.
+
+### Fixed
+
+- `hooks/auto-register.js` treated Cloudflare Access (CF-Access) credentials as
+  mandatory. That is correct for the INT deployment (cws-int.coco.xyz, which
+  sits behind Cloudflare Access and needs `CF-Access-Client-Id` /
+  `CF-Access-Client-Secret` headers), but production `openmax.com` is public and
+  needs no CF headers — so on prod, agent self-registration and invite
+  acceptance were unconditionally skipped/blocked. CF-Access headers are now
+  OPTIONAL: they are sent only when both credentials are present (INT behaves
+  exactly as before), and registration + token-exchange + invite-accept proceed
+  without them on public/prod. On registration, an empty/blank `cf_access` block
+  (e.g. the one `config.example.json` seeds) is stripped from the config rather
+  than left in place — so it never lingers to make the runtime emit empty
+  CF-Access headers. No other behavior changed (idempotency, placeholder-key
+  detection, 0600 persistence, invite-clear-after-accept, timeouts).
+
 ## [1.1.1] - 2026-07-22
 
 Bug-fix release: policy changes made in the OpenMax workspace UI now actually

@@ -7,11 +7,12 @@
  * that has no api_key yet; on every subsequent session it is a no-op.
  *
  * Behavior:
- *  - If the effective api_key is still blank/placeholder AND we have a bff_url +
- *    CF-Access (from the config's own server/cf_access or from env), POST an empty
- *    body to `{bff_url}/auth/register/agent` and persist the returned identity_id +
- *    api_key back at 0600 — writing it where the runtime will actually read it
- *    (also `auth.apiKey` for OLD-shape configs).
+ *  - If the effective api_key is still blank/placeholder AND we have a bff_url,
+ *    POST an empty body to `{bff_url}/auth/register/agent` and persist the
+ *    returned identity_id + api_key back at 0600 — writing it where the runtime
+ *    will actually read it (also `auth.apiKey` for OLD-shape configs). CF-Access
+ *    creds (config's server/cf_access or env) are OPTIONAL: sent as headers when
+ *    present (INT behind Cloudflare Access), omitted for public prod (openmax.com).
  *  - If the config carries an `invite` block (or COCO_INVITATION_ID/TOKEN env),
  *    accept the invitation. This is decoupled from registration and RETRIED on
  *    every session while the invite block remains, so a partial first-run failure
@@ -45,8 +46,18 @@ function isLegacyShape(raw) {
 
 function log(msg) { try { process.stderr.write(`[claude-openmax auto-register] ${msg}\n`); } catch { /* ignore */ } }
 
-function cfHeaders(id, secret) {
-  return { 'Content-Type': 'application/json', 'CF-Access-Client-Id': id, 'CF-Access-Client-Secret': secret };
+/**
+ * Build request headers. Always JSON; CF-Access headers are OPTIONAL — included
+ * ONLY when BOTH `id` and `secret` are truthy (INT sits behind Cloudflare
+ * Access; public prod like openmax.com is not and needs no CF headers).
+ */
+function authHeaders(id, secret) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (id && secret) {
+    headers['CF-Access-Client-Id'] = id;
+    headers['CF-Access-Client-Secret'] = secret;
+  }
+  return headers;
 }
 
 async function postJson(url, headers, body, signal) {
@@ -97,11 +108,10 @@ export async function ensureRegistered(opts = {}) {
     // ---- register (only when there is no usable key yet) ----
     if (PLACEHOLDER_API_KEYS.has(apiKey)) {
       if (!bffUrl) { log('no bff_url (config.server.bff_url / COCO_API_URL) — skipping'); return false; }
-      if (!cfId || !cfSecret) { log('no CF-Access credentials — skipping'); return false; }
 
       log(`registering agent: POST ${bffUrl}/auth/register/agent`);
       let reg;
-      try { reg = await postJson(`${bffUrl}/auth/register/agent`, cfHeaders(cfId, cfSecret), '{}', ctrl.signal); }
+      try { reg = await postJson(`${bffUrl}/auth/register/agent`, authHeaders(cfId, cfSecret), '{}', ctrl.signal); }
       catch (e) { log(`register request failed: ${e.message}`); return false; }
       if (!reg.ok) { log(`register HTTP ${reg.status}: ${(reg.text || '').slice(0, 200)}`); return false; }
 
@@ -114,7 +124,13 @@ export async function ensureRegistered(opts = {}) {
       // and legacy auth.apiKey too when the config is OLD-shape.
       cfg.agent = { ...(cfg.agent || {}), identity_id: identityId, api_key: newKey };
       if (legacy) cfg.auth = { ...(cfg.auth || {}), apiKey: newKey };
-      cfg.cf_access = { client_id: cfId, client_secret: cfSecret };
+      // Persist cf_access only with BOTH creds (INT behind Cloudflare Access).
+      // Without them, STRIP any existing empty/partial block (e.g. the blank
+      // cf_access that config.example.json seeds) so it never lingers — a stale
+      // empty block would otherwise make the runtime emit empty CF-Access headers
+      // on public/prod.
+      if (cfId && cfSecret) cfg.cf_access = { client_id: cfId, client_secret: cfSecret };
+      else delete cfg.cf_access;
       cfg.server = { ...(cfg.server || {}), bff_url: cfg.server?.bff_url || bffUrl };
       try { writeConfig0600(configPath, cfg); }
       catch (e) { log(`persist failed: ${e.message}`); return false; }
@@ -138,11 +154,11 @@ async function maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecr
   const invitationId = invite.invitation_id || process.env.COCO_INVITATION_ID || '';
   const inviteToken = invite.token || process.env.COCO_INVITATION_TOKEN || '';
   if (!invitationId || !inviteToken) return; // nothing to accept
-  if (!bffUrl || !cfId || !cfSecret) { log('invite present but missing bff_url/cf_access — cannot accept, will retry'); return; }
+  if (!bffUrl) { log('invite present but missing bff_url — cannot accept, will retry'); return; }
 
   log('invite supplied — exchanging token + accepting invitation');
   let tok;
-  try { tok = await postJson(`${bffUrl}/auth/agent/token`, { ...cfHeaders(cfId, cfSecret), Authorization: `Bearer ${apiKey}` }, '{}', signal); }
+  try { tok = await postJson(`${bffUrl}/auth/agent/token`, { ...authHeaders(cfId, cfSecret), Authorization: `Bearer ${apiKey}` }, '{}', signal); }
   catch (e) { log(`token exchange failed (will retry next session): ${e.message}`); return; }
   const accessToken = tok.json && (tok.json.data ? tok.json.data.access_token : tok.json.access_token);
   if (!tok.ok || !accessToken) { log(`token exchange HTTP ${tok?.status}: no access_token (will retry)`); return; }
@@ -151,7 +167,7 @@ async function maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecr
   try {
     acc = await postJson(
       `${bffUrl}/api/v1/invitations/${invitationId}/accept`,
-      { ...cfHeaders(cfId, cfSecret), Authorization: `Bearer ${accessToken}` },
+      { ...authHeaders(cfId, cfSecret), Authorization: `Bearer ${accessToken}` },
       JSON.stringify({ token: inviteToken }),
       signal,
     );
