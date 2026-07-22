@@ -133,17 +133,23 @@ Do **NOT** bump `.claude-plugin/marketplace.json` `metadata.version` for a plugi
 code release — that is the marketplace *catalog* document version, independent of
 the plugin. Bump it only when the marketplace catalog itself changes.
 
-**Release steps (after merge):** the only thing `claude plugin` needs is the **git
-tag** — it resolves versions and detects updates by listing the marketplace repo's
-tags (not the GitHub Releases API). Tag each release as `{plugin-name}--v{version}` —
-for this plugin `openmax-channel--v<version>` (e.g. `openmax-channel--v1.1.0-beta.1`),
-matching the `version` in that commit's `.claude-plugin/plugin.json`. Prefer
-`claude plugin tag --push` to create + push it: it validates that the tag version and
-`plugin.json` agree (so you can't mistag). (Decided 2026-07-22: standardize on
+**Release steps (after merge):** ordinary `claude plugin` install/update resolves a
+plugin's version from its `.claude-plugin/plugin.json` `version` (or the marketplace
+entry's `version`, or the source commit SHA when no `version` is set) — **bumping
+`plugin.json` `version` is what makes existing installs pick up a new release.** A
+GitHub **Release is NOT involved** in install/update; it's purely human-facing
+(release notes / changelog) — create one for visibility if you like, but nothing in
+install/update reads it.
+
+Also tag each release as `{plugin-name}--v{version}` — for this plugin
+`openmax-channel--v<version>` (e.g. `openmax-channel--v1.1.0`), matching the `version`
+in that commit's `plugin.json`. Prefer `claude plugin tag --push` (it validates the
+tag matches `plugin.json`, so you can't mistag). These tags are what **dependency
+version-constraints** and **pinned marketplace refs** resolve against
+(`marketplace add <repo>@<tag>` — see "Installing a specific version" below); they are
+**not** what drives ordinary update detection. (Decided 2026-07-22: standardize on
 `openmax-channel--v` going forward; the earlier plain `v<version>` tags predate this
-convention.) A GitHub **Release is optional** — purely human-facing (release notes /
-changelog); create one for visibility, but it is not required for install/update and
-plays no part in version resolution.
+convention.)
 
 **Betas:** use a semver prerelease version (`-beta.N`) in `plugin.json` and in the
 tag (`openmax-channel--v1.1.0-beta.1`). Prerelease exclusion is driven by that semver
