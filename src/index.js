@@ -27,6 +27,7 @@ import { DebouncedWakeNotifier } from './notifier.js';
 import { createInboundDelivery } from './inbound-delivery.js';
 import { createMcpTools } from './mcp-tools.js';
 import { createBridge } from './create-bridge.js';
+import { startOwnerSync } from './owner-sync.js';
 import { startWakeServer } from './wake-server.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 
@@ -70,6 +71,7 @@ async function main() {
 
   let bridge = null;
   let wakeServer = null;
+  let ownerSync = null;
 
   if (mode === 'channel-only') {
     // Topology 1: run only the HTTP /wake endpoint; the bridge is external.
@@ -124,6 +126,10 @@ async function main() {
     // Record the api_key fingerprint now that we've connected, so a later
     // api_key change is detectable on the next bootstrap.
     await writeApiKeyMarkers({ storage, orgIds, apiKey: config.agent.api_key, logger });
+    // Periodically re-pull each org's owner from cws-core (pull-not-trust). The
+    // SDK only hydrates self.name on connect, so this covers owner rebinds that
+    // happen while we're online.
+    ownerSync = startOwnerSync({ runtime, logger });
     logger.info('bridge started; inbound wakes will flow into the Claude Code context');
   }
 
@@ -133,6 +139,7 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info('shutting down');
+    try { if (ownerSync) ownerSync.stop(); } catch { /* ignore */ }
     try { if (bridge) await bridge.stop(); } catch { /* ignore */ }
     try { if (wakeServer) await wakeServer.close(); } catch { /* ignore */ }
     try { await channel.close(); } catch { /* ignore */ }

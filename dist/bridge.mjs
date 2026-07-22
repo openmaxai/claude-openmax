@@ -8261,6 +8261,34 @@ function buildRuntime({ config, file, storage, logger, httpClient }) {
     }
     return { nameReady: false, reason: "core returned no display_name" };
   };
+  const syncOwnerFromCore = async (orgConfig) => {
+    const org = orgByOrgId(orgConfig.org_id);
+    const selfMemberId = org?.self?.member_id || orgConfig.self?.member_id || "";
+    if (!selfMemberId) {
+      return { changed: false, reason: "self.member_id not available yet" };
+    }
+    let member;
+    try {
+      member = await http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${selfMemberId}`));
+    } catch (e) {
+      logger?.warn?.(`syncOwnerFromCore(${orgConfig.org_id}) fetch self member failed: ${e.message} \u2014 keeping local owner`);
+      return { changed: false, reason: `fetch self member failed: ${e.message}` };
+    }
+    const coreOwnerId = member?.owner_member_id || "";
+    if (!coreOwnerId) return { changed: false, reason: "core has no owner bound" };
+    const localOwnerId = org?.owner?.member_id || "";
+    if (coreOwnerId === localOwnerId) return { changed: false, ownerMemberId: coreOwnerId };
+    let ownerName = "";
+    try {
+      const ownerMember = await http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${coreOwnerId}`));
+      ownerName = ownerMember?.display_name || ownerMember?.username || "";
+    } catch {
+    }
+    configProvider.setOwner(orgConfig.org_id, coreOwnerId, ownerName);
+    orgConfig.owner = { member_id: coreOwnerId, name: ownerName };
+    logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || "(none)"} \u2192 ${coreOwnerId}${ownerName ? ` (${ownerName})` : ""}`);
+    return { changed: true, ownerMemberId: coreOwnerId, ownerName, previousOwnerMemberId: localOwnerId };
+  };
   const callbacks = {
     loadConfig,
     loadSession,
@@ -8274,8 +8302,12 @@ function buildRuntime({ config, file, storage, logger, httpClient }) {
         persist();
       }
     },
-    onConfigEvent: (orgConfig, { event, data }) => {
+    onConfigEvent: async (orgConfig, { event, data }) => {
       logger?.info?.(`config event ${event} for org=${orgConfig.org_id}`);
+      if (event === "agent.config.owner_changed") {
+        await syncOwnerFromCore(orgConfig);
+        return;
+      }
       const org = orgByOrgId(orgConfig.org_id);
       if (org && data && typeof data === "object") {
         org.access = { ...org.access || {}, ...pickAccess(data) };
@@ -8308,6 +8340,10 @@ function buildRuntime({ config, file, storage, logger, httpClient }) {
     configProvider,
     wsConfig,
     applyMemberId,
+    // Pull-based owner reconciliation against cws-core. Exposed so the periodic
+    // owner-sync task (owner-sync.js) can reconcile every active org on an
+    // interval; the owner_changed config event routes through the same path.
+    syncOwnerFromCore,
     // Current cached identity_id (may be '' until resolveIdentityId() runs). The
     // guided-autonomy flow's leadAgentId (tm issueCreate lead agent = self) is
     // exactly this value.
@@ -8526,6 +8562,40 @@ function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfi
   });
 }
 
+// src/owner-sync.js
+var DEFAULT_OWNER_SYNC_INTERVAL_MS = 5 * 60 * 1e3;
+var DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS = 10 * 1e3;
+function startOwnerSync({ runtime, logger, intervalMs = DEFAULT_OWNER_SYNC_INTERVAL_MS, initialDelayMs = DEFAULT_OWNER_SYNC_INITIAL_DELAY_MS }) {
+  const tick = () => {
+    for (const orgConfig of runtime.orgConfigs) {
+      Promise.resolve().then(() => runtime.syncOwnerFromCore(orgConfig)).catch((e) => logger?.warn?.(`periodic owner-sync failed for org=${orgConfig.org_id}: ${e.message}`));
+    }
+  };
+  const timers = [];
+  const interval = setInterval(tick, intervalMs);
+  interval.unref?.();
+  timers.push(interval);
+  if (initialDelayMs > 0) {
+    const kick = setTimeout(tick, initialDelayMs);
+    kick.unref?.();
+    timers.push(kick);
+  } else {
+    tick();
+  }
+  logger?.info?.(`owner pull-sync armed (every ${Math.round(intervalMs / 1e3)}s)`);
+  return {
+    stop() {
+      for (const t of timers) {
+        try {
+          clearInterval(t);
+          clearTimeout(t);
+        } catch {
+        }
+      }
+    }
+  };
+}
+
 // src/bridge.js
 async function httpWake(endpoint, token, wakeReq) {
   const res = await fetch(endpoint, {
@@ -8576,8 +8646,13 @@ async function main() {
   await guardStaleTokenCache({ storage, orgIds, apiKey: config.agent.api_key, logger });
   await bridge.start();
   await writeApiKeyMarkers({ storage, orgIds, apiKey: config.agent.api_key, logger });
+  const ownerSync = startOwnerSync({ runtime, logger });
   logger.info(`bridge started; posting wakes to ${endpoint}`);
   const shutdown = async () => {
+    try {
+      ownerSync.stop();
+    } catch {
+    }
     try {
       await bridge.stop();
     } catch {

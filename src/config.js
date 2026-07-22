@@ -475,6 +475,53 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     return { nameReady: false, reason: 'core returned no display_name' };
   };
 
+  // Pull-based owner reconciliation. cws-core is the authoritative source of an
+  // org's owner binding, so we resolve OUR OWN member record from core, read its
+  // `owner_member_id`, and reconcile that into local config (setOwner + persist).
+  // This is the single trust anchor for owner changes: the periodic sync
+  // (owner-sync.js) and the owner_changed config event (onConfigEvent below) both
+  // route through here — we NEVER trust an owner value handed to us in a frame.
+  // Best-effort: swallows its own errors and returns a {changed} result; a core
+  // outage leaves the local owner untouched rather than clearing it.
+  const syncOwnerFromCore = async (orgConfig) => {
+    const org = orgByOrgId(orgConfig.org_id);
+    const selfMemberId = org?.self?.member_id || orgConfig.self?.member_id || '';
+    if (!selfMemberId) {
+      // member_id is written back by the token exchange (applyMemberId); until it
+      // lands we cannot identify our own member record — retry on the next tick.
+      return { changed: false, reason: 'self.member_id not available yet' };
+    }
+    let member;
+    try {
+      member = await http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${selfMemberId}`));
+    } catch (e) {
+      logger?.warn?.(`syncOwnerFromCore(${orgConfig.org_id}) fetch self member failed: ${e.message} — keeping local owner`);
+      return { changed: false, reason: `fetch self member failed: ${e.message}` };
+    }
+
+    const coreOwnerId = member?.owner_member_id || '';
+    // Core has no authoritative owner → leave the local binding as-is so the
+    // first-DM auto-bind fallback keeps working. We never CLEAR a local owner here.
+    if (!coreOwnerId) return { changed: false, reason: 'core has no owner bound' };
+
+    const localOwnerId = org?.owner?.member_id || '';
+    if (coreOwnerId === localOwnerId) return { changed: false, ownerMemberId: coreOwnerId }; // already in sync
+
+    // Owner display name is cosmetic — a lookup failure must not block the bind.
+    let ownerName = '';
+    try {
+      const ownerMember = await http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${coreOwnerId}`));
+      ownerName = ownerMember?.display_name || ownerMember?.username || '';
+    } catch { /* display name is cosmetic */ }
+
+    // Persist to config.json AND mutate the live captured orgConfig in place so
+    // the SDK's owner-gated access decisions see the new owner without a restart.
+    configProvider.setOwner(orgConfig.org_id, coreOwnerId, ownerName);
+    orgConfig.owner = { member_id: coreOwnerId, name: ownerName };
+    logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || '(none)'} → ${coreOwnerId}${ownerName ? ` (${ownerName})` : ''}`);
+    return { changed: true, ownerMemberId: coreOwnerId, ownerName, previousOwnerMemberId: localOwnerId };
+  };
+
   const callbacks = {
     loadConfig,
     loadSession,
@@ -485,9 +532,20 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
       const org = orgByOrgId(orgId);
       if (org) { org.owner = { ...(org.owner || {}), name }; persist(); }
     },
-    onConfigEvent: (orgConfig, { event, data }) => {
+    onConfigEvent: async (orgConfig, { event, data }) => {
       logger?.info?.(`config event ${event} for org=${orgConfig.org_id}`);
-      // Persist agent.config.* into the org's access block (best-effort mirror).
+      // owner_changed is SECURITY-SENSITIVE. The frame carries a
+      // new_owner_member_id, but owner is the DM-access trust anchor, so a forged
+      // or replayed frame must never be able to rebind us to an attacker. We do
+      // NOT read the owner out of `data`; instead we treat the event purely as a
+      // signal to RE-PULL the authoritative owner from cws-core and ignore the
+      // frame's owner fields entirely (pull-not-trust — parity with the openmax
+      // component's owner_changed handling).
+      if (event === 'agent.config.owner_changed') {
+        await syncOwnerFromCore(orgConfig); // never throws; result is best-effort
+        return;
+      }
+      // Other agent.config.* → mirror access fields into the org's access block.
       const org = orgByOrgId(orgConfig.org_id);
       if (org && data && typeof data === 'object') {
         org.access = { ...(org.access || {}), ...pickAccess(data) };
@@ -527,6 +585,10 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     configProvider,
     wsConfig,
     applyMemberId,
+    // Pull-based owner reconciliation against cws-core. Exposed so the periodic
+    // owner-sync task (owner-sync.js) can reconcile every active org on an
+    // interval; the owner_changed config event routes through the same path.
+    syncOwnerFromCore,
     // Current cached identity_id (may be '' until resolveIdentityId() runs). The
     // guided-autonomy flow's leadAgentId (tm issueCreate lead agent = self) is
     // exactly this value.

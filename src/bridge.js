@@ -18,6 +18,7 @@ import { createFileStorage } from './storage.js';
 import { createStderrLogger, createEmptyRuntimeState } from './providers.js';
 import { createInboundDelivery } from './inbound-delivery.js';
 import { createBridge } from './create-bridge.js';
+import { startOwnerSync } from './owner-sync.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 
 async function httpWake(endpoint, token, wakeReq) {
@@ -79,9 +80,13 @@ async function main() {
   // Record the api_key fingerprint now that we've connected, so a later api_key
   // change is detectable on the next bootstrap.
   await writeApiKeyMarkers({ storage, orgIds, apiKey: config.agent.api_key, logger });
+  // Periodically re-pull each org's owner from cws-core (pull-not-trust). The
+  // SDK only hydrates self.name on connect, so this covers owner rebinds that
+  // happen while we're online.
+  const ownerSync = startOwnerSync({ runtime, logger });
   logger.info(`bridge started; posting wakes to ${endpoint}`);
 
-  const shutdown = async () => { try { await bridge.stop(); } catch { /* ignore */ } process.exit(0); };
+  const shutdown = async () => { try { ownerSync.stop(); } catch { /* ignore */ } try { await bridge.stop(); } catch { /* ignore */ } process.exit(0); };
   process.once('SIGINT', () => void shutdown());
   process.once('SIGTERM', () => void shutdown());
 }
