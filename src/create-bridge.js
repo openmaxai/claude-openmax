@@ -14,7 +14,7 @@
 
 import { CwsAgentBridge } from '@openmaxai/openmax-agent-sdk';
 
-const PKG_VERSION = '1.0.0';
+const PKG_VERSION = '1.1.0-beta.1';
 
 /**
  * @param {object} params

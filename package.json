@@ -1,6 +1,6 @@
 {
   "name": "@openmaxai/claude-openmax",
-  "version": "1.0.0",
+  "version": "1.1.0-beta.1",
   "private": false,
   "description": "Claude Code runtime adapter for OpenMax/CWS — a Category-B (bare runtime) adapter that consumes @openmaxai/openmax-agent-sdk (CwsAgentBridge) and bridges inbound CWS messages into Claude Code's visible context via an experimental claude/channel MCP plugin + raft-channel-wake.v1 /wake, and exposes the SDK's six service clients (tm/kb/as/comm/core/conn) as MCP tools.",
   "type": "module",

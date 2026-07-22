@@ -72,8 +72,39 @@ import {
   createConnService,
 } from '@openmaxai/openmax-agent-sdk';
 
-const DEFAULT_APP_VERSION = 'claude-openmax/1.0.0';
+const DEFAULT_APP_VERSION = 'claude-openmax/1.1.0-beta.1';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
+
+// Hard cap on how long a single owner-sync core HTTP call may block the caller
+// (the periodic owner-sync task and the owner_changed handler). Hardcoded on
+// purpose — no config knob. The SDK's CwsHttpClient uses native fetch with NO
+// timeout and accepts NO AbortSignal, so a hung core connection would otherwise
+// stall these calls forever; see withTimeout().
+const OWNER_SYNC_HTTP_TIMEOUT_MS = 10_000;
+
+/**
+ * Race a promise against a timeout so the caller can never block indefinitely.
+ *
+ * NOTE: CwsHttpClient.getForOrg() cannot be hard-aborted (native fetch, no
+ * AbortSignal), so this does NOT cancel the underlying request — it only stops
+ * the CALLER from waiting. On timeout we reject; the dangling fetch keeps running
+ * and its eventual result is simply discarded (harmless — the caller has already
+ * moved on and will retry on the next tick). Scoped to owner-sync deliberately:
+ * we do NOT wrap the shared CwsHttpClient or global fetch (that would also affect
+ * artifact downloads etc.).
+ *
+ * @param {Promise<any>} promise
+ * @param {number}       ms
+ * @param {string}       label   included in the timeout error message
+ */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.(); // never keep the process alive for this guard timer alone
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 /**
  * MIGRATION-ONLY slugify. Before the org_id-keying refactor, per-org session
@@ -272,8 +303,12 @@ export async function resolveAndCacheIdentityId({ http, agent, persist, logger }
  * @param {object} params.logger
  * @param {object} [params.httpClient]  test seam: inject a CwsHttpClient stub
  *        (defaults to a real CwsHttpClient wired to server.* / agent.* / cf_access).
+ * @param {number} [params.ownerSyncTimeoutMs]  TEST SEAM ONLY — per-call timeout for
+ *        the owner-sync core fetches. Production always uses the hardcoded
+ *        OWNER_SYNC_HTTP_TIMEOUT_MS (no config.json knob); tests override it to
+ *        keep a hanging-stub timeout test fast.
  */
-export function buildRuntime({ config, file, storage, logger, httpClient }) {
+export function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS }) {
   // Mutable in-memory config mirror; persisted back to `file` (in the
   // openmax-mirrored, org_id-keyed on-disk shape) on writes so the SDK's
   // member_id write-back / owner bind / self.name / identity_id / agent.config.*
@@ -475,6 +510,84 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     return { nameReady: false, reason: 'core returned no display_name' };
   };
 
+  // Pull-based owner reconciliation. cws-core is the authoritative source of an
+  // org's owner binding, so we resolve OUR OWN member record from core, read its
+  // `owner_member_id`, and reconcile that into local config (setOwner + persist).
+  // This is the single trust anchor for owner changes: the periodic sync
+  // (owner-sync.js) and the owner_changed config event (onConfigEvent below) both
+  // route through here — we NEVER trust an owner value handed to us in a frame.
+  // Best-effort: swallows its own errors and returns a {changed} result; a core
+  // outage leaves the local owner untouched rather than clearing it.
+  const syncOwnerFromCore = async (orgConfig) => {
+    const org = orgByOrgId(orgConfig.org_id);
+    const selfMemberId = org?.self?.member_id || orgConfig.self?.member_id || '';
+    if (!selfMemberId) {
+      // member_id is written back by the token exchange (applyMemberId); until it
+      // lands we cannot identify our own member record — retry on the next tick.
+      return { changed: false, reason: 'self.member_id not available yet' };
+    }
+    let member;
+    try {
+      // Timeout-guarded so a hung core connection can never block the periodic
+      // task / owner_changed handler. A timeout lands here exactly like any other
+      // fetch failure: keep the local owner, return {changed:false}, retry next tick.
+      member = await withTimeout(
+        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${encodeURIComponent(selfMemberId)}`)),
+        ownerSyncTimeoutMs,
+        `syncOwnerFromCore self-member fetch (org=${orgConfig.org_id})`,
+      );
+    } catch (e) {
+      logger?.warn?.(`syncOwnerFromCore(${orgConfig.org_id}) fetch self member failed: ${e.message} — keeping local owner`);
+      return { changed: false, reason: `fetch self member failed: ${e.message}` };
+    }
+
+    const coreOwnerId = member?.owner_member_id || '';
+    // Core has no authoritative owner → leave the local binding as-is so the
+    // first-DM auto-bind fallback keeps working. We never CLEAR a local owner here.
+    if (!coreOwnerId) return { changed: false, reason: 'core has no owner bound' };
+
+    const localOwnerId = org?.owner?.member_id || '';
+    const localOwnerName = org?.owner?.name || '';
+    // Fully in sync (id matches AND we already have a name) → nothing to do.
+    // We deliberately do NOT early-return when the id matches but the local name
+    // is EMPTY: a prior owner-name fetch may have timed out/failed and persisted
+    // an empty name, and this is the path that backfills it on a later tick.
+    if (coreOwnerId === localOwnerId && localOwnerName) {
+      return { changed: false, ownerMemberId: coreOwnerId };
+    }
+
+    // Owner display name is cosmetic — a lookup failure (incl. timeout) must not
+    // block the bind; we proceed with an empty name and let a later sync fill it.
+    let ownerName = '';
+    try {
+      const ownerMember = await withTimeout(
+        http.getForOrg(orgConfig.org_id, http.apiPath(`/members/${encodeURIComponent(coreOwnerId)}`)),
+        ownerSyncTimeoutMs,
+        `syncOwnerFromCore owner-name fetch (org=${orgConfig.org_id})`,
+      );
+      ownerName = ownerMember?.display_name || ownerMember?.username || '';
+    } catch { /* display name is cosmetic */ }
+
+    // Only write when something ACTUALLY changed — a new owner id, or a non-empty
+    // fetched name that differs from the local one (the backfill case). If core
+    // still returns no name for an already-bound owner, we skip the write so a
+    // steady state does not re-persist an empty name on every periodic tick.
+    const idChanged = coreOwnerId !== localOwnerId;
+    const nameChanged = !!ownerName && ownerName !== localOwnerName;
+    if (!idChanged && !nameChanged) {
+      return { changed: false, ownerMemberId: coreOwnerId };
+    }
+
+    // Persist to config.json AND mutate the live captured orgConfig in place so
+    // the SDK's owner-gated access decisions see the new owner without a restart.
+    // (For a same-id name backfill, ownerName is guaranteed non-empty here; for an
+    // owner change we bind whatever name we resolved — possibly '' if it failed.)
+    configProvider.setOwner(orgConfig.org_id, coreOwnerId, ownerName);
+    orgConfig.owner = { member_id: coreOwnerId, name: ownerName };
+    logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || '(none)'} → ${coreOwnerId}${ownerName ? ` (${ownerName})` : ''}${idChanged ? '' : ' (name backfill)'}`);
+    return { changed: true, ownerMemberId: coreOwnerId, ownerName, previousOwnerMemberId: localOwnerId };
+  };
+
   const callbacks = {
     loadConfig,
     loadSession,
@@ -485,9 +598,20 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
       const org = orgByOrgId(orgId);
       if (org) { org.owner = { ...(org.owner || {}), name }; persist(); }
     },
-    onConfigEvent: (orgConfig, { event, data }) => {
+    onConfigEvent: async (orgConfig, { event, data }) => {
       logger?.info?.(`config event ${event} for org=${orgConfig.org_id}`);
-      // Persist agent.config.* into the org's access block (best-effort mirror).
+      // owner_changed is SECURITY-SENSITIVE. The frame carries a
+      // new_owner_member_id, but owner is the DM-access trust anchor, so a forged
+      // or replayed frame must never be able to rebind us to an attacker. We do
+      // NOT read the owner out of `data`; instead we treat the event purely as a
+      // signal to RE-PULL the authoritative owner from cws-core and ignore the
+      // frame's owner fields entirely (pull-not-trust — parity with the openmax
+      // component's owner_changed handling).
+      if (event === 'agent.config.owner_changed') {
+        await syncOwnerFromCore(orgConfig); // never throws; result is best-effort
+        return;
+      }
+      // Other agent.config.* → mirror access fields into the org's access block.
       const org = orgByOrgId(orgConfig.org_id);
       if (org && data && typeof data === 'object') {
         org.access = { ...(org.access || {}), ...pickAccess(data) };
@@ -527,6 +651,10 @@ export function buildRuntime({ config, file, storage, logger, httpClient }) {
     configProvider,
     wsConfig,
     applyMemberId,
+    // Pull-based owner reconciliation against cws-core. Exposed so the periodic
+    // owner-sync task (owner-sync.js) can reconcile every active org on an
+    // interval; the owner_changed config event routes through the same path.
+    syncOwnerFromCore,
     // Current cached identity_id (may be '' until resolveIdentityId() runs). The
     // guided-autonomy flow's leadAgentId (tm issueCreate lead agent = self) is
     // exactly this value.
