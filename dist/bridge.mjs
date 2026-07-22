@@ -3527,7 +3527,7 @@ var require_websocket_server = __commonJS({
         socket.on("error", socketOnError);
         const key = req.headers["sec-websocket-key"];
         const upgrade = req.headers.upgrade;
-        const version = +req.headers["sec-websocket-version"];
+        const version2 = +req.headers["sec-websocket-version"];
         if (req.method !== "GET") {
           const message = "Invalid HTTP method";
           abortHandshakeOrEmitwsClientError(this, req, socket, 405, message);
@@ -3543,7 +3543,7 @@ var require_websocket_server = __commonJS({
           abortHandshakeOrEmitwsClientError(this, req, socket, 400, message);
           return;
         }
-        if (version !== 13 && version !== 8) {
+        if (version2 !== 13 && version2 !== 8) {
           const message = "Missing or invalid Sec-WebSocket-Version header";
           abortHandshakeOrEmitwsClientError(this, req, socket, 400, message, {
             "Sec-WebSocket-Version": "13, 8"
@@ -3587,7 +3587,7 @@ var require_websocket_server = __commonJS({
         }
         if (this.options.verifyClient) {
           const info = {
-            origin: req.headers[`${version === 8 ? "sec-websocket-origin" : "origin"}`],
+            origin: req.headers[`${version2 === 8 ? "sec-websocket-origin" : "origin"}`],
             secure: !!(req.socket.authorized || req.socket.encrypted),
             req
           };
@@ -4615,9 +4615,9 @@ var CwsHttpClient = class {
     if (this._headersOverride) return this._headersOverride;
     const out = {};
     const deviceId = this._deviceId || process.env.COCO_DEVICE_ID || "";
-    const version = this._clientVersion || process.env.COCO_CLIENT_VERSION || "";
+    const version2 = this._clientVersion || process.env.COCO_CLIENT_VERSION || "";
     if (deviceId) out["X-Device-Id"] = deviceId;
-    if (version) out["X-Client-Version"] = version;
+    if (version2) out["X-Client-Version"] = version2;
     return out;
   }
   // ── RPC log emission (uses injected logger + file sink) ─────────────────────
@@ -7100,7 +7100,7 @@ function createCgroupCollector({
   }
   function read() {
     const errors = [];
-    const version = cgroupVersion();
+    const version2 = cgroupVersion();
     let cpuPct = null;
     const { limitCores, found: cpuLimFound } = readCpuLimitCores();
     if (!cpuLimFound) errors.push("cpu_limit_unreadable");
@@ -7134,7 +7134,7 @@ function createCgroupCollector({
       mem_pct: round2(memPct),
       mem_total_bytes: memTotal,
       mem_used_bytes: memUsed,
-      cgroup_version: version,
+      cgroup_version: version2,
       errors
     };
   }
@@ -7149,13 +7149,13 @@ function selectPrimaryOrg(activeOrgConfigs) {
   const [orgId, orgConfig] = primary;
   return { orgId, orgConfig, selfMemberId: orgConfig.self?.member_id };
 }
-function buildPayload(state, cg, version = "0.0.0") {
+function buildPayload(state, cg, version2 = "0.0.0") {
   if (!state) return null;
   const sys = state.system_metrics || {};
   const rt = state.runtime_info || {};
   const containerized = cg.cgroup_version !== "none";
   return {
-    version,
+    version: version2,
     resources: {
       cpu_pct: containerized ? cg.cpu_pct ?? null : sys.cpu_pct ?? null,
       mem_pct: containerized ? cg.mem_pct ?? null : sys.mem_pct ?? null,
@@ -7187,7 +7187,7 @@ function createMetricsReporter(activeOrgConfigs, {
   runtimeState,
   logger = consoleLogger,
   cgroup = createCgroupCollector(),
-  version = "0.0.0",
+  version: version2 = "0.0.0",
   putForOrg,
   apiPath
 } = {}) {
@@ -7227,7 +7227,7 @@ function createMetricsReporter(activeOrgConfigs, {
       loggedCgroupFallback = true;
       log("cgroup unavailable (non-containerized agent) \u2014 reporting node-level CPU/memory from runtime state");
     }
-    const payload = buildPayload(state, cg, version);
+    const payload = buildPayload(state, cg, version2);
     if (!payload) return;
     const primary = selectPrimaryOrg(activeOrgConfigs);
     if (!primary) {
@@ -8007,8 +8007,19 @@ var CwsAgentBridge = class {
   }
 };
 
+// src/version.js
+var version;
+if (true) {
+  version = "1.1.1";
+} else {
+  version = JSON.parse(
+    readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
+  ).version;
+}
+var PKG_VERSION = version;
+var DEFAULT_APP_VERSION = `claude-openmax/${version}`;
+
 // src/config.js
-var DEFAULT_APP_VERSION = "claude-openmax/1.1.0";
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
 var OWNER_SYNC_HTTP_TIMEOUT_MS = 1e4;
 function withTimeout(promise, ms, label) {
@@ -8382,20 +8393,30 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
       const org = orgByOrgId(orgConfig.org_id);
       if (!org) {
         logger?.warn?.(`[onConfigEvent] org NOT resolved by orgByOrgId(${orgConfig.org_id}) \u2014 access change is NOT applied/persisted (event effectively dropped). Known state.orgs ids=${safeJson(state.orgs.map((o) => o.org_id))}`);
+        return;
       }
-      if (org && data && typeof data === "object") {
-        const sameRef = org === orgConfig;
-        const picked = pickAccess(data);
-        const droppedKeys = dataKeys.filter((k) => !(k in picked));
-        logger?.info?.(`[onConfigEvent] resolved internal org=${orgConfig.org_id}; sameObjectAsSdkOrgConfig=${sameRef}`);
-        logger?.info?.(`[onConfigEvent] pickAccess picked=${safeJson(picked)} droppedIncomingKeys=${safeJson(droppedKeys)} (only dmPolicy/dmAllowFrom/groupPolicy are picked; 'groups' and others are DROPPED by design)`);
-        logger?.info?.(`[onConfigEvent] org.access BEFORE=${safeJson(org.access)} | sdk orgConfig.access=${safeJson(orgConfig.access)}`);
-        org.access = { ...org.access || {}, ...picked };
-        logger?.info?.(`[onConfigEvent] org.access AFTER=${safeJson(org.access)}${sameRef ? "" : " | sdk orgConfig.access UNCHANGED (different object) \u2192 SDK gate will not see this until reload"}`);
-        persist();
-      } else if (org) {
+      if (!data || typeof data !== "object") {
         logger?.warn?.(`[onConfigEvent] data missing or not an object (data=${safeJson(data)}) \u2014 nothing to apply org=${orgConfig.org_id}`);
+        return;
       }
+      const selfMemberId = org.self?.member_id || orgConfig.self?.member_id || "";
+      if (data.agent_member_id && selfMemberId && data.agent_member_id !== selfMemberId) {
+        logger?.info?.(`[onConfigEvent] event=${event} not for us (target=${data.agent_member_id}, self=${selfMemberId}) \u2014 skip org=${orgConfig.org_id}`);
+        return;
+      }
+      const sameRef = org === orgConfig;
+      org.access = org.access || {};
+      logger?.info?.(`[onConfigEvent] resolved internal org=${orgConfig.org_id}; sameObjectAsSdkOrgConfig=${sameRef}`);
+      logger?.info?.(`[onConfigEvent] org.access BEFORE=${safeJson(org.access)} | sdk orgConfig.access=${safeJson(orgConfig.access)}`);
+      const result = applyConfigAccessEvent(org.access, event, data);
+      if (!result.applied) {
+        logger?.warn?.(`[onConfigEvent] ${result.unknown ? "" : `${event}: `}${result.reason} \u2014 nothing applied org=${orgConfig.org_id} (org.access unchanged=${safeJson(org.access)})`);
+        return;
+      }
+      if (!sameRef) orgConfig.access = org.access;
+      logger?.info?.(`[onConfigEvent] applied: ${result.summary} (by ${data.changed_by || "?"}) org=${orgConfig.org_id}`);
+      logger?.info?.(`[onConfigEvent] org.access AFTER=${safeJson(org.access)}${sameRef ? "" : " | sdk orgConfig.access synced to internal record \u2192 live gate updated immediately"}`);
+      persist();
     },
     onConnectionEvent: (orgConfig) => logger?.info?.(`connection event for org=${orgConfig.org_id} (Cat.B no-op)`),
     onChannelEvent: (orgConfig) => logger?.info?.(`channel event for org=${orgConfig.org_id} (Cat.B no-op)`),
@@ -8443,12 +8464,86 @@ function cloneOrgs(orgs) {
 function hasWsTuning(ws) {
   return !!ws && (ws.reconnectMaxMs != null || ws.heartbeatIntervalMs != null || ws.pingIntervalMs != null);
 }
-function pickAccess(data) {
-  const out = {};
-  for (const k of ["dmPolicy", "dmAllowFrom", "groupPolicy"]) {
-    if (data[k] !== void 0) out[k] = data[k];
+var VALID_DM_POLICIES = /* @__PURE__ */ new Set(["open", "allowlist", "owner"]);
+var VALID_GROUP_SCOPES = /* @__PURE__ */ new Set(["open", "allowlist", "disabled"]);
+var VALID_GROUP_MODES = /* @__PURE__ */ new Set(["smart", "mention", "silent"]);
+function applyConfigAccessEvent(access, event, data) {
+  switch (event) {
+    case "agent.config.dm_policy_changed": {
+      const { policy } = data;
+      if (!VALID_DM_POLICIES.has(policy)) return { applied: false, reason: `invalid dm policy "${policy}"` };
+      access.dmPolicy = policy;
+      return { applied: true, summary: `dmPolicy \u2192 ${policy}` };
+    }
+    case "agent.config.dm_allowlist_changed": {
+      const { action, member_ids: memberIds } = data;
+      if (!Array.isArray(memberIds) || !memberIds.length) return { applied: false, reason: "missing or empty member_ids" };
+      access.dmAllowFrom = access.dmAllowFrom || [];
+      if (action === "add") {
+        const existing = new Set(access.dmAllowFrom);
+        for (const id of memberIds) if (!existing.has(id)) access.dmAllowFrom.push(id);
+      } else if (action === "remove") {
+        const toRemove = new Set(memberIds);
+        access.dmAllowFrom = access.dmAllowFrom.filter((id) => !toRemove.has(id));
+      } else if (action === "set") {
+        access.dmAllowFrom = [...memberIds];
+      } else {
+        return { applied: false, reason: `unknown action "${action}"` };
+      }
+      return { applied: true, summary: `dmAllowFrom ${action} ${memberIds.length} member(s)` };
+    }
+    case "agent.config.group_mode_changed": {
+      const { mode, conversation_id: convId } = data;
+      if (!VALID_GROUP_MODES.has(mode)) return { applied: false, reason: `invalid mode "${mode}"` };
+      if (!convId) return { applied: false, reason: "missing conversation_id" };
+      access.groups = access.groups || {};
+      if (mode === "silent") {
+        delete access.groups[convId];
+      } else {
+        access.groups[convId] = access.groups[convId] || { allowFrom: ["*"] };
+        access.groups[convId].mode = mode;
+      }
+      return { applied: true, summary: `group ${convId} mode \u2192 ${mode}` };
+    }
+    case "agent.config.group_allowfrom_changed": {
+      const { allow_from: allowFrom, conversation_id: convId } = data;
+      if (!convId) return { applied: false, reason: "missing conversation_id" };
+      if (!Array.isArray(allowFrom)) return { applied: false, reason: "allow_from is not an array" };
+      access.groups = access.groups || {};
+      if (!access.groups[convId]) {
+        access.groups[convId] = { mode: "mention", allowFrom: [...allowFrom] };
+      } else {
+        access.groups[convId].allowFrom = [...allowFrom];
+      }
+      return { applied: true, summary: `group ${convId} allowFrom \u2192 ${safeJson(allowFrom)}` };
+    }
+    case "agent.config.group_scope_changed": {
+      const { scope } = data;
+      if (!VALID_GROUP_SCOPES.has(scope)) return { applied: false, reason: `invalid scope "${scope}"` };
+      access.groupPolicy = scope;
+      return { applied: true, summary: `groupPolicy \u2192 ${scope}` };
+    }
+    case "agent.config.group_allowlist_changed": {
+      const { action, conversation_ids: convIds } = data;
+      if (!Array.isArray(convIds)) return { applied: false, reason: "conversation_ids is not an array" };
+      if (!["add", "remove", "set"].includes(action)) return { applied: false, reason: `unknown action "${action}"` };
+      access.groups = access.groups || {};
+      if (action === "add") {
+        for (const id of convIds) {
+          if (!access.groups[id]) access.groups[id] = { mode: "mention", allowFrom: ["*"] };
+        }
+      } else if (action === "remove") {
+        for (const id of convIds) delete access.groups[id];
+      } else {
+        const old = access.groups;
+        access.groups = {};
+        for (const id of convIds) access.groups[id] = old[id] || { mode: "mention", allowFrom: ["*"] };
+      }
+      return { applied: true, summary: `group_allowlist ${action} ${convIds.length} conversation(s)` };
+    }
+    default:
+      return { applied: false, unknown: true, reason: `unknown config event "${event}"` };
   }
-  return out;
 }
 
 // src/storage.js
@@ -8651,7 +8746,6 @@ function createInboundDelivery({
 }
 
 // src/create-bridge.js
-var PKG_VERSION = "1.1.0";
 function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
   return new CwsAgentBridge({
     http: runtime.http,

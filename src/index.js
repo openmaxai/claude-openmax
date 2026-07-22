@@ -30,8 +30,7 @@ import { createBridge } from './create-bridge.js';
 import { startOwnerSync } from './owner-sync.js';
 import { startWakeServer } from './wake-server.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
-
-const PKG_VERSION = '1.1.0';
+import { PKG_VERSION } from './version.js';
 
 async function main() {
   const mode = process.env.CLAUDE_OPENMAX_MODE || 'inproc';

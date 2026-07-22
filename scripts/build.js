@@ -15,8 +15,19 @@
  */
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
+
+// Inline the version STRING (only the string) into the bundles at build time so
+// dist/ stays self-contained — the dependency-free smoke test copies just
+// dist/*.mjs to an empty dir, so dist must not read repo-root package.json at
+// runtime. src/version.js guards on `typeof __CLAUDE_OPENMAX_VERSION__`: defined
+// here for the bundle, undefined when running from src/ (where it falls back to
+// a runtime package.json read). Single source of truth stays package.json.
+const pkgVersion = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+).version;
 
 const entries = [
   { in: 'src/index.js', out: 'dist/index.mjs' },   // in-process MCP channel plugin (plugin.json target)
@@ -49,6 +60,7 @@ for (const e of entries) {
     minify: false, // keep the shipped bundle auditable; source is in the repo too
     logLevel: 'info',
     banner: { js: BANNER },
+    define: { __CLAUDE_OPENMAX_VERSION__: JSON.stringify(pkgVersion) },
   });
   console.log(`bundled ${e.in} -> ${e.out}`);
 }

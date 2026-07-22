@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-07-22
+
+Bug-fix release: policy changes made in the OpenMax workspace UI now actually
+apply to the agent's local config and live access gate.
+
+### Fixed
+
+- `onConfigEvent` dropped every real config-event payload field. It ran a
+  generic `pickAccess(data)` that only copied the literal keys `dmPolicy` /
+  `dmAllowFrom` / `groupPolicy`, so events carrying `policy`, `scope`, `action`,
+  `conversation_ids`, `member_ids`, `allow_from`, or `mode` (e.g.
+  `agent.config.group_scope_changed`, `agent.config.group_allowlist_changed`)
+  applied nothing — a group allowlisted in the UI was still locally rejected.
+  Replaced `pickAccess` with an event-type-aware `applyConfigAccessEvent` that
+  maps each `agent.config.*` event to the correct `access` mutation (mirroring
+  the zylos-openmax reference handler), persists the change, and syncs the live
+  SDK `orgConfig.access` reference so the access gate updates immediately.
+
 ## [1.1.0] - 2026-07-22
 
 Stable release promoting `1.1.0-beta.1` and adding opt-in diagnostic logging.
