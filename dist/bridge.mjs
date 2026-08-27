@@ -4033,6 +4033,94 @@ function scrubLine(line) {
   return out;
 }
 
+// src/policy-sync.js
+function reportedAllowFrom(allowFrom) {
+  if (!Array.isArray(allowFrom) || allowFrom.length === 0) return ["*"];
+  return [...allowFrom];
+}
+function buildReportedPolicy(access) {
+  const a = access || {};
+  const groups = [];
+  const groupAllowlist = [];
+  for (const [convId, cfg] of Object.entries(a.groups || {})) {
+    if (!convId) continue;
+    const mode = cfg?.mode || "mention";
+    if (mode !== "smart" && mode !== "mention") continue;
+    groupAllowlist.push(convId);
+    groups.push({ conversation_id: convId, mode, allow_from: reportedAllowFrom(cfg?.allowFrom) });
+  }
+  return {
+    dm_policy: a.dmPolicy || "owner",
+    dm_allowlist: Array.isArray(a.dmAllowFrom) ? [...a.dmAllowFrom] : [],
+    // ALWAYS sent explicitly. `group_scope` is optional in the request body and
+    // cws-core substitutes "open" when it is absent (agent_policy.go report
+    // handler) — omitting it on an allowlist/disabled agent would silently
+    // widen the server's copy to "any group".
+    group_scope: a.groupPolicy || "allowlist",
+    group_allowlist: groupAllowlist,
+    groups
+  };
+}
+function accessFromServerPolicy(snapshot) {
+  const s = snapshot || {};
+  const groups = {};
+  for (const g of Array.isArray(s.groups) ? s.groups : []) {
+    const convId = g?.conversation_id;
+    if (!convId) continue;
+    groups[convId] = {
+      mode: g.mode || "mention",
+      allowFrom: Array.isArray(g.allow_from) && g.allow_from.length ? [...g.allow_from] : ["*"]
+    };
+  }
+  for (const convId of Array.isArray(s.group_allowlist) ? s.group_allowlist : []) {
+    if (convId && !groups[convId]) groups[convId] = { mode: "mention", allowFrom: ["*"] };
+  }
+  return {
+    dmPolicy: s.dm_policy || "owner",
+    dmAllowFrom: Array.isArray(s.dm_allowlist) ? [...s.dm_allowlist] : [],
+    // Fall back to the SDK's local default rather than the server's ("open"):
+    // a response missing the field tells us nothing, and guessing "open" would
+    // widen access. Current cws-core always sends it.
+    groupPolicy: s.group_scope || "allowlist",
+    groups
+  };
+}
+function canonical(value) {
+  if (Array.isArray(value)) {
+    const items = value.map(canonical);
+    items.sort((a, b) => {
+      const [x, y] = [JSON.stringify(a), JSON.stringify(b)];
+      return x < y ? -1 : x > y ? 1 : 0;
+    });
+    return items;
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((k) => [k, canonical(value[k])]));
+  }
+  return value;
+}
+function accessFingerprint(access) {
+  return JSON.stringify(canonical(buildReportedPolicy(access)));
+}
+function staleGroupIdsFromError(err, groups) {
+  const ids = (Array.isArray(groups) ? groups : []).map((g) => g?.conversation_id).filter(Boolean);
+  if (!ids.length) return [];
+  let haystack = String(err?.message || "");
+  try {
+    haystack += ` ${JSON.stringify(err?.body ?? "")}`;
+  } catch {
+  }
+  return ids.filter((id) => haystack.includes(id));
+}
+function withoutGroups(payload, convIds) {
+  const drop = new Set(convIds || []);
+  return {
+    ...payload,
+    group_allowlist: (payload?.group_allowlist || []).filter((id) => !drop.has(id)),
+    groups: (payload?.groups || []).filter((g) => !drop.has(g?.conversation_id))
+  };
+}
+
 // node_modules/@openmaxai/openmax-agent-sdk/src/providers.js
 var consoleLogger = {
   info: (...a) => console.log(...a),
@@ -4410,6 +4498,37 @@ function createDeduper(optsOrLegacyTtl = {}, legacyOpts) {
 // node_modules/@openmaxai/openmax-agent-sdk/src/transport/http.js
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+
+// node_modules/@openmaxai/openmax-agent-sdk/src/transport/redact.js
+var SENSITIVE_KEYS = /* @__PURE__ */ new Set([
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "token",
+  "upload_token",
+  "verify_token",
+  "api_key",
+  "apikey",
+  "client_secret",
+  "clientsecret",
+  "app_secret",
+  "password",
+  "secret",
+  "ticket"
+]);
+function redactSecrets(value) {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = SENSITIVE_KEYS.has(k.toLowerCase()) ? "[REDACTED]" : redactSecrets(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+// node_modules/@openmaxai/openmax-agent-sdk/src/transport/http.js
 var REFRESH_ON_401_WINDOW_MS = 10 * 60 * 1e3;
 function rpcLogStdoutEnabled() {
   return process.env.COCO_RPC_LOG !== "0";
@@ -4623,7 +4742,7 @@ var CwsHttpClient = class {
   // ── RPC log emission (uses injected logger + file sink) ─────────────────────
   _logRpcRequest(method, url, body, orgId) {
     const tag = orgId ? `org=${orgId}` : "";
-    const bodyStr = body === void 0 ? "(no body)" : JSON.stringify(body);
+    const bodyStr = body === void 0 ? "(no body)" : JSON.stringify(redactSecrets(body));
     const line = `[rpc] \u2192 ${method} ${url} ${tag} req: ${bodyStr}`;
     if (rpcLogStdoutEnabled()) this._logger.log(line);
     appendRpcLine(line);
@@ -4631,7 +4750,7 @@ var CwsHttpClient = class {
   _logRpcResponse(method, url, status, data) {
     let bodyStr;
     try {
-      bodyStr = typeof data === "string" ? data : JSON.stringify(data);
+      bodyStr = typeof data === "string" ? data : JSON.stringify(redactSecrets(data));
     } catch {
       bodyStr = String(data);
     }
@@ -5085,7 +5204,7 @@ var TokenManager = class {
     };
     if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
     if (rpcLogStdoutEnabled2()) {
-      this._logger.log(`[rpc] \u2192 POST ${url} req: ${JSON.stringify(body)}`);
+      this._logger.log(`[rpc] \u2192 POST ${url} req: ${JSON.stringify(redactSecrets(body))}`);
     }
     const res = await this._fetchNoAutoFollow(url, {
       method: "POST",
@@ -5100,7 +5219,8 @@ var TokenManager = class {
       data = text;
     }
     if (rpcLogStdoutEnabled2()) {
-      const bodyStr = typeof data === "string" ? data : JSON.stringify(data);
+      const redacted = typeof data === "string" ? data : redactSecrets(data);
+      const bodyStr = typeof redacted === "string" ? redacted : JSON.stringify(redacted);
       const level = res.status >= 400 ? "warn" : "log";
       this._logger[level](`[rpc] \u2190 POST ${url} resp ${res.status}: ${bodyStr}`);
     }
@@ -8010,7 +8130,7 @@ var CwsAgentBridge = class {
 // src/version.js
 var version;
 if (true) {
-  version = "1.1.2";
+  version = "1.2.0";
 } else {
   version = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
@@ -8022,6 +8142,8 @@ var DEFAULT_APP_VERSION = `claude-openmax/${version}`;
 // src/config.js
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
 var OWNER_SYNC_HTTP_TIMEOUT_MS = 1e4;
+var POLICY_SYNC_HTTP_TIMEOUT_MS = 1e4;
+var POLICY_RECONCILE_DEBOUNCE_MS = 3e3;
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise((_resolve, reject) => {
@@ -8169,7 +8291,16 @@ async function resolveAndCacheIdentityId({ http, agent, persist, logger }) {
     return "";
   }
 }
-function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS }) {
+function buildRuntime({
+  config,
+  file,
+  storage,
+  logger,
+  httpClient,
+  ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS,
+  policySyncTimeoutMs = POLICY_SYNC_HTTP_TIMEOUT_MS,
+  policyDebounceMs = POLICY_RECONCILE_DEBOUNCE_MS
+}) {
   const state = {
     enabled: config.enabled,
     server: { ...config.server },
@@ -8250,10 +8381,15 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
     enabledOrgs: () => activeOrgs(),
     getOrgByOrgId: orgByOrgId,
     updateConfig: (fn) => {
+      const accessBefore = new Map(state.orgs.map((o) => [o.org_id, accessFingerprint(o.access)]));
       const cfg = { orgs: Object.fromEntries(state.orgs.map((o) => [o.org_id, o])) };
       fn(cfg);
       state.orgs = Object.values(cfg.orgs);
       persist();
+      for (const org of state.orgs) {
+        if (org.enabled === false) continue;
+        if (accessBefore.get(org.org_id) !== accessFingerprint(org.access)) schedulePolicyReconcile(org);
+      }
       return cfg;
     },
     setOwner: (orgId, memberId, name) => {
@@ -8368,6 +8504,143 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
     logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || "(none)"} \u2192 ${coreOwnerId}${ownerName ? ` (${ownerName})` : ""}${idChanged ? "" : " (name backfill)"}`);
     return { changed: true, ownerMemberId: coreOwnerId, ownerName, previousOwnerMemberId: localOwnerId };
   };
+  const policyMarkerKey = (orgId) => path4.join("policy", `${orgId}.json`);
+  const readPolicyMarker = async (orgId) => {
+    try {
+      const raw = await storage.get(policyMarkerKey(orgId));
+      if (!raw) return null;
+      const marker = JSON.parse(raw);
+      return marker && typeof marker === "object" ? marker : null;
+    } catch {
+      return null;
+    }
+  };
+  const writePolicyMarker = async (orgId, marker) => {
+    try {
+      await storage.set(policyMarkerKey(orgId), JSON.stringify(marker));
+    } catch (e) {
+      logger?.warn?.(`[policy-sync] could not persist marker for org=${orgId}: ${e.message}`);
+    }
+  };
+  let warnedPolicyEndpointMissing = false;
+  const warnPolicyEndpointMissingOnce = (message) => {
+    if (warnedPolicyEndpointMissing) return;
+    warnedPolicyEndpointMissing = true;
+    logger?.warn?.(message);
+  };
+  const reconcilePolicyWithServer = async (orgConfig) => {
+    const org = orgByOrgId(orgConfig.org_id) || orgConfig;
+    const orgId = org.org_id;
+    const selfMemberId = org.self?.member_id || orgConfig.self?.member_id || "";
+    if (!selfMemberId) {
+      return { changed: false, reason: "self.member_id not available yet" };
+    }
+    if (typeof http?.getForOrg !== "function" || typeof http?.putForOrg !== "function" || typeof http?.apiPath !== "function") {
+      return { changed: false, reason: "http client lacks getForOrg/putForOrg/apiPath \u2014 policy sync skipped" };
+    }
+    const policyPath = () => http.apiPath(`/agents/${encodeURIComponent(selfMemberId)}/policy`);
+    const reportPath = () => http.apiPath(`/agents/${encodeURIComponent(selfMemberId)}/reported-policy`);
+    const fetchPolicy = () => withTimeout(
+      http.getForOrg(orgId, policyPath()),
+      policySyncTimeoutMs,
+      `policy fetch (org=${orgId})`
+    );
+    const localAccess = org.access || {};
+    const localFp = accessFingerprint(localAccess);
+    const localPayload = buildReportedPolicy(localAccess);
+    let snapshot;
+    try {
+      snapshot = await fetchPolicy();
+    } catch (e) {
+      if (e?.status === 404) {
+        warnPolicyEndpointMissingOnce(`[policy-sync] GET agent policy endpoint unavailable (404) org=${orgId}: ${e.message} \u2014 policy reconcile is a no-op on this deployment (logged once)`);
+      } else {
+        logger?.warn?.(`[policy-sync] policy fetch failed org=${orgId}: ${e.message} \u2014 nothing reported (pull-first)`);
+      }
+      return { changed: false, reason: `policy fetch failed: ${e.message}` };
+    }
+    if (!snapshot || typeof snapshot !== "object") {
+      logger?.warn?.(`[policy-sync] policy read for org=${orgId} returned no object body \u2014 nothing reported (pull-first)`);
+      return { changed: false, reason: "policy read returned no object body" };
+    }
+    const serverUpdatedAt = Number(snapshot?.updated_at) || 0;
+    const serverGroups = Array.isArray(snapshot?.groups) ? snapshot.groups : [];
+    const serverAllowlist = Array.isArray(snapshot?.group_allowlist) ? snapshot.group_allowlist : [];
+    const marker = await readPolicyMarker(orgId);
+    const reportLocalPolicy = async (why) => {
+      const payload = localPayload;
+      let sent = payload;
+      try {
+        await withTimeout(http.putForOrg(orgId, reportPath(), payload), policySyncTimeoutMs, `policy report (org=${orgId})`);
+      } catch (e) {
+        const stale = staleGroupIdsFromError(e, payload.groups);
+        if (stale.length && e?.status >= 400 && e?.status < 500) {
+          sent = withoutGroups(payload, stale);
+          try {
+            await withTimeout(http.putForOrg(orgId, reportPath(), sent), policySyncTimeoutMs, `policy report retry (org=${orgId})`);
+            logger?.warn?.(`[policy-sync] org=${orgId}: server rejected group(s) ${stale.join(", ")} (${e.status}: ${e.message}) \u2014 reported the rest; local config left untouched`);
+          } catch (retryErr) {
+            logger?.warn?.(`[policy-sync] org=${orgId}: policy report retry failed: ${retryErr.message}`);
+            return { changed: false, reason: `report retry failed: ${retryErr.message}` };
+          }
+        } else if (e?.status === 404) {
+          warnPolicyEndpointMissingOnce(`[policy-sync] PUT reported-policy endpoint unavailable (404) org=${orgId}: ${e.message} \u2014 policy reporting is a no-op on this deployment (logged once)`);
+          return { changed: false, reason: `report endpoint unavailable: ${e.message}` };
+        } else {
+          logger?.warn?.(`[policy-sync] org=${orgId}: policy report failed: ${e.message}`);
+          return { changed: false, reason: `report failed: ${e.message}` };
+        }
+      }
+      let confirmedUpdatedAt = serverUpdatedAt;
+      try {
+        const after = await fetchPolicy();
+        const confirmed = Number(after?.updated_at) || 0;
+        if (confirmed > 0) confirmedUpdatedAt = confirmed;
+      } catch (e) {
+        logger?.info?.(`[policy-sync] org=${orgId}: post-report policy re-read failed: ${e.message} (marker keeps the pre-report timestamp)`);
+      }
+      await writePolicyMarker(orgId, { fp: localFp, serverUpdatedAt: confirmedUpdatedAt });
+      logger?.info?.(`[policy-sync] reported policy org=${orgId} (${why}): dm_policy=${sent.dm_policy} group_scope=${sent.group_scope} groups=${sent.groups.length}`);
+      return { changed: true, direction: "reported-local", reason: why, serverUpdatedAt: confirmedUpdatedAt, groupsReported: sent.groups.length };
+    };
+    if (serverUpdatedAt === 0) {
+      if (serverGroups.length === 0 && serverAllowlist.length === 0) {
+        return reportLocalPolicy("server has no policy row yet \u2014 seeding");
+      }
+      logger?.info?.(`[policy-sync] org=${orgId}: server reports updated_at=0 but ${serverGroups.length} group(s) / ${serverAllowlist.length} allowlist entr(ies) \u2014 neither reporting nor adopting (ambiguous server state)`);
+      return { changed: false, reason: "server updated_at=0 with non-empty group state \u2014 no action" };
+    }
+    if (serverUpdatedAt !== marker?.serverUpdatedAt) {
+      const adopted = accessFromServerPolicy(snapshot);
+      const adoptedFp = accessFingerprint(adopted);
+      const differs = adoptedFp !== localFp;
+      if (differs) {
+        org.access = adopted;
+        if (org !== orgConfig) orgConfig.access = adopted;
+        persist();
+        logger?.info?.(`[policy-sync] adopted server policy org=${orgId} (updated_at=${serverUpdatedAt}): ${safeJson(adopted)}`);
+      }
+      await writePolicyMarker(orgId, { fp: adoptedFp, serverUpdatedAt });
+      return { changed: differs, direction: "adopted-server", serverUpdatedAt };
+    }
+    if (localFp !== marker?.fp) {
+      return reportLocalPolicy("local access changed since the last report");
+    }
+    return { changed: false, reason: "in sync", serverUpdatedAt };
+  };
+  const policyDebounceTimers = /* @__PURE__ */ new Map();
+  const schedulePolicyReconcile = (orgConfig) => {
+    const orgId = orgConfig?.org_id;
+    if (!orgId) return;
+    const pending = policyDebounceTimers.get(orgId);
+    if (pending) clearTimeout(pending);
+    const timer = setTimeout(() => {
+      policyDebounceTimers.delete(orgId);
+      Promise.resolve().then(() => reconcilePolicyWithServer(orgConfig)).then((res) => logger?.info?.(`[policy-sync] debounced reconcile org=${orgId} result=${safeJson(res)}`)).catch((e) => logger?.warn?.(`[policy-sync] debounced reconcile org=${orgId} FAILED: ${e.message}`));
+    }, policyDebounceMs);
+    timer.unref?.();
+    policyDebounceTimers.set(orgId, timer);
+  };
   const callbacks = {
     loadConfig,
     loadSession,
@@ -8417,6 +8690,7 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
       logger?.info?.(`[onConfigEvent] applied: ${result.summary} (by ${data.changed_by || "?"}) org=${orgConfig.org_id}`);
       logger?.info?.(`[onConfigEvent] org.access AFTER=${safeJson(org.access)}${sameRef ? "" : " | sdk orgConfig.access synced to internal record \u2192 live gate updated immediately"}`);
       persist();
+      schedulePolicyReconcile(orgConfig);
     },
     onConnectionEvent: (orgConfig) => logger?.info?.(`connection event for org=${orgConfig.org_id} (Cat.B no-op)`),
     onChannelEvent: (orgConfig) => logger?.info?.(`channel event for org=${orgConfig.org_id} (Cat.B no-op)`),
@@ -8448,6 +8722,9 @@ function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTime
     // owner-sync task (owner-sync.js) can reconcile every active org on an
     // interval; the owner_changed config event routes through the same path.
     syncOwnerFromCore,
+    // Two-way policy reconcile against cws-core (pull-first). Exposed for the
+    // periodic task in owner-sync.js, which rides the same 5-minute cadence.
+    reconcilePolicyWithServer,
     // Current cached identity_id (may be '' until resolveIdentityId() runs). The
     // guided-autonomy flow's leadAgentId (tm issueCreate lead agent = self) is
     // exactly this value.
@@ -8782,6 +9059,9 @@ function startOwnerSync({ runtime, logger, intervalMs = DEFAULT_OWNER_SYNC_INTER
     logger?.info?.(`[owner-sync] tick start \u2014 ${orgs.length} active org(s)`);
     for (const orgConfig of orgs) {
       Promise.resolve().then(() => runtime.syncOwnerFromCore(orgConfig)).then((res) => logger?.info?.(`[owner-sync] org=${orgConfig.org_id} result=${safeJson(res)}`)).catch((e) => logger?.warn?.(`[owner-sync] org=${orgConfig.org_id} FAILED: ${e.message}`));
+      Promise.resolve().then(() => runtime.reconcilePolicyWithServer?.(orgConfig)).then((res) => {
+        if (res) logger?.info?.(`[policy-sync] org=${orgConfig.org_id} result=${safeJson(res)}`);
+      }).catch((e) => logger?.warn?.(`[policy-sync] org=${orgConfig.org_id} FAILED: ${e.message}`));
     }
   };
   const timers = [];

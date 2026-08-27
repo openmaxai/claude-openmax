@@ -60,6 +60,13 @@ import path from 'node:path';
 
 import { identityIdFromMe, purgeOrgTokenCache } from './token-guard.js';
 import { safeJson, redactSecretsDeep } from './redact.js';
+import {
+  accessFingerprint,
+  accessFromServerPolicy,
+  buildReportedPolicy,
+  staleGroupIdsFromError,
+  withoutGroups,
+} from './policy-sync.js';
 
 import {
   CwsHttpClient,
@@ -81,6 +88,20 @@ const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 // timeout and accepts NO AbortSignal, so a hung core connection would otherwise
 // stall these calls forever; see withTimeout().
 const OWNER_SYNC_HTTP_TIMEOUT_MS = 10_000;
+
+// Same hard cap, same reason, for the policy-reconcile calls (see withTimeout()
+// below). Kept as its own constant because the two syncs have independent
+// failure modes and one may need to move without dragging the other along.
+const POLICY_SYNC_HTTP_TIMEOUT_MS = 10_000;
+
+// Trailing-edge debounce before an access CHANGE is reconciled with the server.
+// Saving the agent's policy in the workspace UI is not one write: setting the
+// group scope and then adding the first allowlist entry arrive as two separate
+// agent.config.* events, milliseconds apart. Reconciling synchronously on the
+// first one would read a half-applied local state and race the second write —
+// which is exactly how a report can erase the allowlist a user just saved.
+// Waiting for the burst to settle makes the reconcile see the final state.
+const POLICY_RECONCILE_DEBOUNCE_MS = 3_000;
 
 /**
  * Race a promise against a timeout so the caller can never block indefinitely.
@@ -320,8 +341,18 @@ export async function resolveAndCacheIdentityId({ http, agent, persist, logger }
  *        the owner-sync core fetches. Production always uses the hardcoded
  *        OWNER_SYNC_HTTP_TIMEOUT_MS (no config.json knob); tests override it to
  *        keep a hanging-stub timeout test fast.
+ * @param {number} [params.policySyncTimeoutMs]  TEST SEAM ONLY — same, for the
+ *        policy-reconcile calls (POLICY_SYNC_HTTP_TIMEOUT_MS in production).
+ * @param {number} [params.policyDebounceMs]  TEST SEAM ONLY — debounce before an
+ *        access change is reconciled (POLICY_RECONCILE_DEBOUNCE_MS in production);
+ *        tests shorten it so they do not wait three seconds.
  */
-export function buildRuntime({ config, file, storage, logger, httpClient, ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS }) {
+export function buildRuntime({
+  config, file, storage, logger, httpClient,
+  ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS,
+  policySyncTimeoutMs = POLICY_SYNC_HTTP_TIMEOUT_MS,
+  policyDebounceMs = POLICY_RECONCILE_DEBOUNCE_MS,
+}) {
   // Mutable in-memory config mirror; persisted back to `file` (in the
   // openmax-mirrored, org_id-keyed on-disk shape) on writes so the SDK's
   // member_id write-back / owner bind / self.name / identity_id / agent.config.*
@@ -433,11 +464,22 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
     enabledOrgs: () => activeOrgs(),
     getOrgByOrgId: orgByOrgId,
     updateConfig: (fn) => {
+      // Fingerprint every org's access BEFORE the mutation: this is the single
+      // funnel for LOCAL access edits (the SDK's dm_policy / dm_allow / dm_revoke
+      // tools all land here), and a local edit is only worth reporting to the
+      // server if it actually changed what the server would see. Comparing the
+      // fingerprints is also what keeps a self_rename — which comes through the
+      // same funnel but only touches self.name — from triggering any HTTP.
+      const accessBefore = new Map(state.orgs.map((o) => [o.org_id, accessFingerprint(o.access)]));
       const cfg = { orgs: Object.fromEntries(state.orgs.map((o) => [o.org_id, o])) };
       fn(cfg);
       // reflect back mutations keyed by org_id into the array
       state.orgs = Object.values(cfg.orgs);
       persist();
+      for (const org of state.orgs) {
+        if (org.enabled === false) continue;
+        if (accessBefore.get(org.org_id) !== accessFingerprint(org.access)) schedulePolicyReconcile(org);
+      }
       return cfg;
     },
     setOwner: (orgId, memberId, name) => {
@@ -604,6 +646,269 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
     return { changed: true, ownerMemberId: coreOwnerId, ownerName, previousOwnerMemberId: localOwnerId };
   };
 
+
+  // ── policy reconcile: local access block ⇄ server reported-policy ──────────
+  // The workspace settings page shows the policy the SERVER has on record; the
+  // agent enforces the policy in its LOCAL config. Nothing kept the two in step:
+  // an agent that never reported looked wide open on the page ("group scope:
+  // open" — cws-core's synthesized default for "no policy row") while actually
+  // refusing every group, and a policy edited in the UI while the agent was
+  // offline never reached local config.
+  //
+  // This reconciles BOTH directions, and it is deliberately PULL-FIRST rather
+  // than the periodic unconditional push the sibling adapters do: read the server
+  // copy, and only upload when reading proved there is nothing to lose. A blind
+  // push is how a human's UI edit gets overwritten by an agent's stale config —
+  // the openclaw adapter did exactly that and flattened a server-side group
+  // allowlist to null on its next tick.
+  //
+  // Precedence, in one line: a server copy that moved since we last looked wins;
+  // otherwise a local change is uploaded; otherwise nothing happens (and nothing
+  // is written to disk — config.json holds credentials and this runs every five
+  // minutes).
+  const policyMarkerKey = (orgId) => path.join('policy', `${orgId}.json`);
+
+  // Marker = {fp, serverUpdatedAt}: the local fingerprint we last reported (or
+  // adopted) and the server timestamp we saw it at. It is what separates "the
+  // server changed" from "we changed", and it lives in the storage provider
+  // rather than config.json so a reconcile in a steady state never rewrites a
+  // file containing secrets.
+  const readPolicyMarker = async (orgId) => {
+    try {
+      const raw = await storage.get(policyMarkerKey(orgId));
+      if (!raw) return null;
+      const marker = JSON.parse(raw);
+      return (marker && typeof marker === 'object') ? marker : null;
+    } catch { return null; }
+  };
+  const writePolicyMarker = async (orgId, marker) => {
+    try {
+      await storage.set(policyMarkerKey(orgId), JSON.stringify(marker));
+    } catch (e) {
+      // Losing the marker costs us one redundant pass, never correctness.
+      logger?.warn?.(`[policy-sync] could not persist marker for org=${orgId}: ${e.message}`);
+    }
+  };
+
+  // A missing endpoint is a permanent condition on an older deployment, so it is
+  // logged once instead of every five minutes (same pattern as the SDK's metrics
+  // reporter). Everything else is logged each time — it may be transient.
+  let warnedPolicyEndpointMissing = false;
+  const warnPolicyEndpointMissingOnce = (message) => {
+    if (warnedPolicyEndpointMissing) return;
+    warnedPolicyEndpointMissing = true;
+    logger?.warn?.(message);
+  };
+
+  /**
+   * Reconcile one org's access policy with cws-core. Best-effort in the strongest
+   * sense: it never throws and never leaves local config in a partially applied
+   * state. Returns a small result object for the caller to log.
+   */
+  const reconcilePolicyWithServer = async (orgConfig) => {
+    const org = orgByOrgId(orgConfig.org_id) || orgConfig;
+    const orgId = org.org_id;
+    const selfMemberId = org.self?.member_id || orgConfig.self?.member_id || '';
+    if (!selfMemberId) {
+      // Same reason as syncOwnerFromCore: the policy endpoints are keyed by our
+      // own agent member id, written back by the token exchange (applyMemberId).
+      return { changed: false, reason: 'self.member_id not available yet' };
+    }
+
+    // Capability probe. `httpClient` is an injectable seam and callers pass
+    // partial stubs; this function is reachable from the periodic task AND from
+    // every access-changing event, so an unconditional call on a client without
+    // these methods would throw on each one.
+    if (typeof http?.getForOrg !== 'function'
+      || typeof http?.putForOrg !== 'function'
+      || typeof http?.apiPath !== 'function') {
+      return { changed: false, reason: 'http client lacks getForOrg/putForOrg/apiPath — policy sync skipped' };
+    }
+
+    const policyPath = () => http.apiPath(`/agents/${encodeURIComponent(selfMemberId)}/policy`);
+    const reportPath = () => http.apiPath(`/agents/${encodeURIComponent(selfMemberId)}/reported-policy`);
+    const fetchPolicy = () => withTimeout(
+      http.getForOrg(orgId, policyPath()),
+      policySyncTimeoutMs,
+      `policy fetch (org=${orgId})`,
+    );
+
+    const localAccess = org.access || {};
+    const localFp = accessFingerprint(localAccess);
+    // Built here, next to the fingerprint, so the two always describe the SAME
+    // instant of org.access — an event mutating the access block in place while
+    // the HTTP calls below are in flight would otherwise let us upload one state
+    // and record the fingerprint of another.
+    const localPayload = buildReportedPolicy(localAccess);
+
+    // ── PULL FIRST ──────────────────────────────────────────────────────────
+    // Every failure of this read — endpoint missing, 5xx, timeout, token trouble
+    // — returns WITHOUT uploading anything. This single early return is the
+    // anti-erasure guarantee: we never overwrite a policy we could not read.
+    let snapshot;
+    try {
+      snapshot = await fetchPolicy();
+    } catch (e) {
+      if (e?.status === 404) {
+        warnPolicyEndpointMissingOnce(`[policy-sync] GET agent policy endpoint unavailable (404) org=${orgId}: ${e.message} — policy reconcile is a no-op on this deployment (logged once)`);
+      } else {
+        logger?.warn?.(`[policy-sync] policy fetch failed org=${orgId}: ${e.message} — nothing reported (pull-first)`);
+      }
+      return { changed: false, reason: `policy fetch failed: ${e.message}` };
+    }
+
+    // A success with no object body (empty response, a proxy's 204, a gateway
+    // stub) tells us nothing about the server's policy. Reading it as "the server
+    // has nothing" would authorize an upload on no evidence, which is the erasure
+    // this function exists to prevent.
+    if (!snapshot || typeof snapshot !== 'object') {
+      logger?.warn?.(`[policy-sync] policy read for org=${orgId} returned no object body — nothing reported (pull-first)`);
+      return { changed: false, reason: 'policy read returned no object body' };
+    }
+
+    const serverUpdatedAt = Number(snapshot?.updated_at) || 0;
+    const serverGroups = Array.isArray(snapshot?.groups) ? snapshot.groups : [];
+    const serverAllowlist = Array.isArray(snapshot?.group_allowlist) ? snapshot.group_allowlist : [];
+    const marker = await readPolicyMarker(orgId);
+
+    const reportLocalPolicy = async (why) => {
+      const payload = localPayload;
+      let sent = payload;
+      try {
+        await withTimeout(http.putForOrg(orgId, reportPath(), payload), policySyncTimeoutMs, `policy report (org=${orgId})`);
+      } catch (e) {
+        // A 4xx that names one of the conversations WE sent is the server saying
+        // "that group is not yours to report" (cws-comm verifyAgentGroupMember →
+        // not-found, e.g. the agent was removed from the group), and it rejects
+        // the whole report. Retry once without those groups; do NOT delete them
+        // from local config — a membership blip must not erase an owner's
+        // settings, and re-adding the agent restores the report on its own.
+        const stale = staleGroupIdsFromError(e, payload.groups);
+        if (stale.length && e?.status >= 400 && e?.status < 500) {
+          sent = withoutGroups(payload, stale);
+          try {
+            await withTimeout(http.putForOrg(orgId, reportPath(), sent), policySyncTimeoutMs, `policy report retry (org=${orgId})`);
+            logger?.warn?.(`[policy-sync] org=${orgId}: server rejected group(s) ${stale.join(', ')} (${e.status}: ${e.message}) — reported the rest; local config left untouched`);
+          } catch (retryErr) {
+            logger?.warn?.(`[policy-sync] org=${orgId}: policy report retry failed: ${retryErr.message}`);
+            return { changed: false, reason: `report retry failed: ${retryErr.message}` };
+          }
+        } else if (e?.status === 404) {
+          warnPolicyEndpointMissingOnce(`[policy-sync] PUT reported-policy endpoint unavailable (404) org=${orgId}: ${e.message} — policy reporting is a no-op on this deployment (logged once)`);
+          return { changed: false, reason: `report endpoint unavailable: ${e.message}` };
+        } else {
+          logger?.warn?.(`[policy-sync] org=${orgId}: policy report failed: ${e.message}`);
+          return { changed: false, reason: `report failed: ${e.message}` };
+        }
+      }
+
+      // Our own PUT moves the server's updated_at, so re-read it: without this
+      // the next pass sees "the server moved" (it did — we moved it), treats the
+      // server as authoritative, and reverts any local change made in between.
+      // Best-effort; a failed confirmation only costs one redundant adopt of our
+      // own push next pass.
+      let confirmedUpdatedAt = serverUpdatedAt;
+      try {
+        const after = await fetchPolicy();
+        const confirmed = Number(after?.updated_at) || 0;
+        if (confirmed > 0) confirmedUpdatedAt = confirmed;
+      } catch (e) {
+        logger?.info?.(`[policy-sync] org=${orgId}: post-report policy re-read failed: ${e.message} (marker keeps the pre-report timestamp)`);
+      }
+
+      // The stored fingerprint is the LOCAL one even when stale groups were
+      // pruned from the upload: those groups would be rejected again, so
+      // retrying every five minutes buys nothing, and the next genuine local
+      // change retries naturally.
+      await writePolicyMarker(orgId, { fp: localFp, serverUpdatedAt: confirmedUpdatedAt });
+      logger?.info?.(`[policy-sync] reported policy org=${orgId} (${why}): dm_policy=${sent.dm_policy} group_scope=${sent.group_scope} groups=${sent.groups.length}`);
+      return { changed: true, direction: 'reported-local', reason: why, serverUpdatedAt: confirmedUpdatedAt, groupsReported: sent.groups.length };
+    };
+
+    // (1) The server has no policy row for us → seed it. There is nothing to
+    // erase, and the "group_scope: open" in this response is cws-core's
+    // synthesized default, not an owner's decision.
+    //
+    // EXPLICIT ASSUMPTION — `updated_at == 0` ⟺ "no policy row exists". That is
+    // an IMPLEMENTATION DETAIL of cws-comm, not a documented contract: its RPC
+    // handler serializes the timestamp only when the stored row has one
+    // (`if !snap.UpdatedAt.IsZero()`), while the rest of the response is filled
+    // with defaults. If a future server always stamps updated_at, this branch
+    // simply stops firing and we fall through to (3)/(4) — the assumption
+    // degrades to "the server wins", never to an erasure.
+    //
+    // The emptiness check on the other two fields keeps that safe in the other
+    // direction: per-group rows and the allowlist come from separate tables that
+    // CAN hold human-entered state while the policy row is absent, and a report
+    // replaces them wholesale, so a zero timestamp alone is not enough.
+    if (serverUpdatedAt === 0) {
+      if (serverGroups.length === 0 && serverAllowlist.length === 0) {
+        return reportLocalPolicy('server has no policy row yet — seeding');
+      }
+      // (2) Anomalous: no policy row, but group state exists. Reporting would
+      // replace that state on the strength of a synthesized snapshot, and
+      // adopting would import synthesized defaults as if they were policy.
+      // Neither is safe, so do nothing and let a real UI save break the tie.
+      logger?.info?.(`[policy-sync] org=${orgId}: server reports updated_at=0 but ${serverGroups.length} group(s) / ${serverAllowlist.length} allowlist entr(ies) — neither reporting nor adopting (ambiguous server state)`);
+      return { changed: false, reason: 'server updated_at=0 with non-empty group state — no action' };
+    }
+
+    // (3) The server copy moved since the timestamp we recorded → the server is
+    // authoritative (someone edited the policy in the workspace UI, possibly
+    // while we were offline). Adopt it; never report over it.
+    if (serverUpdatedAt !== marker?.serverUpdatedAt) {
+      const adopted = accessFromServerPolicy(snapshot);
+      const adoptedFp = accessFingerprint(adopted);
+      const differs = adoptedFp !== localFp;
+      if (differs) {
+        org.access = adopted;
+        // Same epilogue as onConfigEvent: when the SDK handed us a different
+        // object than our internal record, repoint its access too so the live
+        // gate applies the adopted policy without a restart.
+        if (org !== orgConfig) orgConfig.access = adopted;
+        persist();
+        logger?.info?.(`[policy-sync] adopted server policy org=${orgId} (updated_at=${serverUpdatedAt}): ${safeJson(adopted)}`);
+      }
+      // The marker advances even when the content already matched, so the next
+      // pass reads "server unchanged" and a later local change can still be
+      // reported. Skipping persist() when nothing differs keeps the steady state
+      // off the disk.
+      await writePolicyMarker(orgId, { fp: adoptedFp, serverUpdatedAt });
+      return { changed: differs, direction: 'adopted-server', serverUpdatedAt };
+    }
+
+    // (4) The server has not moved since we last looked, but we have → report.
+    if (localFp !== marker?.fp) {
+      return reportLocalPolicy('local access changed since the last report');
+    }
+
+    // (5) In sync. No HTTP write, no disk write.
+    return { changed: false, reason: 'in sync', serverUpdatedAt };
+  };
+
+  // Debounced entry point for the CHANGE-driven paths (config events + the SDK's
+  // local access tools). Trailing edge per org: a burst of writes reconciles once,
+  // after the last one, so the reconcile always sees the final state. The timer is
+  // unref'd — a pending reconcile must not hold the process open at shutdown; the
+  // change is still picked up by the next periodic pass (local fingerprint vs
+  // marker), so nothing is lost, it is only reported later.
+  const policyDebounceTimers = new Map();
+  const schedulePolicyReconcile = (orgConfig) => {
+    const orgId = orgConfig?.org_id;
+    if (!orgId) return;
+    const pending = policyDebounceTimers.get(orgId);
+    if (pending) clearTimeout(pending);
+    const timer = setTimeout(() => {
+      policyDebounceTimers.delete(orgId);
+      Promise.resolve()
+        .then(() => reconcilePolicyWithServer(orgConfig))
+        .then((res) => logger?.info?.(`[policy-sync] debounced reconcile org=${orgId} result=${safeJson(res)}`))
+        .catch((e) => logger?.warn?.(`[policy-sync] debounced reconcile org=${orgId} FAILED: ${e.message}`));
+    }, policyDebounceMs);
+    timer.unref?.();
+    policyDebounceTimers.set(orgId, timer);
+  };
+
   const callbacks = {
     loadConfig,
     loadSession,
@@ -684,6 +989,15 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
       logger?.info?.(`[onConfigEvent] applied: ${result.summary} (by ${data.changed_by || '?'}) org=${orgConfig.org_id}`);
       logger?.info?.(`[onConfigEvent] org.access AFTER=${safeJson(org.access)}${sameRef ? '' : ' | sdk orgConfig.access synced to internal record → live gate updated immediately'}`);
       persist();
+      // Reconcile with the server AFTER the burst settles. Reporting straight
+      // from here would push a half-applied policy: the UI's "save" is several
+      // sequential writes (group scope, then allowlist entries), so the first
+      // event's report would carry a still-empty allowlist and race the second
+      // write — re-creating the erasure this reconcile exists to prevent. The
+      // pass is still worth running on a server-originated change: it keeps the
+      // marker aligned with the server timestamp and heals any part of the event
+      // the local mapping did not apply.
+      schedulePolicyReconcile(orgConfig);
     },
     onConnectionEvent: (orgConfig) => logger?.info?.(`connection event for org=${orgConfig.org_id} (Cat.B no-op)`),
     onChannelEvent: (orgConfig) => logger?.info?.(`channel event for org=${orgConfig.org_id} (Cat.B no-op)`),
@@ -722,6 +1036,9 @@ export function buildRuntime({ config, file, storage, logger, httpClient, ownerS
     // owner-sync task (owner-sync.js) can reconcile every active org on an
     // interval; the owner_changed config event routes through the same path.
     syncOwnerFromCore,
+    // Two-way policy reconcile against cws-core (pull-first). Exposed for the
+    // periodic task in owner-sync.js, which rides the same 5-minute cadence.
+    reconcilePolicyWithServer,
     // Current cached identity_id (may be '' until resolveIdentityId() runs). The
     // guided-autonomy flow's leadAgentId (tm issueCreate lead agent = self) is
     // exactly this value.
