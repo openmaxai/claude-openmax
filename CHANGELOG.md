@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-27
+
+Feature release: the agent's access policy is now reconciled with the server in
+both directions, so the workspace settings page and the agent finally agree on
+who may reach the agent.
+
+### Added
+
+- **Two-way access-policy reconcile** (`src/policy-sync.js`,
+  `runtime.reconcilePolicyWithServer`). The workspace settings page renders the
+  policy cws-core has on record, while the agent enforces the policy in its local
+  config, and nothing kept the two in step: an agent that never reported looked
+  wide open on the page (`group scope: open` — cws-core's synthesized default for
+  "no policy row on file") while in fact refusing every group message, and a
+  policy edited in the UI while the agent was offline never reached local config.
+  The reconcile runs on three triggers — the existing 5-minute owner-sync tick,
+  a debounced pass after each `agent.config.*` event, and a debounced pass after
+  a local access change made through the SDK's `dm_policy` / `dm_allow` /
+  `dm_revoke` tools.
+- It is deliberately **pull-first**: it reads `GET /agents/<self>/policy` and
+  uploads to `PUT /agents/<self>/reported-policy` only when that read proved
+  there is nothing to lose. A server copy that moved since the last pass wins and
+  is adopted into local config (with the SDK's live access reference repointed,
+  so the gate applies it without a restart); a local change is uploaded only when
+  the server has not moved; a failed or unreadable policy read uploads nothing at
+  all. A blind periodic push — what the sibling adapters do — is how an agent's
+  stale config overwrites a policy a human just set from the UI.
+- The mapping in `src/policy-sync.js` transcribes the SDK's own `decideInbound`
+  fallbacks value for value (`dmPolicy || 'owner'`, `groupPolicy || 'allowlist'`,
+  `mode || 'mention'`, and "empty/absent/`['*']` allow-from all mean any member"),
+  with a `group_scope` that is always sent explicitly because cws-core substitutes
+  `open` for a missing one. Two cases the server cannot express are handled
+  head-on: a `silent` group is dropped from `groups[]` **and**
+  `group_allowlist` (its mode enum is smart|mention and one bad entry rejects the
+  whole upload), and the owner's unconditional DM exemption is *not* forged into
+  `dm_allowlist` (that entry would outlive an owner transfer). A `4xx` naming one
+  of the reported conversations — the server saying the agent is no longer in that
+  group — drops that group and retries once instead of being mistaken for a
+  missing endpoint and silencing all reporting.
+
+### Changed
+
+- `@openmaxai/openmax-agent-sdk` 1.0.1 → 1.0.3 (log-redaction fixes only; no
+  behavior change for this adapter).
+
 ## [1.1.2] - 2026-07-22
 
 Bug-fix release: agent self-registration and invite-acceptance now work on

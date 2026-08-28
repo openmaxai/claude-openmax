@@ -13,6 +13,11 @@
  * ever a signal to re-sync, never trusted data.
  *
  * Mirrors the openmax component's `owner-config-sync` periodic task (5 min).
+ *
+ * The same tick also drives the periodic half of the ACCESS-POLICY reconcile
+ * (runtime.reconcilePolicyWithServer — see config.js), which is pull-first and
+ * therefore safe to run on a schedule: it reads the server copy before deciding
+ * whether anything should be uploaded.
  */
 
 import { safeJson } from './redact.js';
@@ -42,6 +47,16 @@ export function startOwnerSync({ runtime, logger, intervalMs = DEFAULT_OWNER_SYN
         .then(() => runtime.syncOwnerFromCore(orgConfig))
         .then((res) => logger?.info?.(`[owner-sync] org=${orgConfig.org_id} result=${safeJson(res)}`))
         .catch((e) => logger?.warn?.(`[owner-sync] org=${orgConfig.org_id} FAILED: ${e.message}`));
+
+      // The access-policy reconcile rides the same cadence: it is the periodic
+      // half of policy sync (the change-driven half is debounced off config
+      // events and the SDK's local access tools). Called OPTIONALLY — a runtime
+      // without it (older adapter build, or a test double) must not break the
+      // owner sync sharing this tick.
+      Promise.resolve()
+        .then(() => runtime.reconcilePolicyWithServer?.(orgConfig))
+        .then((res) => { if (res) logger?.info?.(`[policy-sync] org=${orgConfig.org_id} result=${safeJson(res)}`); })
+        .catch((e) => logger?.warn?.(`[policy-sync] org=${orgConfig.org_id} FAILED: ${e.message}`));
     }
   };
 

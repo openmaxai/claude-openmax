@@ -4,8 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { decideInbound } from '@openmaxai/openmax-agent-sdk';
+
 import { normalizeConfig, buildRuntime } from '../src/config.js';
 import { startOwnerSync } from '../src/owner-sync.js';
+import { accessFromServerPolicy, buildReportedPolicy } from '../src/policy-sync.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function tmpFile() {
@@ -16,6 +19,22 @@ function readJSON(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 const storageStub = { get: async () => null, set: async () => {} };
+
+// In-memory StorageProvider. The policy reconcile writes its marker
+// ({fp, serverUpdatedAt}) through this seam and READS IT BACK on the next pass to
+// tell "the server changed" from "we changed" — with a get()->null stub every
+// pass would look like the very first one, so the write-vs-adopt branches could
+// not be tested at all. One instance per runtime: the org id is the same in
+// every test here, so a shared map would leak markers between them.
+function memStorage() {
+  const files = new Map();
+  return {
+    files,
+    get: async (key) => (files.has(key) ? files.get(key) : null),
+    set: async (key, value) => { files.set(key, String(value)); },
+  };
+}
+const POLICY_MARKER_KEY = path.join('policy', 'org-uuid-1.json');
 const silentLogger = { info() {}, warn() {}, error() {}, debug() {} };
 
 // A config with a KNOWN self.member_id so syncOwnerFromCore can identify our own
@@ -260,8 +279,12 @@ test('onConfigEvent(non-owner event): still mirrors access fields', async () => 
 function accessRuntime() {
   const file = tmpFile();
   const config = normalizeConfig(shapeWithSelf(), { logger: silentLogger });
-  const rt = buildRuntime({ config, file, storage: storageStub, logger: silentLogger, httpClient: {} });
-  return { file, rt, org: rt.orgConfigs[0] };
+  // Memory storage + a 1ms debounce so the policy reconcile the onConfigEvent
+  // tail schedules actually runs inside the test — with the bare `httpClient: {}`
+  // stub these cases double as the regression guard for the capability probe.
+  const storage = memStorage();
+  const rt = buildRuntime({ config, file, storage, logger: silentLogger, httpClient: {}, policyDebounceMs: 1 });
+  return { file, rt, org: rt.orgConfigs[0], storage };
 }
 
 test('onConfigEvent(group_scope_changed): sets groupPolicy (the live bug repro)', async () => {
@@ -421,4 +444,374 @@ test('startOwnerSync: stop() clears the interval (no further ticks)', async () =
   handle.stop();
   await new Promise((r) => setTimeout(r, 30)); // longer than the 5ms interval
   assert.equal(ticks, afterFirst); // no ticks after stop()
+});
+
+// ── policy reconcile: local access block ⇄ server reported-policy ─────────────
+// The reconcile is pull-first: it reads GET /agents/<self>/policy and only PUTs
+// /reported-policy when that read proved there is nothing to overwrite. Every
+// case below therefore asserts the NUMBER of PUTs, not just their content — an
+// upload that should not have happened is the failure mode that erases a policy a
+// human set in the workspace UI.
+function policyRuntime(opts = {}) {
+  const file = tmpFile();
+  const raw = shapeWithSelf();
+  if (opts.access) raw.orgs['org-uuid-1'].access = opts.access;
+  if (opts.selfMemberId !== undefined) raw.orgs['org-uuid-1'].self.member_id = opts.selfMemberId;
+  const config = normalizeConfig(raw, { logger: silentLogger });
+  const storage = memStorage();
+  const calls = [];
+  const puts = [];
+  const httpClient = {
+    apiPath: (p) => `/api/v1${p}`,
+    getForOrg: async (_orgId, p) => {
+      calls.push(p);
+      if (p === '/api/v1/agents/SELF-1/policy') {
+        if (opts.getError) throw opts.getError;
+        if (opts.getHangs) return new Promise((resolve) => { setTimeout(() => resolve({ updated_at: 9 }), 200); });
+        return typeof opts.policy === 'function' ? opts.policy() : (opts.policy || {});
+      }
+      return {};
+    },
+    putForOrg: async (_orgId, p, body) => {
+      puts.push({ path: p, body });
+      const err = opts.putError?.(puts.length, body);
+      if (err) throw err;
+      return {};
+    },
+  };
+  const rt = buildRuntime({
+    config, file, storage, logger: silentLogger, httpClient,
+    policySyncTimeoutMs: opts.policySyncTimeoutMs ?? 50,
+    policyDebounceMs: opts.policyDebounceMs ?? 1,
+  });
+  return { file, rt, org: rt.orgConfigs[0], storage, calls, puts };
+}
+const readMarker = async (storage) => JSON.parse(await storage.get(POLICY_MARKER_KEY));
+
+test('reconcilePolicyWithServer: seeds the server when the snapshot has no policy row (updated_at absent)', async () => {
+  const { rt, org, puts, storage } = policyRuntime({
+    access: {
+      dmPolicy: 'allowlist', dmAllowFrom: ['m1'], groupPolicy: 'allowlist',
+      groups: { 'conv-A': { mode: 'smart', allowFrom: ['m7'] } },
+    },
+    // What cws-core synthesizes when no policy row exists: defaults everywhere,
+    // no updated_at. The "open" group scope here is NOT an owner's decision.
+    policy: { dm_policy: 'owner', dm_allowlist: [], group_scope: 'open', group_allowlist: [], groups: [] },
+  });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 1);
+  assert.equal(puts[0].path, '/api/v1/agents/SELF-1/reported-policy');
+  assert.deepEqual(puts[0].body, {
+    dm_policy: 'allowlist',
+    dm_allowlist: ['m1'],
+    group_scope: 'allowlist',
+    group_allowlist: ['conv-A'],
+    groups: [{ conversation_id: 'conv-A', mode: 'smart', allow_from: ['m7'] }],
+  });
+  assert.equal(res.direction, 'reported-local');
+  assert.equal(typeof (await readMarker(storage)).fp, 'string');
+});
+
+test('reconcilePolicyWithServer: updated_at absent but the snapshot HAS group state → reports nothing', async () => {
+  // Reachable server state: per-group rows live in their own table and can exist
+  // while the policy row does not. That group state is real human input, and a
+  // report replaces it wholesale, so a zero timestamp alone must not authorize an
+  // upload.
+  const { rt, org, puts } = policyRuntime({
+    access: { dmPolicy: 'open' },
+    policy: { dm_policy: 'owner', group_scope: 'open', group_allowlist: [], groups: [{ conversation_id: 'conv-Z', mode: 'mention', allow_from: ['*'] }] },
+  });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 0);
+  assert.match(res.reason, /updated_at=0/);
+});
+
+test('reconcilePolicyWithServer: a server copy newer than our marker is ADOPTED, never overwritten', async () => {
+  const { rt, org, file, puts, storage } = policyRuntime({
+    access: { dmPolicy: 'owner', dmAllowFrom: [], groupPolicy: 'allowlist', groups: {} },
+    policy: {
+      dm_policy: 'open', dm_allowlist: ['m5'], group_scope: 'allowlist',
+      group_allowlist: ['conv-B', 'conv-C'],
+      groups: [{ conversation_id: 'conv-B', mode: 'smart', allow_from: ['*'] }],
+      updated_at: 1700,
+    },
+  });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 0);                                  // the server wins — no upload
+  assert.equal(res.direction, 'adopted-server');
+  assert.equal(org.access.dmPolicy, 'open');                      // live gate sees it
+  assert.deepEqual(org.access.dmAllowFrom, ['m5']);
+  assert.equal(org.access.groupPolicy, 'allowlist');
+  assert.deepEqual(org.access.groups['conv-B'], { mode: 'smart', allowFrom: ['*'] });
+  // Allowlisted with no per-group row → local entry on the SDK's own defaults,
+  // otherwise the allowlist gate would reject a group the page shows as allowed.
+  assert.deepEqual(org.access.groups['conv-C'], { mode: 'mention', allowFrom: ['*'] });
+  assert.equal(readJSON(file).orgs['org-uuid-1'].access.dmPolicy, 'open'); // persisted
+  assert.equal((await readMarker(storage)).serverUpdatedAt, 1700);
+});
+
+test('reconcilePolicyWithServer: adopting also repoints the SDK\'s live orgConfig.access when it is a different object', async () => {
+  const { rt, puts } = policyRuntime({
+    policy: { dm_policy: 'open', dm_allowlist: [], group_scope: 'open', group_allowlist: [], groups: [], updated_at: 42 },
+  });
+  // The SDK hands us ITS orgConfig; in this adapter it is normally the same
+  // object as the internal record, but the code does not assume that.
+  const sdkView = { org_id: 'org-uuid-1', self: { member_id: 'SELF-1' }, access: { dmPolicy: 'owner' } };
+  const res = await rt.reconcilePolicyWithServer(sdkView);
+  assert.equal(res.direction, 'adopted-server');
+  assert.equal(puts.length, 0);
+  assert.equal(sdkView.access.dmPolicy, 'open');
+  assert.equal(rt.orgConfigs[0].access.dmPolicy, 'open');
+});
+
+test('reconcilePolicyWithServer: server unchanged since the marker + local changed → reports once', async () => {
+  const { rt, org, puts } = policyRuntime({
+    policy: { dm_policy: 'owner', dm_allowlist: [], group_scope: 'allowlist', group_allowlist: [], groups: [], updated_at: 1700 },
+  });
+  await rt.reconcilePolicyWithServer(org);      // first pass: adopt + record the marker
+  assert.equal(puts.length, 0);
+  org.access.dmPolicy = 'allowlist';            // a local change (SDK dm tools land here)
+  org.access.dmAllowFrom = ['m9'];
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 1);
+  assert.equal(res.direction, 'reported-local');
+  assert.equal(puts[0].body.dm_policy, 'allowlist');
+  assert.deepEqual(puts[0].body.dm_allowlist, ['m9']);
+  // ...and a third pass with nothing changed is a no-op (no upload, no re-adopt).
+  const res3 = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 1);
+  assert.equal(res3.changed, false);
+  assert.equal(res3.reason, 'in sync');
+});
+
+test('reconcilePolicyWithServer: a FAILED policy read never uploads (the anti-erasure invariant)', async () => {
+  const { rt, org, puts, storage } = policyRuntime({
+    access: { dmPolicy: 'open', groupPolicy: 'open' },
+    getError: Object.assign(new Error('bad gateway'), { status: 502 }),
+  });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 0);
+  assert.match(res.reason, /policy fetch failed/);
+  assert.equal(await storage.get(POLICY_MARKER_KEY), null); // no marker either
+});
+
+test('reconcilePolicyWithServer: a policy read that TIMES OUT never uploads', async () => {
+  const { rt, org, puts } = policyRuntime({
+    access: { dmPolicy: 'open' }, getHangs: true, policySyncTimeoutMs: 20,
+  });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 0);
+  assert.match(res.reason, /timed out/);
+});
+
+test('reconcilePolicyWithServer: a 404 on the policy read never uploads (endpoint missing on older deployments)', async () => {
+  const { rt, org, puts } = policyRuntime({
+    access: { dmPolicy: 'open' },
+    getError: Object.assign(new Error('not found'), { status: 404 }),
+  });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 0);
+  assert.match(res.reason, /policy fetch failed/);
+});
+
+test('reconcilePolicyWithServer: a policy read with no object body never uploads', async () => {
+  const { rt, org, puts } = policyRuntime({ access: { dmPolicy: 'open' }, policy: () => null });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 0);
+  assert.match(res.reason, /no object body/);
+});
+
+test('reconcilePolicyWithServer: short-circuits with no HTTP at all when self.member_id is unknown', async () => {
+  const { rt, org, calls, puts } = policyRuntime({ selfMemberId: '' });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(calls.length, 0);
+  assert.equal(puts.length, 0);
+  assert.match(res.reason, /member_id not available/);
+});
+
+test('reconcilePolicyWithServer: a 4xx naming one of our groups drops THAT group and retries once (local config untouched)', async () => {
+  // cws-comm answers 404 both when the endpoint is absent and when a reported
+  // group is no longer ours (verifyAgentGroupMember). Collapsing the two into
+  // "endpoint missing" — as the zylos-openmax reference does — silences all
+  // policy reporting for the rest of the session.
+  const { rt, org, puts, file } = policyRuntime({
+    access: {
+      dmPolicy: 'owner', groupPolicy: 'allowlist',
+      groups: { 'conv-GONE': { mode: 'smart', allowFrom: ['*'] }, 'conv-OK': { mode: 'mention', allowFrom: ['*'] } },
+    },
+    policy: { dm_policy: 'owner', group_scope: 'allowlist', group_allowlist: [], groups: [] },
+    putError: (n) => (n === 1
+      ? Object.assign(new Error('group conv-GONE: not found'), { status: 404, body: { error: { detail: 'group conv-GONE: not found' } } })
+      : null),
+  });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 2);                                    // rejected, then retried
+  assert.deepEqual(puts[1].body.group_allowlist, ['conv-OK']);
+  assert.deepEqual(puts[1].body.groups.map((g) => g.conversation_id), ['conv-OK']);
+  assert.equal(res.direction, 'reported-local');
+  // The rejected group stays in local config: a membership blip must not delete
+  // an owner's setting, and re-adding the agent restores the report by itself.
+  assert.ok(org.access.groups['conv-GONE']);
+  // And a report-only pass never rewrites config.json — it holds credentials, so
+  // the periodic steady state must stay off the disk entirely.
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('reconcilePolicyWithServer: a 404 naming NONE of our groups is treated as a missing endpoint (no retry)', async () => {
+  const { rt, org, puts } = policyRuntime({
+    access: { dmPolicy: 'owner', groupPolicy: 'allowlist', groups: { 'conv-OK': { mode: 'mention', allowFrom: ['*'] } } },
+    policy: { dm_policy: 'owner', group_scope: 'allowlist', group_allowlist: [], groups: [] },
+    putError: () => Object.assign(new Error('404 page not found'), { status: 404 }),
+  });
+  const res = await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 1);
+  assert.match(res.reason, /endpoint unavailable/);
+});
+
+test('reconcilePolicyWithServer: a silent group is excluded from BOTH groups[] and group_allowlist', async () => {
+  // The server's mode enum is smart|mention and it validates the whole report
+  // before writing: one silent entry would 400 the ENTIRE upload.
+  const { rt, org, puts } = policyRuntime({
+    access: {
+      dmPolicy: 'owner', groupPolicy: 'allowlist',
+      groups: { c1: { mode: 'silent', allowFrom: ['*'] }, c2: { mode: 'mention', allowFrom: ['*'] } },
+    },
+    policy: {},
+  });
+  await rt.reconcilePolicyWithServer(org);
+  assert.equal(puts.length, 1);
+  assert.deepEqual(puts[0].body.group_allowlist, ['c2']);
+  assert.deepEqual(puts[0].body.groups.map((g) => g.conversation_id), ['c2']);
+});
+
+test('reconcilePolicyWithServer: an empty local allowFrom is reported as the explicit wildcard', async () => {
+  // Locally [] means "any member may trigger me"; on the wire an empty list reads
+  // as "nobody". `[] || ['*']` does not fix this — [] is truthy in JS.
+  const { rt, org, puts } = policyRuntime({
+    access: { groupPolicy: 'allowlist', groups: { c3: { mode: 'mention', allowFrom: [] } } },
+    policy: {},
+  });
+  await rt.reconcilePolicyWithServer(org);
+  assert.deepEqual(puts[0].body.groups, [{ conversation_id: 'c3', mode: 'mention', allow_from: ['*'] }]);
+});
+
+test('onConfigEvent with a bare httpClient: the scheduled reconcile is skipped, not thrown', async () => {
+  // accessRuntime uses `httpClient: {}` — the capability probe is what keeps the
+  // twelve onConfigEvent cases above from turning into twelve TypeErrors.
+  const { rt, org, storage } = accessRuntime();
+  await rt.callbacks.onConfigEvent(org, { event: 'agent.config.group_scope_changed', data: { scope: 'open' } });
+  await new Promise((r) => setTimeout(r, 30)); // let the debounced reconcile run
+  assert.equal(org.access.groupPolicy, 'open');             // the event still applied
+  assert.equal(await storage.get(POLICY_MARKER_KEY), null); // nothing reported, no marker
+});
+
+test('reconcilePolicyWithServer: a bare httpClient reports nothing and never throws', async () => {
+  const file = tmpFile();
+  const config = normalizeConfig(shapeWithSelf(), { logger: silentLogger });
+  const storage = memStorage();
+  const rt = buildRuntime({ config, file, storage, logger: silentLogger, httpClient: {} });
+  const res = await rt.reconcilePolicyWithServer(rt.orgConfigs[0]);
+  assert.match(res.reason, /getForOrg\/putForOrg\/apiPath/);
+  assert.equal(await storage.get(POLICY_MARKER_KEY), null);
+});
+
+// ── the mapper invariant: a round trip must not change a single verdict ────────
+// buildReportedPolicy + accessFromServerPolicy are only correct if the SDK's real
+// decideInbound cannot tell a local access block apart from the same block sent to
+// the server and read back. Any fallback that drifts from access-policy.js (say
+// `|| 'open'` where the SDK says `|| 'allowlist'`) flips at least one verdict in
+// this matrix.
+//
+// `mode: 'silent'` is deliberately absent from the matrix: it is the one lossy
+// case by design (the server enum cannot express it, so the group is dropped from
+// the report) and it has its own test above.
+test('accessFromServerPolicy(buildReportedPolicy(a)): decideInbound returns the same verdict for every access shape', async () => {
+  const accessMatrix = [
+    {},                                                       // nothing configured at all
+    { dmPolicy: 'open' },
+    { dmPolicy: 'owner' },
+    { dmPolicy: 'allowlist', dmAllowFrom: [] },
+    { dmPolicy: 'allowlist', dmAllowFrom: ['M-ALLOWED'] },
+    { groupPolicy: 'open' },
+    { groupPolicy: 'disabled' },
+    { groupPolicy: 'allowlist' },
+    { groupPolicy: 'allowlist', groups: {} },
+    { groupPolicy: 'allowlist', groups: { 'CONV-G': { mode: 'mention', allowFrom: ['*'] } } },
+    { groupPolicy: 'allowlist', groups: { 'CONV-G': { mode: 'smart', allowFrom: [] } } },
+    { groupPolicy: 'allowlist', groups: { 'CONV-G': { mode: 'smart', allowFrom: ['M-ALLOWED'] } } },
+    { groupPolicy: 'allowlist', groups: { 'CONV-G': { mode: 'mention' } } },      // no allowFrom key
+    { groupPolicy: 'allowlist', groups: { 'CONV-G': {} } },                       // neither key set
+    { groupPolicy: 'open', groups: { 'CONV-G': { allowFrom: ['M-ALLOWED'] } } },  // no mode key
+    { groupPolicy: 'open', groups: { 'CONV-G': { mode: 'mention', allowFrom: ['M-ALLOWED'] } } },
+    { groupPolicy: 'open', groups: { 'CONV-OTHER': { mode: 'smart', allowFrom: ['*'] } } },
+    { dmPolicy: 'allowlist', dmAllowFrom: ['M-ALLOWED'], groupPolicy: 'allowlist', groups: { 'CONV-G': { mode: 'smart', allowFrom: ['*'] } } },
+  ];
+
+  const probes = [];
+  for (const sender of ['M-OWNER', 'M-ALLOWED', 'M-STRANGER']) {
+    probes.push({ label: `dm/${sender}`, conv: { type: 'dm' }, msg: { sender_id: sender, conversation_id: 'CONV-DM', content: 'hello' } });
+    for (const convId of ['CONV-G', 'CONV-OTHER']) {
+      probes.push({
+        label: `group ${convId} @me /${sender}`,
+        conv: { type: 'group' },
+        msg: { sender_id: sender, conversation_id: convId, content: '@Claude ping', mentions: ['SELF-1'] },
+      });
+      probes.push({
+        label: `group ${convId} plain /${sender}`,
+        conv: { type: 'group' },
+        msg: { sender_id: sender, conversation_id: convId, content: 'ping' },
+      });
+    }
+  }
+
+  const orgBase = {
+    org_id: 'ORG-1',
+    self: { member_id: 'SELF-1', name: 'Claude', display_name: 'Claude' },
+    owner: { member_id: 'M-OWNER', name: 'Ownie' },
+  };
+  const verdicts = new Set();
+  for (const access of accessMatrix) {
+    // `updated_at: 1` marks the snapshot as a real server row, exactly as the
+    // reconcile's adopt path sees it.
+    const roundTripped = accessFromServerPolicy({ ...buildReportedPolicy(access), updated_at: 1 });
+    for (const { label, msg, conv } of probes) {
+      const before = await decideInbound(msg, conv, { ...orgBase, access });
+      const after = await decideInbound(msg, conv, { ...orgBase, access: roundTripped });
+      const where = `${label} | access=${JSON.stringify(access)}`;
+      assert.equal(after.handle, before.handle, `handle changed: ${where}`);
+      assert.equal(after.reason, before.reason, `reason changed: ${where}`);
+      verdicts.add(`${before.handle}:${before.reason}`);
+    }
+  }
+  // Coverage guard: without it a matrix that (say) never reached the group branch
+  // would pass by never disagreeing about anything.
+  assert.ok(verdicts.size >= 10, `matrix exercised only ${verdicts.size} distinct verdicts: ${[...verdicts].join(' / ')}`);
+  assert.ok([...verdicts].some((v) => v.startsWith('true:')), 'no accepted message in the matrix');
+  assert.ok([...verdicts].some((v) => v.startsWith('false:')), 'no rejected message in the matrix');
+});
+
+test('accessFromServerPolicy({}): a response missing fields falls back to the SDK\'s defaults, not the server\'s', async () => {
+  // Only reachable from a server response that omits the fields (current cws-core
+  // always sends them), so the round-trip matrix cannot see this fallback —
+  // guessing the server's "open" here would widen group access on a partial
+  // response. Pinned directly.
+  const access = accessFromServerPolicy({});
+  assert.equal(access.groupPolicy, 'allowlist');
+  assert.equal(access.dmPolicy, 'owner');
+  assert.deepEqual(access.dmAllowFrom, []);
+  assert.deepEqual(access.groups, {});
+  assert.deepEqual(accessFromServerPolicy(undefined), access);
+});
+
+test('buildReportedPolicy({}): the empty-access defaults are the SDK\'s, not the server\'s', async () => {
+  // Hard-pinned because these two are where a wrong default is invisible: the
+  // server substitutes "open" for a missing group_scope, and its no-row snapshot
+  // reads "open" too, so `|| 'open'` here would look plausible and silently
+  // report an unconfigured agent as reachable in every group.
+  const payload = buildReportedPolicy({});
+  assert.equal(payload.group_scope, 'allowlist');
+  assert.equal(payload.dm_policy, 'owner');
+  assert.deepEqual(payload.dm_allowlist, []);
+  assert.deepEqual(payload.group_allowlist, []);
+  assert.deepEqual(payload.groups, []);
 });
