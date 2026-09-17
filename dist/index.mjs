@@ -14293,13 +14293,13 @@ function _array(Class2, element, params) {
 }
 // @__NO_SIDE_EFFECTS__
 function _custom(Class2, fn, _params) {
-  const norm = normalizeParams(_params);
-  norm.abort ?? (norm.abort = true);
+  const norm2 = normalizeParams(_params);
+  norm2.abort ?? (norm2.abort = true);
   const schema = new Class2({
     type: "custom",
     check: "custom",
     fn,
-    ...norm
+    ...norm2
   });
   return schema;
 }
@@ -19331,6 +19331,71 @@ async function decideInbound(msg, conv, orgConfig, deps = {}) {
   };
 }
 
+// node_modules/@openmaxai/openmax-agent-sdk/src/protocol/mention.js
+var MAX_NAMES_PER_CONV = 200;
+var norm = (s) => String(s ?? "").trim().toLowerCase();
+function createMentionRegistry({
+  storage = memoryStorage(),
+  key = "mention-registry.json",
+  maxNamesPerConv = MAX_NAMES_PER_CONV,
+  log = () => {
+  }
+} = {}) {
+  let cache = null;
+  async function ensureLoaded() {
+    if (cache) return cache;
+    try {
+      const raw = await storage.get(key);
+      cache = raw ? JSON.parse(raw) : {};
+    } catch {
+      cache = {};
+    }
+    return cache;
+  }
+  async function persist(reg) {
+    try {
+      await storage.set(key, JSON.stringify(reg));
+    } catch (err) {
+      log(`mention-registry persist failed: ${err?.message || err}`);
+    }
+  }
+  async function recordParticipants(conversationId, names) {
+    if (!conversationId) return;
+    const list = (Array.isArray(names) ? names : [names]).map((n) => String(n ?? "").trim()).filter(Boolean);
+    if (!list.length) return;
+    const reg = await ensureLoaded();
+    const conv = reg[conversationId] || (reg[conversationId] = {});
+    let changed = false;
+    for (const name of list) {
+      const nkey = norm(name);
+      if (conv[nkey] !== name) {
+        conv[nkey] = name;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    const keys = Object.keys(conv);
+    if (keys.length > maxNamesPerConv) {
+      for (const k of keys.slice(0, keys.length - maxNamesPerConv)) delete conv[k];
+    }
+    await persist(reg);
+  }
+  async function resolveMentions(text, conversationId) {
+    if (!text || !conversationId || !String(text).includes("@")) return text;
+    const reg = await ensureLoaded();
+    const conv = reg[conversationId];
+    if (!conv) return text;
+    const namesList = Object.values(conv).sort((a, b) => b.length - a.length);
+    let out = String(text);
+    for (const name of namesList) {
+      const esc2 = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      out = out.replace(new RegExp("@" + esc2, "gi"), "@" + name);
+    }
+    return out;
+  }
+  return { recordParticipants, resolveMentions };
+}
+
 // node_modules/@openmaxai/openmax-agent-sdk/src/services/tm.js
 function pageParams(p) {
   return {
@@ -20027,9 +20092,9 @@ var CommService = class {
       if (byKey) return byKey;
       const byId = config2.getOrgByOrgId ? config2.getOrgByOrgId(key) : void 0;
       if (byId) return byId;
-      const norm = (s) => s?.toLowerCase().replace(/[-_ ]/g, "");
-      const keyNorm = norm(key);
-      const byName = enabled.find((o) => norm(o.org_name) === keyNorm);
+      const norm2 = (s) => s?.toLowerCase().replace(/[-_ ]/g, "");
+      const keyNorm = norm2(key);
+      const byName = enabled.find((o) => norm2(o.org_name) === keyNorm);
       if (byName) return byName;
       const names2 = enabled.map((o) => o.org_name || o.org_id).join(", ");
       throw new Error(`org not found in config: "${key}" (known: ${names2 || "none"})`);
@@ -25754,8 +25819,36 @@ function okResult(value) {
 function errResult(message) {
   return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
 }
-function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
+function createMcpTools({ services, bridge, defaultOrgId, mentions, logger } = {}) {
   if (!services) throw new Error("createMcpTools requires services");
+  const ROSTER_TTL_MS = 6e4;
+  const rosterAt = /* @__PURE__ */ new Map();
+  const conversationIdOf = (endpoint) => String(endpoint ?? "").split("|")[0].trim();
+  const hydrateRoster = async (conversationId) => {
+    if (!mentions || !conversationId) return;
+    if (Date.now() - (rosterAt.get(conversationId) || 0) < ROSTER_TTL_MS) return;
+    rosterAt.set(conversationId, Date.now());
+    try {
+      const roster = await services.comm.conversationMembers({ conversationId });
+      await mentions.recordMembers(conversationId, roster.map((m) => ({
+        displayName: m?.display_name || m?.name,
+        memberId: m?.member_id || m?.id
+      })));
+      if (!roster.length) logger?.warn?.(`roster hydrate resolved 0 members conv=${conversationId}`);
+    } catch (e) {
+      logger?.debug?.(`roster hydrate failed conv=${conversationId}: ${e.message}`);
+    }
+  };
+  const resolveOutbound = async (content, conversationId) => {
+    if (!mentions || typeof content !== "string" || !conversationId) return { text: content, mentions: [] };
+    try {
+      if (content.includes("@")) await hydrateRoster(conversationId);
+      return await mentions.resolveOutbound(content, conversationId);
+    } catch (e) {
+      logger?.debug?.(`mention resolution failed (sending verbatim): ${e.message}`);
+      return { text: content, mentions: [] };
+    }
+  };
   const defs = [];
   for (const key of SERVICE_KEYS) {
     if (!services[key]) continue;
@@ -25792,9 +25885,13 @@ function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
         const { endpoint, content, replyTo, orgId } = args;
         if (!endpoint || !content) return errResult("comm_send requires endpoint and content");
         if (!bridge) return errResult("comm_send unavailable: no bridge wired");
-        const res = await bridge.send(endpoint, content, {
+        const resolved = await resolveOutbound(content, conversationIdOf(endpoint));
+        const res = await bridge.send(endpoint, resolved.text, {
           orgId: orgId || defaultOrgId,
-          replyTo
+          replyTo,
+          // Only when there is something to carry: nothing to mention must leave
+          // the call shape exactly as it was.
+          ...resolved.mentions.length ? { mentions: resolved.mentions } : {}
         });
         return okResult(res);
       }
@@ -25806,6 +25903,14 @@ function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
         if (method === "list") return okResult({ service: name, methods: listMethods(name, service) });
         if (typeof service[method] !== "function" || method.startsWith("_")) {
           return errResult(`${name}: unknown method "${method}". Call {"method":"list"} to see available verbs and their fields.`);
+        }
+        if (name === "comm" && method === "send" && typeof args.params?.content === "string") {
+          const resolved = await resolveOutbound(args.params.content, args.params.conversationId);
+          args.params = {
+            ...args.params,
+            content: resolved.text,
+            ...resolved.mentions.length ? { mentions: resolved.mentions } : {}
+          };
         }
         const positional = POSITIONAL[name]?.[method];
         const result = positional ? await service[method](...buildPositionalArgs(positional, args.params)) : await service[method](args.params || {});
@@ -25971,11 +26076,13 @@ async function main() {
     logger,
     includePreview: process.env.CLAUDE_OPENMAX_CONTENT_FREE !== "1"
   });
+  const mentionRegistry = createMentionRegistry({ storage, log: (m) => logger?.debug?.(m) });
   const { defs, handler } = createMcpTools({
     services: runtime.services,
     bridge: null,
     // set after the bridge exists (comm_send needs it)
     defaultOrgId: runtime.resolveDefaultOrgId(),
+    mentions: mentionRegistry,
     logger
   });
   channel.registerTools(defs, handler);
@@ -26016,6 +26123,7 @@ async function main() {
       services: runtime.services,
       bridge,
       defaultOrgId: runtime.resolveDefaultOrgId(),
+      mentions: mentionRegistry,
       logger
     });
     channel.registerTools(withBridge.defs, withBridge.handler);

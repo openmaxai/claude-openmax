@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Outbound `@mention` resolution on the send path** (`src/mcp-tools.js`,
+  wired in `src/index.js`). An `@name` typed in the message text is now turned
+  into a structured, top-level `mentions` row before the message leaves, so the
+  recipient actually gets a notification and an unread-mention badge. Previously
+  the text rendered as a mention client-side while nobody was notified, which is
+  indistinguishable from a working mention by eye.
+  - `comm_send` and the `comm` dispatch tool's `send` verb both go through it —
+    treating only one of them would make the other a silent bypass.
+  - The per-conversation roster is read once per minute, and only for text that
+    actually contains an `@`, so an ordinary message costs no extra request.
+  - Resolution failure is never allowed to cost a send: on any error the original
+    text goes out verbatim with no mentions.
+  - When nothing resolves, no `mentions` key is added at all — an empty array
+    would change the call shape for every message that mentions no one.
+
+  **This depends on an unreleased SDK.** The resolution itself lives in
+  `@openmaxai/openmax-agent-sdk` (`resolveOutbound`), which the currently pinned
+  1.0.3 does not have. Against 1.0.3 this code degrades to sending verbatim —
+  correct, but inert. It becomes live once the SDK ships that method and the
+  dependency here is bumped.
+
+
 ## [1.2.0] - 2026-08-27
 
 Feature release: the agent's access policy is now reconciled with the server in
