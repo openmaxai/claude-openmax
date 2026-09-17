@@ -31,6 +31,8 @@ const DEFAULT_RETRY_AFTER_MS = 5000;
  * @param {string} [opts.runtimeSession]  fallback runtime session key
  * @param {number} [opts.previewMax]      contentPreview cap
  * @param {number} [opts.retryAfterMs]    default backoff hint on failure
+ * @param {{record:Function}} [opts.mentions]  outbound @mention state; we feed it the
+ *        sender's display_name + member id so a later `@name` can be resolved (see mentions.js)
  * @returns {{deliver: (inbound:object)=>Promise<{ok:boolean, runtimeSession?:string, failureClass?:string, retryAfterMs?:number}>}}
  */
 export function createInboundDelivery({
@@ -39,11 +41,28 @@ export function createInboundDelivery({
   runtimeSession,
   previewMax,
   retryAfterMs = DEFAULT_RETRY_AFTER_MS,
+  mentions,
 } = {}) {
   if (typeof wake !== 'function') throw new Error('createInboundDelivery requires a wake(wakeRequest) function');
 
   return {
     async deliver(inbound) {
+      // Passive participant learning, on top of the roster read done at the send
+      // site. Best-effort by construction: the SDK leaves senderDisplayName empty
+      // when it could not resolve a name, and a storage hiccup here must never
+      // cost us the message.
+      if (mentions) {
+        try {
+          await mentions.record({
+            conversationId: inbound?.conversationId,
+            displayName: inbound?.senderDisplayName,
+            memberId: inbound?.senderId,
+          });
+        } catch (e) {
+          logger?.debug?.(`inbound.deliver: mention record failed (ignored): ${e.message}`);
+        }
+      }
+
       let wakeReq;
       try {
         wakeReq = deriveWakeRequest(inbound, { previewMax });

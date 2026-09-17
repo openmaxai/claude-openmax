@@ -5651,6 +5651,71 @@ async function decideInbound(msg, conv, orgConfig, deps = {}) {
   };
 }
 
+// node_modules/@openmaxai/openmax-agent-sdk/src/protocol/mention.js
+var MAX_NAMES_PER_CONV = 200;
+var norm = (s) => String(s ?? "").trim().toLowerCase();
+function createMentionRegistry({
+  storage = memoryStorage(),
+  key = "mention-registry.json",
+  maxNamesPerConv = MAX_NAMES_PER_CONV,
+  log = () => {
+  }
+} = {}) {
+  let cache = null;
+  async function ensureLoaded() {
+    if (cache) return cache;
+    try {
+      const raw = await storage.get(key);
+      cache = raw ? JSON.parse(raw) : {};
+    } catch {
+      cache = {};
+    }
+    return cache;
+  }
+  async function persist(reg) {
+    try {
+      await storage.set(key, JSON.stringify(reg));
+    } catch (err) {
+      log(`mention-registry persist failed: ${err?.message || err}`);
+    }
+  }
+  async function recordParticipants(conversationId, names) {
+    if (!conversationId) return;
+    const list = (Array.isArray(names) ? names : [names]).map((n) => String(n ?? "").trim()).filter(Boolean);
+    if (!list.length) return;
+    const reg = await ensureLoaded();
+    const conv = reg[conversationId] || (reg[conversationId] = {});
+    let changed = false;
+    for (const name of list) {
+      const nkey = norm(name);
+      if (conv[nkey] !== name) {
+        conv[nkey] = name;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    const keys = Object.keys(conv);
+    if (keys.length > maxNamesPerConv) {
+      for (const k of keys.slice(0, keys.length - maxNamesPerConv)) delete conv[k];
+    }
+    await persist(reg);
+  }
+  async function resolveMentions(text, conversationId) {
+    if (!text || !conversationId || !String(text).includes("@")) return text;
+    const reg = await ensureLoaded();
+    const conv = reg[conversationId];
+    if (!conv) return text;
+    const namesList = Object.values(conv).sort((a, b) => b.length - a.length);
+    let out = String(text);
+    for (const name of namesList) {
+      const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      out = out.replace(new RegExp("@" + esc, "gi"), "@" + name);
+    }
+    return out;
+  }
+  return { recordParticipants, resolveMentions };
+}
+
 // node_modules/@openmaxai/openmax-agent-sdk/src/services/tm.js
 function pageParams(p) {
   return {
@@ -6347,9 +6412,9 @@ var CommService = class {
       if (byKey) return byKey;
       const byId = config.getOrgByOrgId ? config.getOrgByOrgId(key) : void 0;
       if (byId) return byId;
-      const norm = (s) => s?.toLowerCase().replace(/[-_ ]/g, "");
-      const keyNorm = norm(key);
-      const byName = enabled.find((o) => norm(o.org_name) === keyNorm);
+      const norm3 = (s) => s?.toLowerCase().replace(/[-_ ]/g, "");
+      const keyNorm = norm3(key);
+      const byName = enabled.find((o) => norm3(o.org_name) === keyNorm);
       if (byName) return byName;
       const names2 = enabled.map((o) => o.org_name || o.org_id).join(", ");
       throw new Error(`org not found in config: "${key}" (known: ${names2 || "none"})`);
@@ -8130,7 +8195,7 @@ var CwsAgentBridge = class {
 // src/version.js
 var version;
 if (true) {
-  version = "1.2.0";
+  version = "1.2.1";
 } else {
   version = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
@@ -8891,6 +8956,99 @@ function createFileStorage(opts = {}) {
   };
 }
 
+// src/mentions.js
+var DEFAULT_KEY = "mention-registry.json";
+var DEFAULT_MEMBER_KEY = "mention-members.json";
+var MAX_NAMES_PER_CONV2 = 200;
+var norm2 = (s) => String(s ?? "").trim().toLowerCase();
+function blankOut(text, needle) {
+  let idx = text.indexOf(needle);
+  if (idx === -1) return { found: false, text };
+  let out = text;
+  while (idx !== -1) {
+    out = out.slice(0, idx) + " ".repeat(needle.length) + out.slice(idx + needle.length);
+    idx = out.indexOf(needle, idx + needle.length);
+  }
+  return { found: true, text: out };
+}
+function createMentions({
+  storage,
+  key = DEFAULT_KEY,
+  memberKey = DEFAULT_MEMBER_KEY,
+  maxNamesPerConv = MAX_NAMES_PER_CONV2,
+  log = () => {
+  }
+} = {}) {
+  if (!storage) throw new Error("createMentions requires a storage provider");
+  const registry = createMentionRegistry({ storage, key, maxNamesPerConv, log });
+  let members = null;
+  async function ensureMembers() {
+    if (members) return members;
+    try {
+      const raw = await storage.get(memberKey);
+      members = raw ? JSON.parse(raw) : {};
+    } catch {
+      members = {};
+    }
+    return members;
+  }
+  async function persistMembers(m) {
+    try {
+      await storage.set(memberKey, JSON.stringify(m));
+    } catch (err) {
+      log(`mention members persist failed: ${err?.message || err}`);
+    }
+  }
+  async function record({ conversationId, displayName, memberId } = {}) {
+    const conv = String(conversationId ?? "").trim();
+    const name = String(displayName ?? "").trim();
+    if (!conv || !name) return;
+    await registry.recordParticipants(conv, name);
+    const id = String(memberId ?? "").trim();
+    if (!id) return;
+    const m = await ensureMembers();
+    const bucket = m[conv] || (m[conv] = {});
+    const nkey = norm2(name);
+    if (bucket[nkey] === id) return;
+    bucket[nkey] = id;
+    const keys = Object.keys(bucket);
+    if (keys.length > maxNamesPerConv) {
+      for (const k of keys.slice(0, keys.length - maxNamesPerConv)) delete bucket[k];
+    }
+    await persistMembers(m);
+  }
+  async function decorate(text, conversationId) {
+    const conv = String(conversationId ?? "").trim();
+    const original = typeof text === "string" ? text : "";
+    if (!original || !conv || !original.includes("@")) return { text: original, mentions: [] };
+    const canonical2 = await registry.resolveMentions(original, conv);
+    let known;
+    try {
+      const raw = await storage.get(key);
+      known = raw ? JSON.parse(raw)[conv] || {} : {};
+    } catch {
+      known = {};
+    }
+    const idsByName = (await ensureMembers())[conv] || {};
+    const names = Object.values(known).sort((a, b) => b.length - a.length);
+    const seen = /* @__PURE__ */ new Set();
+    const mentions = [];
+    let remaining = canonical2;
+    for (const name of names) {
+      const nkey = norm2(name);
+      if (seen.has(nkey)) continue;
+      const hit = blankOut(remaining, "@" + name);
+      if (!hit.found) continue;
+      seen.add(nkey);
+      remaining = hit.text;
+      const memberId = idsByName[nkey];
+      if (memberId) mentions.push({ type: "member", member_id: memberId });
+    }
+    return { text: canonical2, mentions };
+  }
+  return { record, decorate };
+}
+
 // src/providers.js
 import fs6 from "node:fs";
 import path6 from "node:path";
@@ -8996,11 +9154,23 @@ function createInboundDelivery({
   logger,
   runtimeSession,
   previewMax,
-  retryAfterMs = DEFAULT_RETRY_AFTER_MS
+  retryAfterMs = DEFAULT_RETRY_AFTER_MS,
+  mentions
 } = {}) {
   if (typeof wake !== "function") throw new Error("createInboundDelivery requires a wake(wakeRequest) function");
   return {
     async deliver(inbound) {
+      if (mentions) {
+        try {
+          await mentions.record({
+            conversationId: inbound?.conversationId,
+            displayName: inbound?.senderDisplayName,
+            memberId: inbound?.senderId
+          });
+        } catch (e) {
+          logger?.debug?.(`inbound.deliver: mention record failed (ignored): ${e.message}`);
+        }
+      }
       let wakeReq;
       try {
         wakeReq = deriveWakeRequest(inbound, { previewMax });
@@ -9125,8 +9295,10 @@ async function main() {
   const runtime = buildRuntime({ config, file, storage, logger });
   runtime.resolveIdentityId().catch(() => {
   });
+  const mentions = createMentions({ storage, log: (m) => logger.debug?.(m) });
   const inbound = createInboundDelivery({
     wake: (wakeReq) => httpWake(endpoint, token, wakeReq),
+    mentions,
     logger
   });
   const bridge = createBridge({

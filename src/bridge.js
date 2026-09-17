@@ -15,6 +15,7 @@
 
 import { loadAdapterConfig, buildRuntime, resolveLogFilePath } from './config.js';
 import { createFileStorage } from './storage.js';
+import { createMentions } from './mentions.js';
 import { createStderrLogger, createEmptyRuntimeState } from './providers.js';
 import { createInboundDelivery } from './inbound-delivery.js';
 import { createBridge } from './create-bridge.js';
@@ -62,8 +63,13 @@ async function main() {
   // effort and non-blocking: leadAgentId for the guided-autonomy flow == this.
   runtime.resolveIdentityId().catch(() => {});
 
+  // The split bridge is the only place this topology sees inbound senders, so it
+  // does the same participant learning as the in-process one.
+  const mentions = createMentions({ storage, log: (m) => logger.debug?.(m) });
+
   const inbound = createInboundDelivery({
     wake: (wakeReq) => httpWake(endpoint, token, wakeReq),
+    mentions,
     logger,
   });
 

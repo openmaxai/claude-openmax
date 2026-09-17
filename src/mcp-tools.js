@@ -36,7 +36,28 @@
  * the SDK wins and the divergence is called out in the method `note`.
  */
 
+import { newClientMsgId, parseEndpoint } from '@openmaxai/openmax-agent-sdk';
+
 const SERVICE_KEYS = ['tm', 'kb', 'as', 'comm', 'core', 'conn'];
+
+/** How long a hydrated conversation roster is reused before re-reading it. */
+const ROSTER_TTL_MS = 60_000;
+
+/**
+ * Shape a resolved message into the part of the send request that carries the
+ * mentions. `mentions` sits at the TOP LEVEL, next to `type`/`content`: cws-core
+ * indexes it from there, and an array nested under `content.body` is stored as
+ * ordinary body data and mentions nobody (see mentions.js).
+ *
+ * @param {{text:string, mentions:Array}} resolved
+ */
+function mentionSendBody({ text, mentions }) {
+  return {
+    type: 'AGENT_TEXT',
+    content: { content_type: 'markdown', body: { text }, attachments: [] },
+    mentions,
+  };
+}
 
 const SERVICE_DESCRIPTIONS = {
   tm: 'Task management: projects, issues, tasks, blueprints, comments, attempts, event-bindings (cws-work via cws-core). method = a camelCase verb like projectCreate, issueCreate, taskCreate.',
@@ -1164,10 +1185,12 @@ function errResult(message) {
  * @param {{tm,kb,as,comm,core,conn}} opts.services  SDK service client instances
  * @param {import('@openmaxai/openmax-agent-sdk').CwsAgentBridge} [opts.bridge]  for comm_send endpoint parsing
  * @param {string} [opts.defaultOrgId]
+ * @param {{record:Function, decorate:Function}} [opts.mentions]  outbound @mention
+ *        resolution (see mentions.js). Omit to send text exactly as given.
  * @param {object} [opts.logger]
  * @returns {{defs: object[], handler: (name:string, args:object)=>Promise<object>}}
  */
-export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
+export function createMcpTools({ services, bridge, defaultOrgId, mentions, logger } = {}) {
   if (!services) throw new Error('createMcpTools requires services');
 
   const defs = [];
@@ -1204,17 +1227,87 @@ export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) 
     },
   });
 
+  // ── outbound @mention resolution ───────────────────────────────────────────
+  // endpoint is `conversationId[|reply:..][|thread:..]` — the conversation id is
+  // the leading segment, and a bare id is also accepted.
+  const conversationIdOf = (endpoint) => String(endpoint ?? '').split('|')[0].trim();
+
+  // Names are otherwise learned only from inbound senders, so a participant who
+  // has never spoken in the conversation cannot be mentioned. Read the roster at
+  // the send site instead, cached briefly because an agent often sends several
+  // messages into the same conversation in a row.
+  const rosterHydratedAt = new Map();
+  const hydrateRoster = async (conversationId, orgId) => {
+    if (!mentions || !conversationId) return;
+    if (Date.now() - (rosterHydratedAt.get(conversationId) || 0) < ROSTER_TTL_MS) return;
+    rosterHydratedAt.set(conversationId, Date.now());
+    try {
+      const comm = services.comm;
+      if (!comm?.http?.apiPath) return;
+      const path = comm.http.apiPath(`/conversations/${conversationId}/members`);
+      const res = orgId ? await comm.http.getForOrg(orgId, path) : await comm.http.get(path);
+      // The http client unwraps the cws-core response envelope, so a list
+      // endpoint hands back a BARE ARRAY. Reading `res.data` here yields
+      // undefined, loops zero times and throws nothing — indistinguishable from
+      // this function never having run. Accept both shapes.
+      const list = Array.isArray(res) ? res : (Array.isArray(res?.data) ? res.data : (res?.members || []));
+      let learned = 0;
+      for (const m of list) {
+        const memberId = m?.member_id || m?.id;
+        const displayName = m?.display_name || m?.name;
+        if (!memberId || !displayName) continue;
+        await mentions.record({ conversationId, displayName, memberId });
+        learned++;
+      }
+      if (learned === 0) logger?.warn?.(`roster hydrate resolved 0 members conv=${conversationId}`);
+      else logger?.debug?.(`roster hydrated conv=${conversationId} members=${learned}`);
+    } catch (e) {
+      logger?.debug?.(`roster hydrate failed conv=${conversationId}: ${e.message}`);
+    }
+  };
+
+  // Never let mention resolution cost us a send: on any failure we fall back to
+  // the caller's original content with no mentions.
+  const resolveMentions = async (content, conversationId, orgId) => {
+    if (!mentions || typeof content !== 'string' || !conversationId) return { text: content, mentions: [] };
+    try {
+      if (content.includes('@')) await hydrateRoster(conversationId, orgId);
+      return await mentions.decorate(content, conversationId);
+    } catch (e) {
+      logger?.debug?.(`mention resolution failed (sending verbatim): ${e.message}`);
+      return { text: content, mentions: [] };
+    }
+  };
+
   const handler = async (name, args) => {
     try {
       if (name === 'comm_send') {
         const { endpoint, content, replyTo, orgId } = args;
         if (!endpoint || !content) return errResult('comm_send requires endpoint and content');
         if (!bridge) return errResult('comm_send unavailable: no bridge wired');
-        const res = await bridge.send(endpoint, content, {
-          orgId: orgId || defaultOrgId,
-          replyTo,
-        });
-        return okResult(res);
+        const org = orgId || defaultOrgId;
+        const resolved = await resolveMentions(content, conversationIdOf(endpoint), org);
+        if (!resolved.mentions.length) {
+          const res = await bridge.send(endpoint, resolved.text, { orgId: org, replyTo });
+          return okResult(res);
+        }
+        // `bridge.send` hardcodes `content:{content_type:'text', body:{text}}`
+        // and has no seam for the top-level mentions array, so a mentioning
+        // send posts the request body itself. Endpoint routing is resolved the
+        // same way the SDK does it (parseEndpoint + thread/reply precedence).
+        const comm = services.comm;
+        if (!comm?.http?.apiPath) return errResult('comm_send unavailable: no comm http client');
+        const ep = parseEndpoint(endpoint);
+        const conversationId = ep.threadConversationId || ep.conversationId;
+        const parentId = replyTo || ep.replyTo || ep.parentMessageId;
+        const body = {
+          client_msg_id: newClientMsgId(),
+          ...mentionSendBody(resolved),
+          ...(parentId ? { parent_id: String(parentId) } : {}),
+        };
+        const path = comm.http.apiPath(`/conversations/${conversationId}/messages`);
+        const res = org ? await comm.http.postForOrg(org, path, body) : await comm.http.post(path, body);
+        return okResult({ messageId: res?.id || res?.message?.id || res?.message_id || '' });
       }
 
       if (SERVICE_KEYS.includes(name)) {
@@ -1228,6 +1321,23 @@ export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) 
         }
         // Most services take a single params object; the `as` service takes
         // POSITIONAL args, so map the flat params onto the positional call.
+        // `comm`/`send` must get the same mention treatment as comm_send, or it
+        // is a silent bypass. It has no org routing of its own (the service's
+        // http client posts as the default org), so none is threaded here.
+        if (name === 'comm' && method === 'send' && typeof args.params?.content === 'string') {
+          const resolved = await resolveMentions(args.params.content, args.params.conversationId, defaultOrgId);
+          const next = { ...args.params };
+          if (resolved.mentions.length) {
+            // `buildSendBody`'s advanced override: a `body` carrying both
+            // `content` and `type` is forwarded to the wire as-is, which is the
+            // only way to get a top-level `mentions` past the SDK.
+            delete next.content;
+            next.body = mentionSendBody(resolved);
+          } else {
+            next.content = resolved.text;
+          }
+          args.params = next;
+        }
         const positional = POSITIONAL[name]?.[method];
         const result = positional
           ? await service[method](...buildPositionalArgs(positional, args.params))

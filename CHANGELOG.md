@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-17
+
+Fix release: an `@name` the agent writes in an outbound message now actually
+mentions that person. Until now it was decoration — the message sent, it read
+back looking mentioned, and the addressee was never notified.
+
+### Fixed
+
+- **Outbound `@mention` never reached anyone** (`src/mentions.js`, wired in
+  `src/mcp-tools.js`, `src/inbound-delivery.js`, `src/index.js`, `src/bridge.js`).
+  Two independent causes, both closed here:
+  - **Placement.** cws-core builds its mention index from the `mentions` array
+    at the **top level of the send request**, next to `type` and `content`. Both
+    outbound paths now put it there. `comm_send` cannot use `bridge.send` for
+    this — the SDK's `CwsAgentBridge.send` hardcodes
+    `content:{content_type:'text', body:{text}}` and has no seam for a top-level
+    field — so a mentioning send posts the request body itself, resolving
+    endpoint routing exactly as the SDK does (`parseEndpoint`, thread/reply
+    precedence). Sends that mention nobody still go through `bridge.send`
+    unchanged. The generic `comm`/`send` dispatch path gets the same treatment
+    via `buildSendBody`'s documented advanced `body` override, so it is not a
+    silent bypass.
+  - **Name → member id.** A structured mention needs the addressee's
+    `member_id`. Names were only ever learned passively from inbound senders, so
+    anyone who had not already spoken in the conversation could not be mentioned
+    at all. The send site now reads the conversation roster
+    (`GET /conversations/{id}/members`) before decorating, cached for 60s per
+    conversation and only when the text actually contains an `@`. The roster
+    response is read tolerantly: the SDK's http client unwraps the cws-core
+    response envelope, so a list endpoint hands back a **bare array** and the
+    obvious `res.data` would silently yield nothing.
+- Mention entries are emitted as `{type:'member', member_id}` — the request-side
+  shape. The response side spells the same field `mentioned_id`, and copying
+  that shape into a request fails validation.
+- Text canonicalization rides along, since cws-fe highlights a mention by
+  matching `@` + the exact `display_name` and the SDK's
+  `isSelfNameMentionedInText` wake gate matches `@<self display_name>`: an `@`
+  differing by case or alias is a no-op in both.
+- Every failure in this path is best-effort by construction — a roster read that
+  502s, a corrupt registry file, or a throwing resolver all fall back to sending
+  the author's text verbatim rather than dropping the message.
+
 ## [1.2.0] - 2026-08-27
 
 Feature release: the agent's access policy is now reconciled with the server in

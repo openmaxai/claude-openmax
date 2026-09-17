@@ -25,6 +25,7 @@ import { createStderrLogger, createEmptyRuntimeState } from './providers.js';
 import { ClaudeChannel } from './channel.js';
 import { DebouncedWakeNotifier } from './notifier.js';
 import { createInboundDelivery } from './inbound-delivery.js';
+import { createMentions } from './mentions.js';
 import { createMcpTools } from './mcp-tools.js';
 import { createBridge } from './create-bridge.js';
 import { startOwnerSync } from './owner-sync.js';
@@ -62,10 +63,16 @@ async function main() {
     includePreview: process.env.CLAUDE_OPENMAX_CONTENT_FREE !== '1',
   });
 
+  // Outbound @mention resolution. Without it an `@name` we send is decorative:
+  // it never lands in cws-core's mention index and never wakes the addressee
+  // (see mentions.js).
+  const mentions = createMentions({ storage, log: (m) => logger.debug?.(m) });
+
   const { defs, handler } = createMcpTools({
     services: runtime.services,
     bridge: null,               // set after the bridge exists (comm_send needs it)
     defaultOrgId: runtime.resolveDefaultOrgId(),
+    mentions,
     logger,
   });
   channel.registerTools(defs, handler);
@@ -95,6 +102,7 @@ async function main() {
     const inbound = createInboundDelivery({
       wake: (req) => notifier.notify(req).then(() => ({ runtimeSession: channel.runtimeSession })),
       runtimeSession: channel.runtimeSession,
+      mentions,
       logger,
     });
     bridge = createBridge({
@@ -112,6 +120,7 @@ async function main() {
       services: runtime.services,
       bridge,
       defaultOrgId: runtime.resolveDefaultOrgId(),
+      mentions,
       logger,
     });
     channel.registerTools(withBridge.defs, withBridge.handler);
