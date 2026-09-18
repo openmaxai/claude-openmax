@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [1.2.1] - 2026-09-18
+
+Makes the outbound `@mention` resolution that landed in the previous commit
+actually take effect: the SDK method it calls has shipped, and the pin here now
+points at it. Until this bump the feature was present but inert.
+
 ### Added
 
 - **Outbound `@mention` resolution on the send path** (`src/mcp-tools.js`,
@@ -24,11 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - When nothing resolves, no `mentions` key is added at all — an empty array
     would change the call shape for every message that mentions no one.
 
-  **This depends on an unreleased SDK.** The resolution itself lives in
-  `@openmaxai/openmax-agent-sdk` (`resolveOutbound`), which the currently pinned
-  1.0.3 does not have. Against 1.0.3 this code degrades to sending verbatim —
-  correct, but inert. It becomes live once the SDK ships that method and the
-  dependency here is bumped.
+### Changed
+
+- **`@openmaxai/openmax-agent-sdk` pinned 1.0.3 → 1.1.0.** The resolution itself
+  lives in the SDK (`createMentionRegistry().resolveOutbound`), which 1.0.3 does
+  not expose — against 1.0.3 the send path fell through its own error branch and
+  sent verbatim with no `mentions`, so a typed `@name` still notified nobody. The
+  fallback is deliberate (resolution must never cost a send) and it is also what
+  made the gap invisible: the code was correct but inert. 1.1.0 adds
+  `resolveOutbound` and `recordMembers`, so the mentions rows now actually go out.
+
+  The adapter's tolerance of a registry without `resolveOutbound` is kept and
+  still tested — it guards the fallback contract, not the old pin.
 
 
 ## [1.2.0] - 2026-08-27
