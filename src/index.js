@@ -26,6 +26,7 @@ import { ClaudeChannel } from './channel.js';
 import { DebouncedWakeNotifier } from './notifier.js';
 import { createInboundDelivery } from './inbound-delivery.js';
 import { createMcpTools } from './mcp-tools.js';
+import { createMentionRegistry } from '@openmaxai/openmax-agent-sdk';
 import { createBridge } from './create-bridge.js';
 import { startOwnerSync } from './owner-sync.js';
 import { startWakeServer } from './wake-server.js';
@@ -62,10 +63,13 @@ async function main() {
     includePreview: process.env.CLAUDE_OPENMAX_CONTENT_FREE !== '1',
   });
 
+  const mentionRegistry = createMentionRegistry({ storage, log: (m) => logger?.debug?.(m) });
+
   const { defs, handler } = createMcpTools({
     services: runtime.services,
     bridge: null,               // set after the bridge exists (comm_send needs it)
     defaultOrgId: runtime.resolveDefaultOrgId(),
+    mentions: mentionRegistry,
     logger,
   });
   channel.registerTools(defs, handler);
@@ -112,6 +116,7 @@ async function main() {
       services: runtime.services,
       bridge,
       defaultOrgId: runtime.resolveDefaultOrgId(),
+      mentions: mentionRegistry,
       logger,
     });
     channel.registerTools(withBridge.defs, withBridge.handler);

@@ -223,3 +223,83 @@ test('as {method:"list"} exposes flat-param schemas + positional-mapping notes',
   // The note documents the adapter's positional mapping.
   assert.match(byName.downloadMedia.note, /downloadMedia\(urlOrIdOrUri, filename\)|no trailing/i);
 });
+
+// ── outbound @mention resolution ──────────────────────────────────────────────
+
+const ROSTER = [
+  { member_id: 'mem-noah', display_name: 'nova-noah' },
+  { member_id: 'mem-ath', display_name: 'athan.chen' },
+];
+
+// `mentionsImpl: {}` models an older SDK whose registry predates resolveOutbound.
+function mentionHarness({ mentionsImpl, members = ROSTER } = {}) {
+  const calls = { roster: [], recorded: [], sent: [], dispatched: [] };
+  const services = {
+    ...fakeServices(),
+    comm: {
+      getMessages: async () => ({ messages: [] }),
+      send: async (p) => { calls.dispatched.push(p); return { id: 'm1' }; },
+      conversationMembers: async ({ conversationId }) => { calls.roster.push(conversationId); return members; },
+    },
+  };
+  const mentions = mentionsImpl ?? {
+    recordMembers: async (cid, list) => { calls.recorded.push({ cid, list }); },
+    resolveOutbound: async (text, cid) => {
+      const hit = members.find((m) => text.includes(`@${m.display_name}`));
+      return hit ? { text, mentions: [{ type: 'member', member_id: hit.member_id }] } : { text, mentions: [] };
+    },
+  };
+  const bridge = { send: async (endpoint, content, opts) => { calls.sent.push({ endpoint, content, opts }); return { messageId: 'm9' }; } };
+  const { handler } = createMcpTools({ services, bridge, defaultOrgId: 'org1', mentions });
+  return { handler, calls };
+}
+
+test('comm_send: an @name in the text becomes a top-level mentions row', async () => {
+  const { handler, calls } = mentionHarness();
+  await handler('comm_send', { endpoint: 'conv1', content: 'ping @nova-noah' });
+  assert.deepEqual(calls.sent[0].opts.mentions, [{ type: 'member', member_id: 'mem-noah' }]);
+  assert.equal(calls.roster[0], 'conv1');
+  assert.deepEqual(calls.recorded[0].list, [
+    { displayName: 'nova-noah', memberId: 'mem-noah' },
+    { displayName: 'athan.chen', memberId: 'mem-ath' },
+  ]);
+});
+
+test('comm_send: nothing to mention leaves the call shape untouched (no empty array)', async () => {
+  const { handler, calls } = mentionHarness();
+  await handler('comm_send', { endpoint: 'conv1', content: 'ping @nobody-here' });
+  assert.ok(!('mentions' in calls.sent[0].opts), 'must not add a mentions key when there is nothing to carry');
+});
+
+test('comm.send dispatch gets the same treatment as comm_send (not a silent bypass)', async () => {
+  const { handler, calls } = mentionHarness();
+  await handler('comm', { method: 'send', params: { conversationId: 'conv1', content: 'ping @nova-noah' } });
+  assert.deepEqual(calls.dispatched[0].mentions, [{ type: 'member', member_id: 'mem-noah' }]);
+});
+
+test('an older SDK registry (no resolveOutbound) sends verbatim instead of throwing', async () => {
+  const { handler, calls } = mentionHarness({ mentionsImpl: {} });
+  const res = await handler('comm_send', { endpoint: 'conv1', content: 'ping @nova-noah' });
+  assert.notEqual(res.isError, true);
+  assert.equal(calls.sent[0].content, 'ping @nova-noah');
+  assert.ok(!('mentions' in calls.sent[0].opts));
+});
+
+test('the roster is hydrated once per conversation, not once per send', async () => {
+  const { handler, calls } = mentionHarness();
+  await handler('comm_send', { endpoint: 'conv1', content: 'a @nova-noah' });
+  await handler('comm_send', { endpoint: 'conv1', content: 'b @nova-noah' });
+  assert.equal(calls.roster.length, 1);
+});
+
+test('text with no @ never pays for a roster read', async () => {
+  const { handler, calls } = mentionHarness();
+  await handler('comm_send', { endpoint: 'conv1', content: 'no at-sign here' });
+  assert.equal(calls.roster.length, 0);
+});
+
+test('an endpoint carrying a suffix still resolves against the conversation id', async () => {
+  const { handler, calls } = mentionHarness();
+  await handler('comm_send', { endpoint: 'conv1|thread7', content: 'ping @nova-noah' });
+  assert.equal(calls.roster[0], 'conv1');
+});

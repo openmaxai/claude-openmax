@@ -14293,13 +14293,13 @@ function _array(Class2, element, params) {
 }
 // @__NO_SIDE_EFFECTS__
 function _custom(Class2, fn, _params) {
-  const norm = normalizeParams(_params);
-  norm.abort ?? (norm.abort = true);
+  const norm2 = normalizeParams(_params);
+  norm2.abort ?? (norm2.abort = true);
   const schema = new Class2({
     type: "custom",
     check: "custom",
     fn,
-    ...norm
+    ...norm2
   });
   return schema;
 }
@@ -19331,6 +19331,151 @@ async function decideInbound(msg, conv, orgConfig, deps = {}) {
   };
 }
 
+// node_modules/@openmaxai/openmax-agent-sdk/src/protocol/mention.js
+var MAX_NAMES_PER_CONV = 200;
+var norm = (s) => String(s ?? "").trim().toLowerCase();
+var HANDLE_CHAR = /[\p{L}\p{N}]/u;
+function handleContinues(text, at) {
+  const c = text[at];
+  if (c === void 0) return false;
+  if (HANDLE_CHAR.test(c)) return true;
+  if (c === "." || c === "_" || c === "-") return HANDLE_CHAR.test(text[at + 1] ?? "");
+  return false;
+}
+function createMentionRegistry({
+  storage = memoryStorage(),
+  key = "mention-registry.json",
+  maxNamesPerConv = MAX_NAMES_PER_CONV,
+  log = () => {
+  }
+} = {}) {
+  let cache = null;
+  async function ensureLoaded() {
+    if (cache) return cache;
+    try {
+      const raw = await storage.get(key);
+      cache = raw ? JSON.parse(raw) : {};
+    } catch {
+      cache = {};
+    }
+    return cache;
+  }
+  async function persist(reg) {
+    try {
+      await storage.set(key, JSON.stringify(reg));
+    } catch (err) {
+      log(`mention-registry persist failed: ${err?.message || err}`);
+    }
+  }
+  function bucketOf(reg, conversationId, { create = false } = {}) {
+    const existing = reg[conversationId];
+    if (!existing) return create ? reg[conversationId] = { names: {}, ids: {} } : null;
+    if (typeof existing.names !== "object" || existing.names === null) {
+      return reg[conversationId] = { names: { ...existing }, ids: {} };
+    }
+    if (typeof existing.ids !== "object" || existing.ids === null) existing.ids = {};
+    return existing;
+  }
+  function evict(conv) {
+    const keys = Object.keys(conv.names);
+    if (keys.length <= maxNamesPerConv) return;
+    for (const k of keys.slice(0, keys.length - maxNamesPerConv)) {
+      delete conv.names[k];
+      delete conv.ids[k];
+    }
+  }
+  async function recordParticipants(conversationId, names) {
+    if (!conversationId) return;
+    const list = (Array.isArray(names) ? names : [names]).map((n) => String(n ?? "").trim()).filter(Boolean);
+    if (!list.length) return;
+    const reg = await ensureLoaded();
+    const conv = bucketOf(reg, conversationId, { create: true });
+    let changed = false;
+    for (const name of list) {
+      const nkey = norm(name);
+      if (conv.names[nkey] !== name) {
+        conv.names[nkey] = name;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    evict(conv);
+    await persist(reg);
+  }
+  async function recordMembers(conversationId, members) {
+    if (!conversationId) return;
+    const list = (Array.isArray(members) ? members : [members]).map((m) => ({ name: String(m?.displayName ?? "").trim(), id: String(m?.memberId ?? "").trim() })).filter((m) => m.name && m.id);
+    if (!list.length) return;
+    const reg = await ensureLoaded();
+    const conv = bucketOf(reg, conversationId, { create: true });
+    let changed = false;
+    for (const { name, id } of list) {
+      const nkey = norm(name);
+      if (conv.names[nkey] !== name) {
+        conv.names[nkey] = name;
+        changed = true;
+      }
+      if (conv.ids[nkey] !== id) {
+        conv.ids[nkey] = id;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    evict(conv);
+    await persist(reg);
+  }
+  async function resolveMentions(text, conversationId) {
+    if (!text || !conversationId || !String(text).includes("@")) return text;
+    const reg = await ensureLoaded();
+    const conv = bucketOf(reg, conversationId);
+    if (!conv) return text;
+    const namesList = Object.values(conv.names).sort((a, b) => b.length - a.length);
+    let out = String(text);
+    for (const name of namesList) {
+      const esc2 = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      out = out.replace(new RegExp("@" + esc2, "gi"), (match, offset, whole) => handleContinues(whole, offset + match.length) ? match : "@" + name);
+    }
+    return out;
+  }
+  async function resolveOutbound(text, conversationId) {
+    const canonical2 = await resolveMentions(text, conversationId);
+    if (typeof canonical2 !== "string" || !conversationId || !canonical2.includes("@")) {
+      return { text: canonical2, mentions: [] };
+    }
+    const reg = await ensureLoaded();
+    const conv = bucketOf(reg, conversationId);
+    if (!conv) return { text: canonical2, mentions: [] };
+    const names = Object.values(conv.names).sort((a, b) => b.length - a.length);
+    let restLower = canonical2.toLowerCase();
+    const mentions = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const name of names) {
+      const token = ("@" + name).toLowerCase();
+      let matched = false;
+      for (let from = 0; ; ) {
+        const at = restLower.indexOf(token, from);
+        if (at < 0) break;
+        const end = at + token.length;
+        if (handleContinues(restLower, end)) {
+          from = at + 1;
+          continue;
+        }
+        matched = true;
+        const blank = " ".repeat(token.length);
+        restLower = restLower.slice(0, at) + blank + restLower.slice(end);
+        from = end;
+      }
+      if (!matched) continue;
+      const memberId = conv.ids[norm(name)];
+      if (!memberId || seen.has(memberId)) continue;
+      seen.add(memberId);
+      mentions.push({ type: "member", member_id: memberId });
+    }
+    return { text: canonical2, mentions };
+  }
+  return { recordParticipants, recordMembers, resolveMentions, resolveOutbound };
+}
+
 // node_modules/@openmaxai/openmax-agent-sdk/src/services/tm.js
 function pageParams(p) {
   return {
@@ -19892,9 +20037,11 @@ function ensureClientMsgId(id) {
   return id || `cmsg_${randomUUID2()}`;
 }
 function buildSendBody(params) {
+  const mentions = Array.isArray(params.mentions) && params.mentions.length ? params.mentions : null;
   if (params.body && params.body.content && params.body.type) {
     return {
       client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
+      ...mentions ? { mentions } : {},
       ...params.body,
       ...params.replyTo ? { parent_id: params.replyTo } : {}
     };
@@ -19918,6 +20065,7 @@ function buildSendBody(params) {
     client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
     type: msgType,
     content: { content_type: contentType, body, attachments },
+    ...mentions ? { mentions } : {},
     ...params.replyTo ? { parent_id: params.replyTo } : {}
   };
 }
@@ -19966,6 +20114,28 @@ var CommService = class {
   }
   getConversation(params = {}) {
     return this.http.get(this._p(`/conversations/${params.conversationId}`));
+  }
+  /**
+   * Members of a conversation, ALWAYS as an array.
+   *
+   * Unlike the other reads here this one normalizes the response instead of
+   * handing it back raw. The http client unwraps the D8 envelope, so an
+   * unpaginated response arrives as a BARE ARRAY while a paginated one arrives as
+   * `{data, pagination}` — a caller writing the usual `res.data` gets undefined
+   * for the first shape, iterates zero times and throws nothing, which on disk
+   * and in logs is indistinguishable from the call never having run. All the
+   * shapes are accepted here so no adapter has to learn that the hard way.
+   *
+   * Feeds `createMentionRegistry().recordMembers()`: names learned from inbound
+   * senders carry no member id, so without a roster read a participant who has
+   * never spoken cannot be mentioned.
+   */
+  async conversationMembers(params = {}) {
+    const res = await this.http.get(this._p(`/conversations/${params.conversationId}/members`));
+    if (Array.isArray(res)) return res;
+    if (Array.isArray(res?.data)) return res.data;
+    if (Array.isArray(res?.members)) return res.members;
+    return [];
   }
   // ---- Messages ------------------------------------------------------------
   getMessages(params = {}) {
@@ -20027,9 +20197,9 @@ var CommService = class {
       if (byKey) return byKey;
       const byId = config2.getOrgByOrgId ? config2.getOrgByOrgId(key) : void 0;
       if (byId) return byId;
-      const norm = (s) => s?.toLowerCase().replace(/[-_ ]/g, "");
-      const keyNorm = norm(key);
-      const byName = enabled.find((o) => norm(o.org_name) === keyNorm);
+      const norm2 = (s) => s?.toLowerCase().replace(/[-_ ]/g, "");
+      const keyNorm = norm2(key);
+      const byName = enabled.find((o) => norm2(o.org_name) === keyNorm);
       if (byName) return byName;
       const names2 = enabled.map((o) => o.org_name || o.org_id).join(", ");
       throw new Error(`org not found in config: "${key}" (known: ${names2 || "none"})`);
@@ -21777,6 +21947,9 @@ var CwsAgentBridge = class {
    * @param {string} [opts.orgId]     org to send as (else the client's default org)
    * @param {string} [opts.replyTo]   parent message id (reply)
    * @param {string} [opts.type]      message type (default 'AGENT_TEXT')
+   * @param {Array<{type:string, member_id:string}>} [opts.mentions] structured
+   *        mentions, emitted at the request top level (see protocol/mention.js —
+   *        `content.body` is the wrong place and notifies nobody)
    * @returns {Promise<{messageId: string}>}
    */
   async send(endpoint, content, opts = {}) {
@@ -21789,6 +21962,7 @@ var CwsAgentBridge = class {
       type: opts.type || "AGENT_TEXT",
       content: { content_type: "text", body: { text: content }, attachments: [] }
     };
+    if (Array.isArray(opts.mentions) && opts.mentions.length) body.mentions = opts.mentions;
     const replyTo = opts.replyTo || ep.replyTo || ep.parentMessageId;
     if (replyTo) body.parent_id = String(replyTo);
     const res = orgId ? await this.http.postForOrg(orgId, this.#ap(`/conversations/${conversationId}/messages`), body) : await this.http.post(this.#ap(`/conversations/${conversationId}/messages`), body);
@@ -21810,7 +21984,7 @@ var CwsAgentBridge = class {
 // src/version.js
 var version2;
 if (true) {
-  version2 = "1.2.0";
+  version2 = "1.3.0";
 } else {
   version2 = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
@@ -25754,8 +25928,36 @@ function okResult(value) {
 function errResult(message) {
   return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
 }
-function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
+function createMcpTools({ services, bridge, defaultOrgId, mentions, logger } = {}) {
   if (!services) throw new Error("createMcpTools requires services");
+  const ROSTER_TTL_MS = 6e4;
+  const rosterAt = /* @__PURE__ */ new Map();
+  const conversationIdOf = (endpoint) => String(endpoint ?? "").split("|")[0].trim();
+  const hydrateRoster = async (conversationId) => {
+    if (!mentions || !conversationId) return;
+    if (Date.now() - (rosterAt.get(conversationId) || 0) < ROSTER_TTL_MS) return;
+    rosterAt.set(conversationId, Date.now());
+    try {
+      const roster = await services.comm.conversationMembers({ conversationId });
+      await mentions.recordMembers(conversationId, roster.map((m) => ({
+        displayName: m?.display_name || m?.name,
+        memberId: m?.member_id || m?.id
+      })));
+      if (!roster.length) logger?.warn?.(`roster hydrate resolved 0 members conv=${conversationId}`);
+    } catch (e) {
+      logger?.debug?.(`roster hydrate failed conv=${conversationId}: ${e.message}`);
+    }
+  };
+  const resolveOutbound = async (content, conversationId) => {
+    if (!mentions || typeof content !== "string" || !conversationId) return { text: content, mentions: [] };
+    try {
+      if (content.includes("@")) await hydrateRoster(conversationId);
+      return await mentions.resolveOutbound(content, conversationId);
+    } catch (e) {
+      logger?.debug?.(`mention resolution failed (sending verbatim): ${e.message}`);
+      return { text: content, mentions: [] };
+    }
+  };
   const defs = [];
   for (const key of SERVICE_KEYS) {
     if (!services[key]) continue;
@@ -25792,9 +25994,13 @@ function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
         const { endpoint, content, replyTo, orgId } = args;
         if (!endpoint || !content) return errResult("comm_send requires endpoint and content");
         if (!bridge) return errResult("comm_send unavailable: no bridge wired");
-        const res = await bridge.send(endpoint, content, {
+        const resolved = await resolveOutbound(content, conversationIdOf(endpoint));
+        const res = await bridge.send(endpoint, resolved.text, {
           orgId: orgId || defaultOrgId,
-          replyTo
+          replyTo,
+          // Only when there is something to carry: nothing to mention must leave
+          // the call shape exactly as it was.
+          ...resolved.mentions.length ? { mentions: resolved.mentions } : {}
         });
         return okResult(res);
       }
@@ -25806,6 +26012,14 @@ function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
         if (method === "list") return okResult({ service: name, methods: listMethods(name, service) });
         if (typeof service[method] !== "function" || method.startsWith("_")) {
           return errResult(`${name}: unknown method "${method}". Call {"method":"list"} to see available verbs and their fields.`);
+        }
+        if (name === "comm" && method === "send" && typeof args.params?.content === "string") {
+          const resolved = await resolveOutbound(args.params.content, args.params.conversationId);
+          args.params = {
+            ...args.params,
+            content: resolved.text,
+            ...resolved.mentions.length ? { mentions: resolved.mentions } : {}
+          };
         }
         const positional = POSITIONAL[name]?.[method];
         const result = positional ? await service[method](...buildPositionalArgs(positional, args.params)) : await service[method](args.params || {});
@@ -25971,11 +26185,13 @@ async function main() {
     logger,
     includePreview: process.env.CLAUDE_OPENMAX_CONTENT_FREE !== "1"
   });
+  const mentionRegistry = createMentionRegistry({ storage, log: (m) => logger?.debug?.(m) });
   const { defs, handler } = createMcpTools({
     services: runtime.services,
     bridge: null,
     // set after the bridge exists (comm_send needs it)
     defaultOrgId: runtime.resolveDefaultOrgId(),
+    mentions: mentionRegistry,
     logger
   });
   channel.registerTools(defs, handler);
@@ -26016,6 +26232,7 @@ async function main() {
       services: runtime.services,
       bridge,
       defaultOrgId: runtime.resolveDefaultOrgId(),
+      mentions: mentionRegistry,
       logger
     });
     channel.registerTools(withBridge.defs, withBridge.handler);

@@ -6212,9 +6212,11 @@ function ensureClientMsgId(id) {
   return id || `cmsg_${randomUUID2()}`;
 }
 function buildSendBody(params) {
+  const mentions = Array.isArray(params.mentions) && params.mentions.length ? params.mentions : null;
   if (params.body && params.body.content && params.body.type) {
     return {
       client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
+      ...mentions ? { mentions } : {},
       ...params.body,
       ...params.replyTo ? { parent_id: params.replyTo } : {}
     };
@@ -6238,6 +6240,7 @@ function buildSendBody(params) {
     client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
     type: msgType,
     content: { content_type: contentType, body, attachments },
+    ...mentions ? { mentions } : {},
     ...params.replyTo ? { parent_id: params.replyTo } : {}
   };
 }
@@ -6286,6 +6289,28 @@ var CommService = class {
   }
   getConversation(params = {}) {
     return this.http.get(this._p(`/conversations/${params.conversationId}`));
+  }
+  /**
+   * Members of a conversation, ALWAYS as an array.
+   *
+   * Unlike the other reads here this one normalizes the response instead of
+   * handing it back raw. The http client unwraps the D8 envelope, so an
+   * unpaginated response arrives as a BARE ARRAY while a paginated one arrives as
+   * `{data, pagination}` — a caller writing the usual `res.data` gets undefined
+   * for the first shape, iterates zero times and throws nothing, which on disk
+   * and in logs is indistinguishable from the call never having run. All the
+   * shapes are accepted here so no adapter has to learn that the hard way.
+   *
+   * Feeds `createMentionRegistry().recordMembers()`: names learned from inbound
+   * senders carry no member id, so without a roster read a participant who has
+   * never spoken cannot be mentioned.
+   */
+  async conversationMembers(params = {}) {
+    const res = await this.http.get(this._p(`/conversations/${params.conversationId}/members`));
+    if (Array.isArray(res)) return res;
+    if (Array.isArray(res?.data)) return res.data;
+    if (Array.isArray(res?.members)) return res.members;
+    return [];
   }
   // ---- Messages ------------------------------------------------------------
   getMessages(params = {}) {
@@ -8097,6 +8122,9 @@ var CwsAgentBridge = class {
    * @param {string} [opts.orgId]     org to send as (else the client's default org)
    * @param {string} [opts.replyTo]   parent message id (reply)
    * @param {string} [opts.type]      message type (default 'AGENT_TEXT')
+   * @param {Array<{type:string, member_id:string}>} [opts.mentions] structured
+   *        mentions, emitted at the request top level (see protocol/mention.js —
+   *        `content.body` is the wrong place and notifies nobody)
    * @returns {Promise<{messageId: string}>}
    */
   async send(endpoint, content, opts = {}) {
@@ -8109,6 +8137,7 @@ var CwsAgentBridge = class {
       type: opts.type || "AGENT_TEXT",
       content: { content_type: "text", body: { text: content }, attachments: [] }
     };
+    if (Array.isArray(opts.mentions) && opts.mentions.length) body.mentions = opts.mentions;
     const replyTo = opts.replyTo || ep.replyTo || ep.parentMessageId;
     if (replyTo) body.parent_id = String(replyTo);
     const res = orgId ? await this.http.postForOrg(orgId, this.#ap(`/conversations/${conversationId}/messages`), body) : await this.http.post(this.#ap(`/conversations/${conversationId}/messages`), body);
@@ -8130,7 +8159,7 @@ var CwsAgentBridge = class {
 // src/version.js
 var version;
 if (true) {
-  version = "1.2.0";
+  version = "1.3.0";
 } else {
   version = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")

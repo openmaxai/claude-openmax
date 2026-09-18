@@ -1167,8 +1167,46 @@ function errResult(message) {
  * @param {object} [opts.logger]
  * @returns {{defs: object[], handler: (name:string, args:object)=>Promise<object>}}
  */
-export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) {
+export function createMcpTools({ services, bridge, defaultOrgId, mentions, logger } = {}) {
   if (!services) throw new Error('createMcpTools requires services');
+
+  // ── outbound @mention resolution ───────────────────────────────────────────
+  // The SDK owns both halves (canonical text + the top-level `mentions` array);
+  // all this adapter decides is WHEN to read the roster. Names are otherwise
+  // learned only from inbound senders, so a participant who has never spoken
+  // could not be mentioned at all.
+  const ROSTER_TTL_MS = 60_000;
+  const rosterAt = new Map();
+  const conversationIdOf = (endpoint) => String(endpoint ?? '').split('|')[0].trim();
+
+  const hydrateRoster = async (conversationId) => {
+    if (!mentions || !conversationId) return;
+    if (Date.now() - (rosterAt.get(conversationId) || 0) < ROSTER_TTL_MS) return;
+    rosterAt.set(conversationId, Date.now());   // set before the call: a dead endpoint must not stall every send
+    try {
+      const roster = await services.comm.conversationMembers({ conversationId });
+      await mentions.recordMembers(conversationId, roster.map((m) => ({
+        displayName: m?.display_name || m?.name,
+        memberId: m?.member_id || m?.id,
+      })));
+      if (!roster.length) logger?.warn?.(`roster hydrate resolved 0 members conv=${conversationId}`);
+    } catch (e) {
+      logger?.debug?.(`roster hydrate failed conv=${conversationId}: ${e.message}`);
+    }
+  };
+
+  // Never let mention resolution cost us a send: on any failure fall back to the
+  // caller's text with no mentions.
+  const resolveOutbound = async (content, conversationId) => {
+    if (!mentions || typeof content !== 'string' || !conversationId) return { text: content, mentions: [] };
+    try {
+      if (content.includes('@')) await hydrateRoster(conversationId);
+      return await mentions.resolveOutbound(content, conversationId);
+    } catch (e) {
+      logger?.debug?.(`mention resolution failed (sending verbatim): ${e.message}`);
+      return { text: content, mentions: [] };
+    }
+  };
 
   const defs = [];
   for (const key of SERVICE_KEYS) {
@@ -1210,9 +1248,13 @@ export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) 
         const { endpoint, content, replyTo, orgId } = args;
         if (!endpoint || !content) return errResult('comm_send requires endpoint and content');
         if (!bridge) return errResult('comm_send unavailable: no bridge wired');
-        const res = await bridge.send(endpoint, content, {
+        const resolved = await resolveOutbound(content, conversationIdOf(endpoint));
+        const res = await bridge.send(endpoint, resolved.text, {
           orgId: orgId || defaultOrgId,
           replyTo,
+          // Only when there is something to carry: nothing to mention must leave
+          // the call shape exactly as it was.
+          ...(resolved.mentions.length ? { mentions: resolved.mentions } : {}),
         });
         return okResult(res);
       }
@@ -1226,6 +1268,17 @@ export function createMcpTools({ services, bridge, defaultOrgId, logger } = {}) 
         if (typeof service[method] !== 'function' || method.startsWith('_')) {
           return errResult(`${name}: unknown method "${method}". Call {"method":"list"} to see available verbs and their fields.`);
         }
+        // `comm`/`send` must get the same mention treatment as comm_send, or it
+        // is a silent bypass of it.
+        if (name === 'comm' && method === 'send' && typeof args.params?.content === 'string') {
+          const resolved = await resolveOutbound(args.params.content, args.params.conversationId);
+          args.params = {
+            ...args.params,
+            content: resolved.text,
+            ...(resolved.mentions.length ? { mentions: resolved.mentions } : {}),
+          };
+        }
+
         // Most services take a single params object; the `as` service takes
         // POSITIONAL args, so map the flat params onto the positional call.
         const positional = POSITIONAL[name]?.[method];

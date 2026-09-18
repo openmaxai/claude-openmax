@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [1.3.0] - 2026-09-18
+
+Makes the outbound `@mention` resolution that landed in the previous commit
+actually take effect: the SDK method it calls has shipped, and the pin here now
+points at it. Until this bump the feature was present but inert.
+
+### Added
+
+- **Outbound `@mention` resolution on the send path** (`src/mcp-tools.js`,
+  wired in `src/index.js`). An `@name` typed in the message text is now turned
+  into a structured, top-level `mentions` row before the message leaves, so the
+  recipient actually gets a notification and an unread-mention badge. Previously
+  the text rendered as a mention client-side while nobody was notified, which is
+  indistinguishable from a working mention by eye.
+  - `comm_send` and the `comm` dispatch tool's `send` verb both go through it —
+    treating only one of them would make the other a silent bypass.
+  - The per-conversation roster is read once per minute, and only for text that
+    actually contains an `@`, so an ordinary message costs no extra request.
+  - Resolution failure is never allowed to cost a send: on any error the original
+    text goes out verbatim with no mentions.
+  - When nothing resolves, no `mentions` key is added at all — an empty array
+    would change the call shape for every message that mentions no one.
+
+### Changed
+
+- **`@openmaxai/openmax-agent-sdk` pinned 1.0.3 → 1.1.0.** The resolution itself
+  lives in the SDK (`createMentionRegistry().resolveOutbound`), which 1.0.3 does
+  not expose — against 1.0.3 the send path fell through its own error branch and
+  sent verbatim with no `mentions`, so a typed `@name` still notified nobody. The
+  fallback is deliberate (resolution must never cost a send) and it is also what
+  made the gap invisible: the code was correct but inert. 1.1.0 adds
+  `resolveOutbound` and `recordMembers`, so the mentions rows now actually go out.
+
+  The adapter's tolerance of a registry without `resolveOutbound` is kept and
+  still tested — it guards the fallback contract, not the old pin.
+
+
 ## [1.2.0] - 2026-08-27
 
 Feature release: the agent's access policy is now reconciled with the server in
