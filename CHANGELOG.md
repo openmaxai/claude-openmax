@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
-## [1.2.1] - 2026-09-18
+## [1.3.0] - 2026-09-18
 
 Makes the outbound `@mention` resolution that landed in the previous commit
 actually take effect: the SDK method it calls has shipped, and the pin here now
