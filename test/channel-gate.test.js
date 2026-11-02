@@ -319,7 +319,7 @@ test('parseLstartUtc: C-locale lstart → epoch seconds', () => {
   assert.equal(parseLstartUtc('lun.  2 nov. 2026 14:00:05'), null);
 });
 
-/** A fake `ps`/`sysctl` that formats ONE fixed instant according to the env it is given. */
+/** A fake `ps` that formats ONE fixed instant according to the env it is given. */
 function fakeRunner(seen) {
   const instant = new Date(Date.UTC(2026, 10, 2, 13, 0, 5));
   const fmt = (env) => {
@@ -332,7 +332,6 @@ function fakeRunner(seen) {
   return (cmd, args, env) => {
     seen.push({ cmd, env });
     if (cmd === 'ps') return `${fmt(env)}\n`;
-    if (cmd === 'sysctl') return `{ sec = 1730000000, usec = 42 } ${fmt(env)}\n`;
     throw new Error('unexpected');
   };
 }
@@ -348,7 +347,7 @@ test('macOS path: the same process observed from sessions with different TZ / lo
     { LC_TIME: 'de_DE.UTF-8' },
   ];
   const starts = envs.map((env) => processStartTime(77, { readFile: noProc, run, platform: 'darwin', env }));
-  const boots = envs.map((env) => currentBootId({ readFile: noProc, run, platform: 'darwin', env }));
+  const boots = envs.map(() => currentBootId({ readFile: noProc, platform: 'darwin' }));
   assert.ok(starts[0], 'parsed');
   assert.deepEqual(new Set(starts).size, 1, `start times differ: ${starts}`);
   assert.deepEqual(boots, [null, null, null], 'no boot id on macOS (kern.boottime follows the wall clock)');
@@ -370,17 +369,17 @@ test('real ps (procps here) with different caller TZ/LANG gives the same start t
   assert.ok(Math.abs(Number(a) - Date.now() / 1000) < 3600, 'epoch seconds near now');
 });
 
-test('unparseable ps / sysctl output → null (pid-only fallback), never a bogus value', () => {
+test('unparseable ps output → null (pid-only fallback), never a bogus value', () => {
   const run = () => 'something else\n';
   assert.equal(processStartTime(77, { readFile: noProc, run, platform: 'darwin' }), null);
 });
 
 // ── macOS: no boot-id comparison (kern.boottime drifts with clock adjustments) ─
 
-test('macOS: currentBootId is null and never shells out to sysctl', () => {
-  let ran = 0;
-  assert.equal(currentBootId({ readFile: () => { throw new Error('no /proc'); }, run: () => { ran++; return '{ sec = 1, usec = 0 }'; }, platform: 'darwin' }), null);
-  assert.equal(ran, 0);
+test('macOS (and any non-Linux platform): currentBootId is null', () => {
+  for (const platform of ['darwin', 'freebsd', 'win32']) {
+    assert.equal(currentBootId({ readFile: () => 'some-id\n', platform }), null, platform);
+  }
 });
 
 test('macOS: boottime drift (±1 s, ±1 h) while the holder is alive → lock stays held', () => {
@@ -389,9 +388,9 @@ test('macOS: boottime drift (±1 s, ±1 h) while the holder is alive → lock st
   for (const [recorded, label] of [['1730000000', 'old record'], ['', 'new record']]) {
     writeFileSync(path.join(dataDir, 'channel.lock'), `500\nstart=1793629977\nboot=${recorded}\n`);
     for (const drift of [-3600, -1, 1, 3600]) {
-      // what kern.boottime would read now after the clock moved by `drift`
-      const run = (cmd) => (cmd === 'sysctl' ? `{ sec = ${1730000000 + drift}, usec = 0 }` : 'Mon Nov  2 13:00:05 2026');
-      const bootId = currentBootId({ readFile: () => { throw new Error('no /proc'); }, run, platform: 'darwin' });
+      // kern.boottime would now read 1730000000 + drift; macOS reports no boot id,
+      // so the drift cannot make the live holder look "rebooted".
+      const bootId = currentBootId({ readFile: () => { throw new Error('no /proc'); }, platform: 'darwin' });
       const r = acquireChannelLock({ dataDir, pid: 600, isAlive: (p) => p === 500, startTimeOf: (p) => (p === 500 ? '1793629977' : 'X'), bootId });
       assert.equal(r.acquired, false, `${label}, drift ${drift}s: live holder must keep the lock`);
       assert.equal(r.holderPid, 500);
