@@ -89,11 +89,11 @@ export function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
-// Locale/timezone-independent environment for the `ps` / `sysctl` fallbacks:
-// `ps -o lstart` formats with setlocale(LC_ALL,"") + strftime("%c", localtime())
-// and `sysctl kern.boottime` appends ctime(), so two sessions with different
-// TZ/LANG/LC_* would otherwise print the SAME instant differently and judge a
-// live lock stale. Values are additionally reduced to epoch seconds.
+// Locale/timezone-independent environment for the `ps` fallback: `ps -o lstart`
+// formats with setlocale(LC_ALL,"") + strftime("%c", localtime()), so two
+// sessions with different TZ/LANG/LC_* would otherwise print the SAME instant
+// differently and judge a live lock stale. The value is also reduced to epoch
+// seconds.
 const NEUTRAL_ENV = { LC_ALL: 'C', LANG: 'C', TZ: 'UTC0' };
 
 function defaultRun(cmd, args, env) {
@@ -127,12 +127,6 @@ export function parseLstartUtc(text) {
   return Number.isFinite(t) ? String(t / 1000) : null;
 }
 
-/** `sysctl -n kern.boottime` ("{ sec = 1730000000, usec = 1 } Mon …") → "1730000000"; null otherwise. */
-export function parseKernBoottime(text) {
-  const m = String(text || '').match(/\bsec\s*=\s*(\d+)/);
-  return m ? m[1] : null;
-}
-
 /**
  * Start time of `pid` as a locale/TZ-independent string, or null when unknown.
  * Linux: /proc/<pid>/stat field 22 (readable for other users' processes too).
@@ -153,16 +147,18 @@ export function processStartTime(pid, { readFile = fs.readFileSync, run = defaul
 }
 
 /**
- * Identifier of the current boot, or null. Linux: boot_id. macOS: the `sec`
- * value of kern.boottime (epoch seconds; the ctime() tail is ignored).
- * @param {object} [o]  test seams: {readFile, run, platform, env}
+ * Identifier of the current boot, or null when there is no clock-independent one.
+ * Linux only: /proc/sys/kernel/random/boot_id (random per boot, unaffected by
+ * clock changes). Deliberately null on macOS: kern.boottime is derived from the
+ * wall clock and moves whenever the clock is adjusted (NTP sync, manual change,
+ * wake-from-sleep correction), so comparing it would judge a LIVE holder
+ * "rebooted" and steal its lock. There pid + process start time (fixed at fork)
+ * already cover a reboot: the old pid is gone or has a different start time.
+ * @param {object} [o]  test seams: {readFile, platform}
  */
-export function currentBootId({ readFile = fs.readFileSync, run = defaultRun, platform = process.platform, env = process.env } = {}) {
-  try { return readFile('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { /* not Linux */ }
-  if (platform !== 'darwin') return null;
-  try {
-    return parseKernBoottime(run('sysctl', ['-n', 'kern.boottime'], { ...env, ...NEUTRAL_ENV }));
-  } catch { return null; }
+export function currentBootId({ readFile = fs.readFileSync, platform = process.platform } = {}) {
+  if (platform !== 'linux') return null;
+  try { return readFile('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { return null; }
 }
 
 /** Parse a lock file: "<pid>\nstart=<s>\nboot=<b>\n" (older builds: just "<pid>\n"). */

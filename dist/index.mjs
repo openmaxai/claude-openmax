@@ -26272,10 +26272,6 @@ function parseLstartUtc(text) {
   const t = Date.UTC(Number(m[6]), MONTHS[m[1]], Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]));
   return Number.isFinite(t) ? String(t / 1e3) : null;
 }
-function parseKernBoottime(text) {
-  const m = String(text || "").match(/\bsec\s*=\s*(\d+)/);
-  return m ? m[1] : null;
-}
 function processStartTime(pid, { readFile = fs7.readFileSync, run = defaultRun, platform = process.platform, env = process.env } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
@@ -26290,14 +26286,10 @@ function processStartTime(pid, { readFile = fs7.readFileSync, run = defaultRun, 
     return null;
   }
 }
-function currentBootId({ readFile = fs7.readFileSync, run = defaultRun, platform = process.platform, env = process.env } = {}) {
+function currentBootId({ readFile = fs7.readFileSync, platform = process.platform } = {}) {
+  if (platform !== "linux") return null;
   try {
     return readFile("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
-  } catch {
-  }
-  if (platform !== "darwin") return null;
-  try {
-    return parseKernBoottime(run("sysctl", ["-n", "kern.boottime"], { ...env, ...NEUTRAL_ENV }));
   } catch {
     return null;
   }

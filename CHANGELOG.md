@@ -54,10 +54,11 @@ running, and without the gate both would hold the workspace connection.
   is moved aside, and a live lock moved by mistake is put back (or left in place,
   never deleted). The lock records pid + process start time + boot id, so a pid
   reused after a restart or reboot is recognised as stale (Linux: `/proc/<pid>/stat`
-  starttime + `boot_id`; macOS: `ps -o lstart` and the `sec` of `kern.boottime`,
-  both read with `LC_ALL=C TZ=UTC0` and compared as epoch seconds, so sessions with
-  different time zones or locales agree); when start time / boot id cannot be read
-  it falls back to pid liveness. Applies in `channel-only` mode
+  starttime + `boot_id`; macOS: `ps -o lstart` read with `LC_ALL=C TZ=UTC0` and
+  compared as epoch seconds, so sessions with different time zones or locales
+  agree). macOS has no boot-id check: `kern.boottime` moves whenever the clock is
+  adjusted, and pid + start time already catch a reboot. When the start time /
+  boot id cannot be read it falls back to pid liveness. Applies in `channel-only` mode
   too.
   A second channel-active session runs tools-only and is told so, instead of
   processing every message twice.

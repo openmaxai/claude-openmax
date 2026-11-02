@@ -10,7 +10,7 @@ import { utimesSync, readdirSync } from 'node:fs';
 import {
   resolveChannelActivation, argvLoadsChannel, acquireChannelLock, decideChannelRole,
   parseLock, holderIsLive, processStartTime, currentBootId,
-  parseProcStatStartTime, parseLstartUtc, parseKernBoottime,
+  parseProcStatStartTime, parseLstartUtc,
 } from '../src/channel-gate.js';
 import { ClaudeChannel } from '../src/channel.js';
 import { createInboundDelivery } from '../src/inbound-delivery.js';
@@ -314,12 +314,9 @@ test('real /proc: our own start time is stable while memory grows', () => {
   assert.ok(ballast.length > 0);
 });
 
-test('parseLstartUtc: C-locale lstart → epoch seconds; parseKernBoottime takes only sec', () => {
+test('parseLstartUtc: C-locale lstart → epoch seconds', () => {
   assert.equal(parseLstartUtc('Mon Nov  2 13:00:05 2026'), String(Date.UTC(2026, 10, 2, 13, 0, 5) / 1000));
   assert.equal(parseLstartUtc('lun.  2 nov. 2026 14:00:05'), null);
-  assert.equal(parseKernBoottime('{ sec = 1730000000, usec = 123456 } Mon Nov  2 13:00:00 2026'), '1730000000');
-  assert.equal(parseKernBoottime('{ sec = 1730000000, usec = 1 } lun.  2 nov. 2026 14:00:00'), '1730000000');
-  assert.equal(parseKernBoottime('nonsense'), null);
 });
 
 /** A fake `ps`/`sysctl` that formats ONE fixed instant according to the env it is given. */
@@ -354,8 +351,7 @@ test('macOS path: the same process observed from sessions with different TZ / lo
   const boots = envs.map((env) => currentBootId({ readFile: noProc, run, platform: 'darwin', env }));
   assert.ok(starts[0], 'parsed');
   assert.deepEqual(new Set(starts).size, 1, `start times differ: ${starts}`);
-  assert.deepEqual(new Set(boots).size, 1, `boot ids differ: ${boots}`);
-  assert.equal(boots[0], '1730000000');
+  assert.deepEqual(boots, [null, null, null], 'no boot id on macOS (kern.boottime follows the wall clock)');
   for (const c of seen) { assert.equal(c.env.LC_ALL, 'C'); assert.equal(c.env.TZ, 'UTC0'); }
   // and therefore a live lock written from one session is live for the other
   assert.equal(holderIsLive({ pid: 77, start: starts[0], boot: boots[0] }, {
@@ -377,5 +373,43 @@ test('real ps (procps here) with different caller TZ/LANG gives the same start t
 test('unparseable ps / sysctl output → null (pid-only fallback), never a bogus value', () => {
   const run = () => 'something else\n';
   assert.equal(processStartTime(77, { readFile: noProc, run, platform: 'darwin' }), null);
-  assert.equal(currentBootId({ readFile: noProc, run, platform: 'darwin' }), null);
+});
+
+// ── macOS: no boot-id comparison (kern.boottime drifts with clock adjustments) ─
+
+test('macOS: currentBootId is null and never shells out to sysctl', () => {
+  let ran = 0;
+  assert.equal(currentBootId({ readFile: () => { throw new Error('no /proc'); }, run: () => { ran++; return '{ sec = 1, usec = 0 }'; }, platform: 'darwin' }), null);
+  assert.equal(ran, 0);
+});
+
+test('macOS: boottime drift (±1 s, ±1 h) while the holder is alive → lock stays held', () => {
+  const dataDir = tmp();
+  // Holder: an older 1.3.1 build may have recorded kern.boottime sec as boot id.
+  for (const [recorded, label] of [['1730000000', 'old record'], ['', 'new record']]) {
+    writeFileSync(path.join(dataDir, 'channel.lock'), `500\nstart=1793629977\nboot=${recorded}\n`);
+    for (const drift of [-3600, -1, 1, 3600]) {
+      // what kern.boottime would read now after the clock moved by `drift`
+      const run = (cmd) => (cmd === 'sysctl' ? `{ sec = ${1730000000 + drift}, usec = 0 }` : 'Mon Nov  2 13:00:05 2026');
+      const bootId = currentBootId({ readFile: () => { throw new Error('no /proc'); }, run, platform: 'darwin' });
+      const r = acquireChannelLock({ dataDir, pid: 600, isAlive: (p) => p === 500, startTimeOf: (p) => (p === 500 ? '1793629977' : 'X'), bootId });
+      assert.equal(r.acquired, false, `${label}, drift ${drift}s: live holder must keep the lock`);
+      assert.equal(r.holderPid, 500);
+    }
+  }
+});
+
+test('macOS: after a real reboot the old holder pid is gone or has a different start time → stale', () => {
+  const info = { pid: 500, start: '1793629977', boot: null };
+  assert.equal(holderIsLive(info, { isAlive: () => false, startTimeOf: () => null, bootId: null }), false, 'pid gone');
+  assert.equal(holderIsLive(info, { isAlive: () => true, startTimeOf: () => '1800000000', bootId: null }), false, 'pid reused');
+});
+
+test('Linux: boot_id change → stale even though the pid runs with the same start ticks', () => {
+  const bootA = currentBootId({ readFile: () => 'aaaa-1111\n', platform: 'linux' });
+  const bootB = currentBootId({ readFile: () => 'bbbb-2222\n', platform: 'linux' });
+  assert.equal(bootA, 'aaaa-1111');
+  const info = { pid: 42, start: '987654', boot: bootA };
+  assert.equal(holderIsLive(info, { isAlive: () => true, startTimeOf: () => '987654', bootId: bootB }), false);
+  assert.equal(holderIsLive(info, { isAlive: () => true, startTimeOf: () => '987654', bootId: bootA }), true);
 });
