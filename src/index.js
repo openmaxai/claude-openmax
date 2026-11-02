@@ -78,7 +78,7 @@ async function main() {
   // runtime is built (immediately when the config already has an api_key).
   channel.registerTools(
     createMcpTools({ services: TOOL_STUB_SERVICES }).defs,
-    pendingToolHandler('OpenMax registration is still in progress — retry in a few seconds.'),
+    pendingToolHandler('OpenMax is waiting for this agent\'s API key (agent.api_key in the claude-openmax config). If you have not run the OpenMax onboarding command yet, run it; if it is running right now, retry in a few seconds.'),
   );
 
   // ── channel activation gate + single-instance lock ───────────────────────────

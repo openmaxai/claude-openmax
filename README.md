@@ -175,7 +175,8 @@ redelivery to the channel session.
 **Startup and network errors:** if the config has no `agent.api_key` yet when the
 server starts (the onboarding command is still registering), it waits up
 to 120 s for the key to appear instead of running the whole session on an empty key;
-the tools answer "registration in progress" meanwhile. Workspace HTTP calls time out
+the tools answer "waiting for the API key — run the onboarding command if you
+haven't" meanwhile. Workspace HTTP calls time out
 after 15 s waiting for a response, errors name the request and its cause
 (`fetch failed: POST /auth/ws-ticket → ECONNRESET`), and the token / ws-ticket calls
 are retried twice on network errors.

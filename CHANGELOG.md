@@ -20,7 +20,8 @@ The rest of Plane OPENM-1107 / cws-core#269 (the gating part shipped in 1.3.1).
   hook registered; since 1.3.1 the onboarding command does, possibly while a session
   is already starting); if it won the race, the TokenManager was built with an empty key and never re-read it, so the
   whole session stayed offline. With no usable key the server now advertises its
-  tools at once (they answer "registration in progress"), polls the config every
+  tools at once (they answer "waiting for the API key — run the onboarding command
+  if you haven't"), polls the config every
   2 s for up to 120 s, and builds the runtime and connects once the key lands.
   If it gives up, it releases `channel.lock`, so a later session is not locked out.
 - **"fetch failed" with no detail, and requests that could hang forever**

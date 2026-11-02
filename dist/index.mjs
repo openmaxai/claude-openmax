@@ -22110,7 +22110,7 @@ function hasUsableApiKey(config2) {
 }
 async function waitForApiKey({ initial, load = () => loadAdapterConfig(), intervalMs = 2e3, timeoutMs = 12e4, logger, cancelled = () => false } = {}) {
   if (hasUsableApiKey(initial)) return initial;
-  logger?.warn?.(`agent.api_key not set yet \u2014 waiting up to ${Math.round(timeoutMs / 1e3)}s for registration to write it (tools answer "registration in progress" meanwhile)`);
+  logger?.warn?.(`agent.api_key not set yet \u2014 waiting up to ${Math.round(timeoutMs / 1e3)}s for the onboarding to write it (tools answer "waiting for the API key" meanwhile)`);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline && !cancelled()) {
     await new Promise((r) => setTimeout(r, intervalMs));
@@ -26613,7 +26613,7 @@ async function main() {
   });
   channel.registerTools(
     createMcpTools({ services: TOOL_STUB_SERVICES }).defs,
-    pendingToolHandler("OpenMax registration is still in progress \u2014 retry in a few seconds.")
+    pendingToolHandler("OpenMax is waiting for this agent's API key (agent.api_key in the claude-openmax config). If you have not run the OpenMax onboarding command yet, run it; if it is running right now, retry in a few seconds.")
   );
   const activation = resolveChannelActivation();
   let channelLock = null;

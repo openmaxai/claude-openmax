@@ -201,7 +201,7 @@ export function hasUsableApiKey(config) {
  */
 export async function waitForApiKey({ initial, load = () => loadAdapterConfig(), intervalMs = 2000, timeoutMs = 120_000, logger, cancelled = () => false } = {}) {
   if (hasUsableApiKey(initial)) return initial;
-  logger?.warn?.(`agent.api_key not set yet — waiting up to ${Math.round(timeoutMs / 1000)}s for registration to write it (tools answer "registration in progress" meanwhile)`);
+  logger?.warn?.(`agent.api_key not set yet — waiting up to ${Math.round(timeoutMs / 1000)}s for the onboarding to write it (tools answer "waiting for the API key" meanwhile)`);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline && !cancelled()) {
     await new Promise((r) => setTimeout(r, intervalMs));

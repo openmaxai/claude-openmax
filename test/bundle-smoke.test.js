@@ -188,15 +188,18 @@ test('startup race: a key written after the server started is picked up (no rest
   child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}\n');
   child.stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"core","arguments":{"method":"me"}}}\n');
   try {
-    await waitFor(() => /registration is still in progress/.test(out), 10000, () => `stdout:\n${out}\nstderr:\n${err}`);
+    await waitFor(() => /waiting for this agent.s API key/.test(out), 10000, () => `stdout:\n${out}\nstderr:\n${err}`);
+    assert.match(out, /If you have not run the OpenMax onboarding command yet, run it/, 'tells the user what to do');
+    assert.ok(!/registration is still in progress/.test(out), 'the hook no longer registers, so do not claim a registration is running');
     writeFileSync(cfgPath, JSON.stringify({ enabled: false, server: { bff_url: 'http://127.0.0.1:9' }, agent: { api_key: 'cwsk_written_later' }, orgs: {} }));
     await waitFor(() => /agent\.api_key found — continuing startup/.test(err), 10000, () => err);
     await waitFor(() => /runtime ready/.test(err), 10000, () => err);
     // The real handler is now in place: the same call reaches the network
-    // (closed port) instead of answering "registration in progress".
+    // (closed port) instead of answering "waiting for the API key".
     child.stdin.write('{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"core","arguments":{"method":"me"}}}\n');
     await waitFor(() => out.split('\n').some((l) => l.includes('"id":3')), 15000, () => `stdout:\n${out}\nstderr:\n${err}`);
     const reply = out.split('\n').find((l) => l.includes('"id":3'));
+    assert.ok(!/waiting for this agent.s API key/.test(reply), reply);
     assert.ok(!/registration is still in progress/.test(reply), reply);
     assert.match(reply, /fetch failed: GET \/api\/v1\/me → \S/, `guarded fetch names path + cause: ${reply}`);
   } finally {
