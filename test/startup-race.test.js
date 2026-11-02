@@ -61,3 +61,19 @@ test('buildRuntime routes SDK token requests through the injected (guarded) fetc
   await rt.tokenManager.exchange('').catch(() => {});
   assert.ok(urls.some((u) => u.endsWith('/auth/agent/token')), `token exchange should use the injected fetch; saw ${urls.join(', ')}`);
 });
+
+test('buildRuntime routes CwsHttpClient (REST/tool) requests through the injected fetch too', async () => {
+  const urls = [];
+  const fetchImpl = async (url) => {
+    urls.push(String(url));
+    const body = String(url).endsWith('/auth/agent/token')
+      ? { data: { access_token: 'eyJ.x.y', expires_in: 3600 } }
+      : { data: { id: 'me' } };
+    return { ok: true, status: 200, headers: new Map(), async text() { return JSON.stringify(body); } };
+  };
+  const config = normalizeConfig({ server: { bff_url: 'https://core.test' }, agent: { api_key: 'cwsk_k' }, orgs: {} });
+  const storage = { async get() { return null; }, async set() {} };
+  const rt = buildRuntime({ config, file: '/dev/null', storage, logger: { info() {}, warn() {}, error() {}, log() {}, debug() {} }, fetchImpl });
+  await rt.http.get(rt.http.apiPath('/me')).catch(() => {});
+  assert.ok(urls.some((u) => /\/me$/.test(u) && !u.includes('/auth/')), `REST call should use the injected fetch; saw ${urls.join(', ')}`);
+});

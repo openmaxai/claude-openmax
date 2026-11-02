@@ -93,7 +93,7 @@ test('channelNoticeMeta: carries routing ids, omits sender when absent', () => {
   assert.equal('openmax_sender_id' in meta, false);
 });
 
-// ── OPENM-1107 parse fixes ────────────────────────────────────────────────────
+// ── thread endpoint + attachment preview ────────────────────────────────────────────────────
 
 const THREAD_EP = 'conv1|thread:th9|parent:msg0';
 

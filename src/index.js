@@ -104,7 +104,7 @@ async function main() {
   } else if (channelLock) {
     logger.info(`channel active (source=${activation.source}); holding ${channelLock.path}`);
   }
-  if (channelLock) process.once('exit', () => channelLock.release());
+  if (channelLock) process.once('exit', () => channelLock?.release());
 
   const notifier = new DebouncedWakeNotifier({
     notify: (wakes) => channel.notifyWake(wakes),
@@ -160,11 +160,21 @@ async function main() {
     );
   }
 
-  // ── startup race (OPENM-1107 P2): build only once a key exists ──────────────
-  const config = await waitForApiKey({ initial: initialConfig, logger, cancelled: () => shuttingDown });
+  // ── startup race: build only once a key exists ─────────────────────────────
+  // CLAUDE_OPENMAX_KEY_WAIT_MS: test seam only (default 120s).
+  const keyWaitMs = Number(process.env.CLAUDE_OPENMAX_KEY_WAIT_MS) > 0 ? Number(process.env.CLAUDE_OPENMAX_KEY_WAIT_MS) : undefined;
+  const config = await waitForApiKey({ initial: initialConfig, logger, cancelled: () => shuttingDown, ...(keyWaitMs ? { timeoutMs: keyWaitMs } : {}) });
   if (!config) {
     if (shuttingDown) return;
     logger.error('agent.api_key is still not set — OpenMax stays offline in this session. Run the onboarding again, then restart Claude Code.');
+    // Give the channel up: a session that will never connect must not keep
+    // every later session locked out (they would all report "lock busy").
+    if (channelLock) {
+      channelLock.release();
+      channelLock = null;
+      channel.setDeliveryEnabled(false, 'not registered');
+      logger.info('channel lock released (not registered)');
+    }
     channel.registerTools(
       createMcpTools({ services: TOOL_STUB_SERVICES }).defs,
       pendingToolHandler('OpenMax is not registered on this machine (no agent.api_key). Re-run the OpenMax onboarding, then restart Claude Code.'),
@@ -220,6 +230,7 @@ async function main() {
     logger,
   });
   channel.registerTools(tools.defs, tools.handler);
+  logger.info(`runtime ready (ws=${bridge && wsEnabled ? 'on' : 'off'})`);
 
   if (bridge && wsEnabled && !shuttingDown) {
     // Belt-and-suspenders for the org-keyed token cache bug: if agent.api_key

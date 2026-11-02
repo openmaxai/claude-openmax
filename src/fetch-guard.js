@@ -1,5 +1,5 @@
 /**
- * Guarded fetch for the SDK's TokenManager + CwsHttpClient (OPENM-1107).
+ * Guarded fetch for the SDK's TokenManager + CwsHttpClient.
  *
  * The SDK uses native fetch with no timeout, and undici reports every
  * network-layer failure as the bare message "fetch failed" with the real reason

@@ -26633,7 +26633,7 @@ async function main() {
   } else if (channelLock) {
     logger.info(`channel active (source=${activation.source}); holding ${channelLock.path}`);
   }
-  if (channelLock) process.once("exit", () => channelLock.release());
+  if (channelLock) process.once("exit", () => channelLock?.release());
   const notifier = new DebouncedWakeNotifier({
     notify: (wakes) => channel.notifyWake(wakes),
     debounceMs
@@ -26689,10 +26689,17 @@ async function main() {
       `OpenMax: another Claude Code session is already connected to the workspace channel${lockBusy.holderPid ? ` (pid ${lockBusy.holderPid})` : ""}. This session will NOT receive workspace messages; the OpenMax tools (comm_send, tm, kb, ...) still work here. Close the other session and restart this one to move the channel here.`
     );
   }
-  const config2 = await waitForApiKey({ initial: initialConfig, logger, cancelled: () => shuttingDown });
+  const keyWaitMs = Number(process.env.CLAUDE_OPENMAX_KEY_WAIT_MS) > 0 ? Number(process.env.CLAUDE_OPENMAX_KEY_WAIT_MS) : void 0;
+  const config2 = await waitForApiKey({ initial: initialConfig, logger, cancelled: () => shuttingDown, ...keyWaitMs ? { timeoutMs: keyWaitMs } : {} });
   if (!config2) {
     if (shuttingDown) return;
     logger.error("agent.api_key is still not set \u2014 OpenMax stays offline in this session. Run the onboarding again, then restart Claude Code.");
+    if (channelLock) {
+      channelLock.release();
+      channelLock = null;
+      channel.setDeliveryEnabled(false, "not registered");
+      logger.info("channel lock released (not registered)");
+    }
     channel.registerTools(
       createMcpTools({ services: TOOL_STUB_SERVICES }).defs,
       pendingToolHandler("OpenMax is not registered on this machine (no agent.api_key). Re-run the OpenMax onboarding, then restart Claude Code.")
@@ -26741,6 +26748,7 @@ async function main() {
     logger
   });
   channel.registerTools(tools.defs, tools.handler);
+  logger.info(`runtime ready (ws=${bridge && wsEnabled ? "on" : "off"})`);
   if (bridge && wsEnabled && !shuttingDown) {
     const orgIds = runtime.orgConfigs.map((o) => o.org_id);
     await guardStaleTokenCache({ storage, orgIds, apiKey: config2.agent.api_key, logger });

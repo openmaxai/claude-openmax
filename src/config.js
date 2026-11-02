@@ -181,7 +181,7 @@ export function hasUsableApiKey(config) {
 }
 
 /**
- * Wait until the config has a usable api_key (OPENM-1107 startup race).
+ * Wait until the config has a usable api_key (startup race with registration).
  *
  * The MCP server reads its config once at startup, while the SessionStart hook
  * may be registering the agent at the same moment. A server that built its

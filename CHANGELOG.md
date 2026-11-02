@@ -21,6 +21,7 @@ The rest of Plane OPENM-1107 / cws-core#269 (the gating part shipped in 1.3.1).
   whole session stayed offline. With no usable key the server now advertises its
   tools at once (they answer "registration in progress"), polls the config every
   2 s for up to 120 s, and builds the runtime and connects once the key lands.
+  If it gives up, it releases `channel.lock`, so a later session is not locked out.
 - **"fetch failed" with no detail, and requests that could hang forever**
   (`src/fetch-guard.js`, injected into the SDK `TokenManager` + `CwsHttpClient`).
   15 s time-to-headers timeout for JSON API calls (uploads exempt); errors now read

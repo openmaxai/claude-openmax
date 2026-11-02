@@ -67,3 +67,11 @@ test('fetchCause prefers cause.code', () => {
   assert.equal(fetchCause(netErr('ENOTFOUND')), 'ENOTFOUND');
   assert.equal(fetchCause(new Error('plain')), 'plain');
 });
+
+test('message sends (comm_send → POST /conversations/<id>/messages) are never retried, even on timeout', async () => {
+  let n = 0;
+  const hang = (url, init) => { n++; return new Promise((_r, rej) => init.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })))); };
+  const f = createGuardedFetch({ baseFetch: hang, timeoutMs: 10, retryDelayMs: 1 });
+  await assert.rejects(() => f('https://core.test/api/v1/conversations/c1/messages', { method: 'POST', body: '{}' }), (e) => e.name === 'TimeoutError');
+  assert.equal(n, 1);
+});
