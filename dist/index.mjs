@@ -26253,30 +26253,51 @@ function pidAlive(pid) {
     return e.code === "EPERM";
   }
 }
-function processStartTime(pid) {
+var NEUTRAL_ENV = { LC_ALL: "C", LANG: "C", TZ: "UTC0" };
+function defaultRun(cmd, args, env) {
+  return execFileSync(cmd, args, { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"], env });
+}
+function parseProcStatStartTime(statText) {
+  if (typeof statText !== "string") return null;
+  const close = statText.lastIndexOf(")");
+  if (close < 0) return null;
+  const fields = statText.slice(close + 2).trim().split(/\s+/);
+  const v = fields[19];
+  return v && /^\d+$/.test(v) ? v : null;
+}
+var MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+function parseLstartUtc(text) {
+  const m = String(text || "").trim().match(/^[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})\s+(\d{4})$/);
+  if (!m || !(m[1] in MONTHS)) return null;
+  const t = Date.UTC(Number(m[6]), MONTHS[m[1]], Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]));
+  return Number.isFinite(t) ? String(t / 1e3) : null;
+}
+function parseKernBoottime(text) {
+  const m = String(text || "").match(/\bsec\s*=\s*(\d+)/);
+  return m ? m[1] : null;
+}
+function processStartTime(pid, { readFile = fs7.readFileSync, run = defaultRun, platform = process.platform, env = process.env } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
-    const stat = fs7.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    return rest[19] || null;
+    const v = parseProcStatStartTime(readFile(`/proc/${pid}/stat`, "utf8"));
+    if (v) return v;
   } catch {
   }
-  if (process.platform === "win32" || process.platform === "linux") return null;
+  if (platform === "win32" || platform === "linux") return null;
   try {
-    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"] }).trim();
-    return out || null;
+    return parseLstartUtc(run("ps", ["-o", "lstart=", "-p", String(pid)], { ...env, ...NEUTRAL_ENV }));
   } catch {
     return null;
   }
 }
-function currentBootId() {
+function currentBootId({ readFile = fs7.readFileSync, run = defaultRun, platform = process.platform, env = process.env } = {}) {
   try {
-    return fs7.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
+    return readFile("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
   } catch {
   }
-  if (process.platform !== "darwin") return null;
+  if (platform !== "darwin") return null;
   try {
-    return execFileSync("sysctl", ["-n", "kern.boottime"], { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
+    return parseKernBoottime(run("sysctl", ["-n", "kern.boottime"], { ...env, ...NEUTRAL_ENV }));
   } catch {
     return null;
   }

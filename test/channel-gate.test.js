@@ -10,6 +10,7 @@ import { utimesSync, readdirSync } from 'node:fs';
 import {
   resolveChannelActivation, argvLoadsChannel, acquireChannelLock, decideChannelRole,
   parseLock, holderIsLive, processStartTime, currentBootId,
+  parseProcStatStartTime, parseLstartUtc, parseKernBoottime,
 } from '../src/channel-gate.js';
 import { ClaudeChannel } from '../src/channel.js';
 import { createInboundDelivery } from '../src/inbound-delivery.js';
@@ -283,4 +284,98 @@ test('the real identity readers work on this platform (or return null, never thr
   assert.ok(b === null || typeof b === 'string');
   const rec = parseLock(`${process.pid}\nstart=${st || ''}\nboot=${b || ''}\n`);
   assert.equal(holderIsLive(rec), true);
+});
+
+// ── start time / boot id are locale- and timezone-independent ─────────────────
+
+// Fixture: comm with spaces + parens; fields 22 (starttime) and 23 (vsize) distinct.
+const STAT = '4242 (my (weird) proc) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 '
+  + '987654 123456789 2048 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0';
+
+test('parseProcStatStartTime returns exactly field 22 (starttime), not vsize (23) or rss (24)', () => {
+  assert.equal(parseProcStatStartTime(STAT), '987654');
+  assert.equal(parseProcStatStartTime('garbage'), null);
+});
+
+test('Linux path: holder memory growth (vsize/rss change) keeps the lock valid', () => {
+  const grown = STAT.replace(' 987654 123456789 2048 ', ' 987654 999999999 9999 ');
+  const readFile = (f) => { if (f.endsWith('/stat')) return calls++ === 0 ? STAT : grown; throw new Error('ENOENT'); };
+  let calls = 0;
+  const a = processStartTime(4242, { readFile, platform: 'linux' });
+  const b = processStartTime(4242, { readFile, platform: 'linux' });
+  assert.equal(a, b);
+  assert.equal(holderIsLive({ pid: 4242, start: a, boot: null }, { isAlive: () => true, startTimeOf: () => b, bootId: null }), true);
+});
+
+test('real /proc: our own start time is stable while memory grows', () => {
+  const before = processStartTime(process.pid);
+  const ballast = Buffer.alloc(64 * 1024 * 1024, 1); // grow vsize/rss
+  assert.equal(processStartTime(process.pid), before);
+  assert.ok(ballast.length > 0);
+});
+
+test('parseLstartUtc: C-locale lstart → epoch seconds; parseKernBoottime takes only sec', () => {
+  assert.equal(parseLstartUtc('Mon Nov  2 13:00:05 2026'), String(Date.UTC(2026, 10, 2, 13, 0, 5) / 1000));
+  assert.equal(parseLstartUtc('lun.  2 nov. 2026 14:00:05'), null);
+  assert.equal(parseKernBoottime('{ sec = 1730000000, usec = 123456 } Mon Nov  2 13:00:00 2026'), '1730000000');
+  assert.equal(parseKernBoottime('{ sec = 1730000000, usec = 1 } lun.  2 nov. 2026 14:00:00'), '1730000000');
+  assert.equal(parseKernBoottime('nonsense'), null);
+});
+
+/** A fake `ps`/`sysctl` that formats ONE fixed instant according to the env it is given. */
+function fakeRunner(seen) {
+  const instant = new Date(Date.UTC(2026, 10, 2, 13, 0, 5));
+  const fmt = (env) => {
+    if (env.LC_ALL !== 'C' || env.TZ !== 'UTC0') {
+      // what an un-neutralised ps would print: local TZ + locale
+      return env.LANG?.startsWith('fr') ? 'lun.  2 nov. 2026 22:00:05' : 'Mon Nov  2 08:00:05 2026';
+    }
+    return instant.toUTCString().replace(/^(\w{3}), (\d{2}) (\w{3}) (\d{4}) (\S+) GMT$/, (_, d, dd, mon, y, t) => `${d} ${mon} ${String(Number(dd)).padStart(2)} ${t} ${y}`);
+  };
+  return (cmd, args, env) => {
+    seen.push({ cmd, env });
+    if (cmd === 'ps') return `${fmt(env)}\n`;
+    if (cmd === 'sysctl') return `{ sec = 1730000000, usec = 42 } ${fmt(env)}\n`;
+    throw new Error('unexpected');
+  };
+}
+
+const noProc = () => { throw new Error('ENOENT'); };
+
+test('macOS path: the same process observed from sessions with different TZ / locale compares equal', () => {
+  const seen = [];
+  const run = fakeRunner(seen);
+  const envs = [
+    { TZ: 'America/New_York', LANG: 'en_US.UTF-8' },
+    { TZ: 'Asia/Tokyo', LANG: 'fr_FR.UTF-8', LC_ALL: 'fr_FR.UTF-8' },
+    { LC_TIME: 'de_DE.UTF-8' },
+  ];
+  const starts = envs.map((env) => processStartTime(77, { readFile: noProc, run, platform: 'darwin', env }));
+  const boots = envs.map((env) => currentBootId({ readFile: noProc, run, platform: 'darwin', env }));
+  assert.ok(starts[0], 'parsed');
+  assert.deepEqual(new Set(starts).size, 1, `start times differ: ${starts}`);
+  assert.deepEqual(new Set(boots).size, 1, `boot ids differ: ${boots}`);
+  assert.equal(boots[0], '1730000000');
+  for (const c of seen) { assert.equal(c.env.LC_ALL, 'C'); assert.equal(c.env.TZ, 'UTC0'); }
+  // and therefore a live lock written from one session is live for the other
+  assert.equal(holderIsLive({ pid: 77, start: starts[0], boot: boots[0] }, {
+    isAlive: () => true,
+    startTimeOf: (p) => processStartTime(p, { readFile: noProc, run, platform: 'darwin', env: envs[1] }),
+    bootId: boots[2],
+  }), true);
+});
+
+test('real ps (procps here) with different caller TZ/LANG gives the same start time', () => {
+  const st = (env) => processStartTime(process.pid, { readFile: noProc, platform: 'darwin', env: { ...process.env, ...env } });
+  const a = st({ TZ: 'America/New_York', LANG: 'en_US.UTF-8' });
+  if (a === null) return; // no ps on this machine — covered by the fake-runner test
+  assert.equal(st({ TZ: 'Asia/Tokyo', LC_ALL: 'de_DE.UTF-8' }), a);
+  assert.equal(st({ TZ: 'UTC' }), a);
+  assert.ok(Math.abs(Number(a) - Date.now() / 1000) < 3600, 'epoch seconds near now');
+});
+
+test('unparseable ps / sysctl output → null (pid-only fallback), never a bogus value', () => {
+  const run = () => 'something else\n';
+  assert.equal(processStartTime(77, { readFile: noProc, run, platform: 'darwin' }), null);
+  assert.equal(currentBootId({ readFile: noProc, run, platform: 'darwin' }), null);
 });

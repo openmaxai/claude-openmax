@@ -89,33 +89,79 @@ export function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
+// Locale/timezone-independent environment for the `ps` / `sysctl` fallbacks:
+// `ps -o lstart` formats with setlocale(LC_ALL,"") + strftime("%c", localtime())
+// and `sysctl kern.boottime` appends ctime(), so two sessions with different
+// TZ/LANG/LC_* would otherwise print the SAME instant differently and judge a
+// live lock stale. Values are additionally reduced to epoch seconds.
+const NEUTRAL_ENV = { LC_ALL: 'C', LANG: 'C', TZ: 'UTC0' };
+
+function defaultRun(cmd, args, env) {
+  return execFileSync(cmd, args, { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'], env });
+}
+
 /**
- * Start time of `pid` as an opaque string, or null when it cannot be read.
- * Linux: field 22 of /proc/<pid>/stat (clock ticks since boot; readable for other
- * users' processes too). Elsewhere: `ps -o lstart= -p <pid>`.
+ * Field 22 (starttime, clock ticks since boot) of a /proc/<pid>/stat line.
+ * comm (field 2) may contain spaces and parentheses, so fields are counted
+ * after the LAST ')': state is field 3 → starttime is index 22 - 3 = 19.
  */
-export function processStartTime(pid) {
+export function parseProcStatStartTime(statText) {
+  if (typeof statText !== 'string') return null;
+  const close = statText.lastIndexOf(')');
+  if (close < 0) return null;
+  const fields = statText.slice(close + 2).trim().split(/\s+/);
+  const v = fields[19];
+  return v && /^\d+$/.test(v) ? v : null;
+}
+
+const MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+
+/**
+ * `ps -o lstart=` under LC_ALL=C TZ=UTC0 ("Mon Nov  2 13:00:00 2026") → epoch
+ * seconds as a string; null if unparseable.
+ */
+export function parseLstartUtc(text) {
+  const m = String(text || '').trim().match(/^[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})\s+(\d{4})$/);
+  if (!m || !(m[1] in MONTHS)) return null;
+  const t = Date.UTC(Number(m[6]), MONTHS[m[1]], Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]));
+  return Number.isFinite(t) ? String(t / 1000) : null;
+}
+
+/** `sysctl -n kern.boottime` ("{ sec = 1730000000, usec = 1 } Mon …") → "1730000000"; null otherwise. */
+export function parseKernBoottime(text) {
+  const m = String(text || '').match(/\bsec\s*=\s*(\d+)/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Start time of `pid` as a locale/TZ-independent string, or null when unknown.
+ * Linux: /proc/<pid>/stat field 22 (readable for other users' processes too).
+ * Elsewhere: `ps -o lstart=` run with LC_ALL=C TZ=UTC0, reduced to epoch seconds.
+ * @param {number} pid
+ * @param {object} [o]  test seams: {readFile, run, platform, env}
+ */
+export function processStartTime(pid, { readFile = fs.readFileSync, run = defaultRun, platform = process.platform, env = process.env } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    // comm (field 2) may contain spaces/parens — fields after the LAST ')' are
-    // state (3), ppid (4), … starttime (22) → index 19.
-    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    return rest[19] || null;
+    const v = parseProcStatStartTime(readFile(`/proc/${pid}/stat`, 'utf8'));
+    if (v) return v;
   } catch { /* not Linux / gone */ }
-  if (process.platform === 'win32' || process.platform === 'linux') return null;
+  if (platform === 'win32' || platform === 'linux') return null;
   try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    return out || null;
+    return parseLstartUtc(run('ps', ['-o', 'lstart=', '-p', String(pid)], { ...env, ...NEUTRAL_ENV }));
   } catch { return null; }
 }
 
-/** Identifier of the current boot, or null. Linux: boot_id; macOS: kern.boottime. */
-export function currentBootId() {
-  try { return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { /* not Linux */ }
-  if (process.platform !== 'darwin') return null;
+/**
+ * Identifier of the current boot, or null. Linux: boot_id. macOS: the `sec`
+ * value of kern.boottime (epoch seconds; the ctime() tail is ignored).
+ * @param {object} [o]  test seams: {readFile, run, platform, env}
+ */
+export function currentBootId({ readFile = fs.readFileSync, run = defaultRun, platform = process.platform, env = process.env } = {}) {
+  try { return readFile('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { /* not Linux */ }
+  if (platform !== 'darwin') return null;
   try {
-    return execFileSync('sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
+    return parseKernBoottime(run('sysctl', ['-n', 'kern.boottime'], { ...env, ...NEUTRAL_ENV }));
   } catch { return null; }
 }
 
