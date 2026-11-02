@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { ensureRegistered, resolveConfigPath, registerAndAccept, describeOutcome, describeFetchError } from '../hooks/auto-register.js';
+import { ensureRegistered, resolveConfigPath, registerAndAccept, describeOutcome, describeFetchError, isRetryable } from '../hooks/auto-register.js';
 
 function seedConfig(overrides = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'claude-openmax-reg-'));
@@ -259,7 +259,7 @@ test('invite is NOT cleared when acceptance fails (so it retries next session)',
   assert.deepEqual(JSON.parse(readFileSync(cfgPath, 'utf8')).invite, { invitation_id: 'inv-f', token: 'tok-f' }, 'invite retained on failure');
 });
 
-// ── structured outcome + retries (OPENM-1106) ─────────────────────────────────
+// ── structured outcome + retries ─────────────────────────────────
 
 test('registerAndAccept reports failed (not "no-op") when registration fails, with step + reason', async () => {
   const cfgPath = seedConfig();
@@ -270,12 +270,12 @@ test('registerAndAccept reports failed (not "no-op") when registration fails, wi
   assert.match(describeOutcome(res), /^FAILED: POST \/auth\/register\/agent → HTTP 500/);
 });
 
-test('registerAndAccept retries 5xx and network errors when retries > 0, then succeeds', async () => {
+test('register retries only provably-unsent failures (connection refused, 503), then succeeds', async () => {
   const cfgPath = seedConfig();
   let n = 0;
   const res = await runWith(cfgPath, () => withFetch((url) => {
     n++;
-    if (n === 1) { const e = new TypeError('fetch failed'); e.cause = { code: 'ECONNRESET' }; throw e; }
+    if (n === 1) { const e = new TypeError('fetch failed'); e.cause = { code: 'ECONNREFUSED' }; throw e; }
     if (n === 2) return jsonRes(503, {});
     return jsonRes(200, { identity_id: 'id-r', api_key: 'cwsk_r' });
   }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
@@ -323,9 +323,10 @@ test('error excerpts are secret-scrubbed', async () => {
   assert.ok(!res.reason.includes('cwsk_leaky'), res.reason);
 });
 
-test('describeFetchError: abort → "timed out"; cause code appended', () => {
+test('describeFetchError: per-request timeout, budget abort, cause code appended', () => {
   const abort = new Error('x'); abort.name = 'AbortError';
-  assert.equal(describeFetchError(abort), 'timed out');
+  assert.equal(describeFetchError(abort), 'timed out (total budget exhausted)');
+  assert.equal(describeFetchError(Object.assign(new Error('timed out after 5ms'), { name: 'TimeoutError' })), 'timed out after 5ms');
   const e = new TypeError('fetch failed'); e.cause = { code: 'ENOTFOUND' };
   assert.equal(describeFetchError(e), 'fetch failed (ENOTFOUND)');
 });
@@ -346,4 +347,71 @@ test('standalone CLI: exits 0 with a real no-op message when already registered'
   const r = runCli(cfgPath);
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stderr, /no-op \(already registered, no invitation pending\)/);
+});
+
+// ── register must never create an orphan identity; per-request timeouts ──────
+
+const netErr = (code) => Object.assign(new TypeError('fetch failed'), { cause: { code } });
+
+test('register: a dropped connection after the server may have created the identity is NOT retried', async () => {
+  // Server-side: identity created, then the connection resets before the response.
+  const cfgPath = seedConfig();
+  let created = 0;
+  const res = await runWith(cfgPath, () => withFetch((url) => {
+    if (url.endsWith('/auth/register/agent')) { created++; throw netErr('ECONNRESET'); }
+    return jsonRes(404, {});
+  }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
+  assert.equal(created, 1, 'exactly one register call — a retry would orphan the first identity');
+  assert.equal(res.status, 'failed');
+  assert.match(res.reason, /ECONNRESET.*may already have created an identity/);
+});
+
+test('register: HTTP 500 / 502 / 504 are not retried (may have been processed)', async () => {
+  for (const status of [500, 502, 504]) {
+    const cfgPath = seedConfig();
+    let n = 0;
+    const res = await runWith(cfgPath, () => withFetch(() => { n++; return jsonRes(status, {}); }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
+    assert.equal(n, 1, `HTTP ${status}`);
+    assert.equal(res.status, 'failed');
+  }
+});
+
+const hangUntilAbort = (url, opts) => new Promise((_r, rej) => opts.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+
+test('register: a hung request times out per request (not the whole budget) and is not retried', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const t0 = Date.now();
+  const res = await runWith(cfgPath, () => withFetch((url, opts) => { n++; return hangUntilAbort(url, opts); },
+    () => registerAndAccept({ retries: 3, backoffMs: [1], requestTimeoutMs: 40, deadlineMs: 5000 })));
+  assert.equal(n, 1);
+  assert.ok(Date.now() - t0 < 2000, 'returned at the per-request timeout, long before the 5s budget');
+  assert.match(res.reason, /^timed out after 40ms/);
+});
+
+test('token exchange: a hung first request times out per request and the retry succeeds within the budget', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' }, invite: { invitation_id: 'inv-t', token: 'tok-t' } });
+  let tokCalls = 0;
+  const res = await runWith(cfgPath, () => withFetch((url, opts) => {
+    if (url.endsWith('/auth/agent/token')) return ++tokCalls === 1 ? hangUntilAbort(url, opts) : jsonRes(200, { access_token: 'a' });
+    if (url.includes('/invitations/inv-t/accept')) return jsonRes(200, {});
+    return jsonRes(404, {});
+  }, () => registerAndAccept({ retries: 3, backoffMs: [1], requestTimeoutMs: 40, deadlineMs: 5000 })));
+  assert.equal(tokCalls, 2);
+  assert.equal(res.status, 'changed');
+  assert.equal(res.inviteAccepted, true);
+});
+
+test('isRetryable policy table', () => {
+  assert.equal(isRetryable('not-idempotent', { error: netErr('ECONNREFUSED') }), true);
+  assert.equal(isRetryable('not-idempotent', { error: netErr('ENOTFOUND') }), true);
+  assert.equal(isRetryable('not-idempotent', { error: netErr('ECONNRESET') }), false);
+  assert.equal(isRetryable('not-idempotent', { error: Object.assign(new Error('t'), { name: 'TimeoutError' }) }), false);
+  assert.equal(isRetryable('not-idempotent', { status: 503 }), true);
+  assert.equal(isRetryable('not-idempotent', { status: 429 }), true);
+  assert.equal(isRetryable('not-idempotent', { status: 500 }), false);
+  assert.equal(isRetryable('idempotent', { error: netErr('ECONNRESET') }), true);
+  assert.equal(isRetryable('idempotent', { status: 502 }), true);
+  assert.equal(isRetryable('idempotent', { status: 404 }), false);
+  assert.equal(isRetryable('idempotent', { error: Object.assign(new Error('x'), { name: 'AbortError' }) }), false);
 });

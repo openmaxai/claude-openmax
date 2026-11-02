@@ -18,8 +18,10 @@ running, and without the gate both would hold the workspace connection.
 ### Added
 
 - **`scripts/onboard.js`** — one command for the invitation prompt: write the
-  config from stdin (0600), register + accept the invitation (45 s budget, 3
-  retries on network errors / 5xx), append the OpenMax tool rules to
+  config from stdin (0600), register + accept the invitation (per-request
+  timeouts under a 45 s total budget; up to 3 retries — for registration only on
+  failures that prove no identity was created, i.e. connection never established
+  or HTTP 503/429, so a retry can never leave an orphan identity), append the OpenMax tool rules to
   `permissions.allow` in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`
   (append-only, backup first, corrupt JSON refused), self-check, and with
   `--launch` start `CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax`
@@ -27,7 +29,12 @@ running, and without the gate both would hold the workspace connection.
   command without tmux). Prints `ONBOARD OK` … `RESTART_COMMAND: …` or
   `ONBOARD FAILED: <step>: <reason>`; exit 0 / 1 / 2. Idempotent: a re-run keeps
   the existing registration, does not duplicate rules and reuses the tmux window.
-  Nothing is launched after any failure, and no dialog is ever answered for the user.
+  A running `openmax` window/session is NOT reused when this run registered a new
+  identity or replaced the config (it would still hold the old key): the script
+  prints `LAUNCH: manual` and asks the user to close it first, and never kills it.
+  `settings.json` is replaced atomically (temp file + rename, mode kept, 0600
+  backup). Nothing is launched after any failure, and no dialog is ever answered
+  for the user.
 - Allowed tools: `comm`, `comm_send`, `tm`, `kb`, `core`. `as` and `conn` still
   prompt per call.
 - README **Security** section: what is installed, files written, endpoints called,
@@ -41,7 +48,10 @@ running, and without the gate both would hold the workspace connection.
   its pushes. The WS now opens only with `CLAUDE_OPENMAX_CHANNEL=1` (fallback when
   unset: the parent `claude` argv carries the channel flag for this plugin); other
   sessions keep every tool.
-- **Single instance:** `<data dir>/channel.lock` (pid, O_EXCL, stale lock taken over).
+- **Single instance:** `<data dir>/channel.lock`, created atomically (pid written to
+  a temp file, then hard-linked into place, so it is never seen empty); a stale lock
+  is renamed aside before takeover so only one contender can win. Applies in
+  `channel-only` mode too.
   A second channel-active session runs tools-only and is told so, instead of
   processing every message twice.
 - **No false delivery ack:** a session that may not deliver refuses the wake

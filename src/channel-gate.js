@@ -1,5 +1,5 @@
 /**
- * Channel activation gate + single-instance lock (OPENM-1107).
+ * Channel activation gate + single-instance lock.
  *
  * Claude Code starts this plugin's MCP server in EVERY session — a plain
  * `claude`, a `claude -p`, an IDE session — but it only delivers
@@ -78,6 +78,9 @@ export function resolveChannelActivation({ env = process.env, parentArgv = readP
   return { active: false, source: 'none' };
 }
 
+// A lock file without a pid younger than this is treated as held, not stale.
+const LOCK_GRACE_MS = 5000;
+
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
@@ -85,6 +88,13 @@ function pidAlive(pid) {
 
 /**
  * Take the single-instance channel lock. Never throws.
+ *
+ * Atomic: the pid is written to a private temp file first and then hard-linked
+ * to `channel.lock` (link fails with EEXIST if the lock exists), so the lock
+ * file is never observable empty or half-written. A stale lock (holder pid gone)
+ * is taken over by RENAMING it away first — only one contender can win that
+ * rename — and the renamed file is re-checked: if it turns out to hold a live
+ * pid (someone else took over in between), it is put back and we report busy.
  *
  * @param {object} opts
  * @param {string} opts.dataDir
@@ -95,33 +105,75 @@ function pidAlive(pid) {
  */
 export function acquireChannelLock({ dataDir, pid = process.pid, isAlive = pidAlive }) {
   const lockPath = path.join(dataDir, 'channel.lock');
-  try { fs.mkdirSync(dataDir, { recursive: true }); } catch { /* surfaced by the open below */ }
+  try { fs.mkdirSync(dataDir, { recursive: true }); } catch { /* surfaced below */ }
+  const uniq = `${pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const readPid = (f) => { try { return Number.parseInt(fs.readFileSync(f, 'utf8'), 10); } catch { return null; } };
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = fs.openSync(lockPath, 'wx', 0o600);
-      fs.writeSync(fd, `${pid}\n`);
-      fs.closeSync(fd);
-      let released = false;
-      const release = () => {
-        if (released) return;
-        released = true;
-        try {
-          // Only remove the lock if it is still ours (never delete a successor's).
-          if (Number.parseInt(fs.readFileSync(lockPath, 'utf8'), 10) === pid) fs.rmSync(lockPath, { force: true });
-        } catch { /* already gone */ }
-      };
-      return { acquired: true, path: lockPath, release };
-    } catch (e) {
-      if (e.code !== 'EEXIST') return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
-    }
-    let holder = null;
-    try { holder = Number.parseInt(fs.readFileSync(lockPath, 'utf8'), 10); } catch { /* raced with a release */ }
-    if (Number.isInteger(holder) && holder !== pid && isAlive(holder)) {
-      return { acquired: false, path: lockPath, holderPid: holder, reason: `held by pid ${holder}` };
-    }
-    // Stale (holder gone / unreadable / our own leftover pid) — take it over.
-    try { fs.rmSync(lockPath, { force: true }); } catch { /* retry the open anyway */ }
+  const tmp = `${lockPath}.tmp-${uniq}`;
+  try {
+    fs.writeFileSync(tmp, `${pid}\n`, { mode: 0o600, flag: 'wx' });
+  } catch (e) {
+    return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
   }
-  return { acquired: false, path: lockPath, holderPid: null, reason: 'lock contention' };
+  const tryLink = () => { try { fs.linkSync(tmp, lockPath); return true; } catch (e) { if (e.code === 'EEXIST') return false; throw e; } };
+
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (tryLink()) {
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          // Only remove the lock if it is still ours (never delete a successor's).
+          try { if (readPid(lockPath) === pid) fs.rmSync(lockPath, { force: true }); } catch { /* already gone */ }
+        };
+        return { acquired: true, path: lockPath, release };
+      }
+      const holder = readPid(lockPath);
+      if (!Number.isInteger(holder)) {
+        // No pid in it. Link-based creation never produces that, so it is debris
+        // (an older build, a crash, a manual touch) — but only take it over once
+        // it is old enough that it cannot be a writer still mid-way.
+        let age = Infinity;
+        try { age = Date.now() - fs.statSync(lockPath).mtimeMs; } catch { continue; /* gone — retry */ }
+        if (age < LOCK_GRACE_MS) return { acquired: false, path: lockPath, holderPid: null, reason: 'lock file is being written by another session' };
+      }
+      if (Number.isInteger(holder) && holder !== pid && isAlive(holder)) {
+        return { acquired: false, path: lockPath, holderPid: holder, reason: `held by pid ${holder}` };
+      }
+      // Stale: move it aside atomically, then make sure we moved what we judged.
+      const aside = `${lockPath}.stale-${uniq}-${attempt}`;
+      try { fs.renameSync(lockPath, aside); } catch { continue; /* gone or raced — retry the link */ }
+      const moved = readPid(aside);
+      if (Number.isInteger(moved) && moved !== pid && isAlive(moved)) {
+        // We raced a successful takeover and moved a LIVE lock: restore it.
+        try { fs.linkSync(aside, lockPath); } catch { /* a third party holds it now */ }
+        try { fs.rmSync(aside, { force: true }); } catch { /* ignore */ }
+        return { acquired: false, path: lockPath, holderPid: moved, reason: `held by pid ${moved}` };
+      }
+      try { fs.rmSync(aside, { force: true }); } catch { /* ignore */ }
+    }
+    return { acquired: false, path: lockPath, holderPid: readPid(lockPath), reason: 'lock contention' };
+  } catch (e) {
+    return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * What this process may do, from the mode, the activation and the lock.
+ * Pure — the single place index.js takes these decisions from.
+ *  - wsEnabled: open the workspace WS (in-process bridge only);
+ *  - deliveryEnabled: accept wakes (in-process bridge, or /wake in channel-only).
+ * Both require an active channel AND the lock — in channel-only mode too, so two
+ * channel-only sessions cannot both accept wakes for the same agent.
+ *
+ * @param {{mode:string, active:boolean, lockAcquired:boolean}} o
+ * @returns {{wsEnabled:boolean, deliveryEnabled:boolean, reason:string}}
+ */
+export function decideChannelRole({ mode, active, lockAcquired }) {
+  if (!active) return { wsEnabled: false, deliveryEnabled: false, reason: 'channel not active in this session' };
+  if (!lockAcquired) return { wsEnabled: false, deliveryEnabled: false, reason: 'another session holds the OpenMax channel' };
+  return { wsEnabled: mode !== 'channel-only', deliveryEnabled: true, reason: '' };
 }

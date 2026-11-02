@@ -4,7 +4,10 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { resolveChannelActivation, argvLoadsChannel, acquireChannelLock } from '../src/channel-gate.js';
+import { spawn } from 'node:child_process';
+import { utimesSync, readdirSync } from 'node:fs';
+
+import { resolveChannelActivation, argvLoadsChannel, acquireChannelLock, decideChannelRole } from '../src/channel-gate.js';
 import { ClaudeChannel } from '../src/channel.js';
 import { createInboundDelivery } from '../src/inbound-delivery.js';
 
@@ -96,4 +99,73 @@ test('delivery disabled → notifyWake throws runtime_unavailable → InboundDel
   ch.setDeliveryEnabled(true);
   await ch.notifyWake([{ messageId: 'm', conversationId: 'c', contentPreview: 'x' }]);
   assert.equal(sent, 1);
+});
+
+test('a young lock file without a pid is treated as held (never stolen mid-write)', () => {
+  const dataDir = tmp();
+  writeFileSync(path.join(dataDir, 'channel.lock'), '');
+  const r = acquireChannelLock({ dataDir, pid: 7777, isAlive: () => false });
+  assert.equal(r.acquired, false);
+  assert.match(r.reason, /being written/);
+});
+
+test('an OLD lock file without a pid is debris and is taken over', () => {
+  const dataDir = tmp();
+  const f = path.join(dataDir, 'channel.lock');
+  writeFileSync(f, '');
+  const old = (Date.now() - 60_000) / 1000;
+  utimesSync(f, old, old);
+  const r = acquireChannelLock({ dataDir, pid: 7778, isAlive: () => false });
+  assert.equal(r.acquired, true);
+  assert.equal(readFileSync(f, 'utf8').trim(), '7778');
+});
+
+test('lock file is never left without a pid and no temp/stale files linger', () => {
+  const dataDir = tmp();
+  const a = acquireChannelLock({ dataDir, pid: 8001, isAlive: () => false });
+  assert.equal(readFileSync(a.path, 'utf8'), '8001\n');
+  writeFileSync(a.path, '8001\n');
+  const b = acquireChannelLock({ dataDir, pid: 8002, isAlive: () => false }); // 8001 "dead" → takeover
+  assert.equal(b.acquired, true);
+  assert.deepEqual(readdirSync(dataDir).sort(), ['channel.lock']);
+});
+
+const GATE = new URL('../src/channel-gate.js', import.meta.url).href;
+
+test('race: 8 processes contending (over a stale lock) → exactly one holder', async () => {
+  const dataDir = tmp();
+  writeFileSync(path.join(dataDir, 'channel.lock'), '999999\n'); // stale holder
+  // Every child keeps running (so a winner's pid stays alive) until the parent
+  // has collected ALL answers and closes their stdin — a slow-starting child can
+  // therefore never see the winner already gone and legitimately win "later".
+  const script = `import { acquireChannelLock } from ${JSON.stringify(GATE)};
+    const go = Number(process.argv[1]); while (Date.now() < go) {}
+    const r = acquireChannelLock({ dataDir: ${JSON.stringify(dataDir)} });
+    process.stdout.write(r.acquired ? 'WIN\\n' : 'LOSE\\n');
+    process.stdin.resume(); process.stdin.on('end', () => process.exit(0));`;
+  const go = Date.now() + 1500;
+  const children = Array.from({ length: 8 }, () => spawn(process.execPath, ['--input-type=module', '-e', script, String(go)], { stdio: ['pipe', 'pipe', 'inherit'] }));
+  const answers = await Promise.all(children.map((c) => new Promise((resolve) => {
+    let out = '';
+    c.stdout.on('data', (d) => { out += d; if (out.includes('\n')) resolve(out.trim()); });
+    c.on('exit', () => resolve(out.trim() || 'EXIT'));
+  })));
+  for (const c of children) c.stdin.end();
+  assert.equal(answers.filter((r) => r === 'WIN').length, 1, answers.join(','));
+});
+
+test('decideChannelRole: inactive or lock busy → no WS and no delivery, in BOTH modes', () => {
+  for (const mode of ['inproc', 'channel-only']) {
+    assert.deepEqual(
+      { ...decideChannelRole({ mode, active: false, lockAcquired: true }), reason: undefined },
+      { wsEnabled: false, deliveryEnabled: false, reason: undefined }, `${mode} inactive`);
+    const busy = decideChannelRole({ mode, active: true, lockAcquired: false });
+    assert.equal(busy.deliveryEnabled, false, `${mode} lock busy`);
+    assert.equal(busy.wsEnabled, false);
+  }
+});
+
+test('decideChannelRole: active + lock → inproc opens the WS; channel-only only accepts wakes', () => {
+  assert.deepEqual(decideChannelRole({ mode: 'inproc', active: true, lockAcquired: true }), { wsEnabled: true, deliveryEnabled: true, reason: '' });
+  assert.deepEqual(decideChannelRole({ mode: 'channel-only', active: true, lockAcquired: true }), { wsEnabled: false, deliveryEnabled: true, reason: '' });
 });

@@ -68,11 +68,33 @@ function authHeaders(id, secret) {
   return headers;
 }
 
-async function postJson(url, headers, body, signal) {
-  const res = await fetch(url, { method: 'POST', headers, body: body ?? '{}', signal });
-  const text = await res.text();
-  let json; try { json = JSON.parse(text); } catch { json = undefined; }
-  return { ok: res.ok, status: res.status, text, json };
+// Per-request timeouts (each request also stops when the overall budget runs out).
+// A hung first request must not eat the whole budget and leave no room for a retry.
+export const REQUEST_TIMEOUT_MS = { register: 15000, token: 10000, accept: 15000 };
+
+/**
+ * POST with a per-request timeout under the caller's overall budget `signal`.
+ * A timeout rejects with name 'TimeoutError'; an overall-budget abort with
+ * name 'AbortError'.
+ */
+async function postJson(url, headers, body, signal, timeoutMs) {
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const onAbort = () => ctrl.abort();
+  if (signal) { if (signal.aborted) ctrl.abort(); else signal.addEventListener('abort', onAbort, { once: true }); }
+  const timer = Number.isFinite(timeoutMs) && timeoutMs > 0 ? setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs) : null;
+  try {
+    const res = await fetch(url, { method: 'POST', headers, body: body ?? '{}', signal: ctrl.signal });
+    const text = await res.text();
+    let json; try { json = JSON.parse(text); } catch { json = undefined; }
+    return { ok: res.ok, status: res.status, text, json };
+  } catch (e) {
+    if (timedOut) throw Object.assign(new Error(`timed out after ${timeoutMs}ms`), { name: 'TimeoutError', cause: e });
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
 }
 
 /**
@@ -83,32 +105,61 @@ async function postJson(url, headers, body, signal) {
  */
 export function describeFetchError(e) {
   if (!e) return 'unknown error';
-  if (e.name === 'AbortError' || e.name === 'TimeoutError') return 'timed out';
+  if (e.name === 'TimeoutError') return e.message || 'timed out';
+  if (e.name === 'AbortError') return 'timed out (total budget exhausted)';
   const cause = e.cause && (e.cause.code || e.cause.message);
   return cause ? `${e.message} (${cause})` : (e.message || String(e));
 }
 
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 
+// Network errors that prove the request never reached the server (no TCP
+// connection was made / name did not resolve). Only these are safe to retry for
+// a NON-idempotent request.
+const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
+
 /**
- * POST with optional retries. Retries ONLY transient failures — a network error
- * or an HTTP 5xx — never a 4xx (a rejected request will be rejected again).
- * `signal` is the caller's overall budget: once it fires, no further attempt is
- * made. Returns the last {ok,status,text,json}, or throws the last network error.
+ * Retry policy.
+ *  - 'idempotent' (token exchange; accept — the server replays an existing
+ *    accept for the same identity): any network error, timeout or 5xx.
+ *  - 'not-idempotent' (register — every successful call creates a new identity
+ *    and the key is shown only once, with no idempotency key and no lookup):
+ *    only failures that prove nothing was created — a connection that was never
+ *    established, or HTTP 503/429 (refused before processing). A timeout, a reset
+ *    connection or another 5xx may mean the identity WAS created, so it is
+ *    reported instead of risking an orphan identity.
  */
-async function postWithRetry(url, headers, body, signal, retries, backoff = RETRY_BACKOFF_MS) {
+export function isRetryable(kind, { error, status } = {}) {
+  if (error) {
+    if (error.name === 'AbortError') return false; // overall budget gone
+    if (kind === 'idempotent') return true;
+    const code = error.cause?.code || error.code;
+    return NOT_SENT_CODES.has(code);
+  }
+  if (kind === 'idempotent') return status >= 500;
+  return status === 503 || status === 429;
+}
+
+/**
+ * POST with optional retries per `kind` (see isRetryable). Never retries a 4xx
+ * other than 429. `signal` is the caller's overall budget: once it fires, no
+ * further attempt is made. Returns the last {ok,status,text,json}, or throws the
+ * last network error.
+ */
+async function postWithRetry(url, headers, body, { signal, retries, backoff = RETRY_BACKOFF_MS, timeoutMs, kind }) {
+  const p = new URL(url).pathname;
   for (let attempt = 0; ; attempt++) {
     let res;
     try {
-      res = await postJson(url, headers, body, signal);
+      res = await postJson(url, headers, body, signal, timeoutMs);
     } catch (e) {
-      if (signal?.aborted || attempt >= retries) throw e;
-      log(`POST ${new URL(url).pathname} → ${describeFetchError(e)} — retrying (${attempt + 1}/${retries})`);
+      if (signal?.aborted || attempt >= retries || !isRetryable(kind, { error: e })) throw e;
+      log(`POST ${p} → ${describeFetchError(e)} — retrying (${attempt + 1}/${retries})`);
       await sleep(backoff[Math.min(attempt, backoff.length - 1)]);
       continue;
     }
-    if (res.status < 500 || signal?.aborted || attempt >= retries) return res;
-    log(`POST ${new URL(url).pathname} → HTTP ${res.status} — retrying (${attempt + 1}/${retries})`);
+    if (res.ok || signal?.aborted || attempt >= retries || !isRetryable(kind, { status: res.status })) return res;
+    log(`POST ${p} → HTTP ${res.status} — retrying (${attempt + 1}/${retries})`);
     await sleep(backoff[Math.min(attempt, backoff.length - 1)]);
   }
 }
@@ -142,7 +193,9 @@ export function writeConfig0600(configPath, cfg) {
  * @param {{deadlineMs?:number, retries?:number}} [opts]
  *   deadlineMs — total network budget (default 8s, sized for the SessionStart hook);
  *   retries    — extra attempts per request on network errors / 5xx (default 0);
- *   backoffMs  — TEST SEAM: delays between retries (default 1s, 2s, 4s).
+ *   backoffMs  — TEST SEAM: delays between retries (default 1s, 2s, 4s);
+ *   requestTimeoutMs — TEST SEAM: per-request timeout for every step
+ *                (default REQUEST_TIMEOUT_MS per step, always within deadlineMs).
  */
 export async function registerAndAccept(opts = {}) {
   const configPath = resolveConfigPath();
@@ -168,6 +221,7 @@ export async function registerAndAccept(opts = {}) {
   const cfSecret = cf.client_secret || process.env.COCO_CF_ACCESS_CLIENT_SECRET || '';
   const retries = Number.isInteger(opts.retries) && opts.retries > 0 ? opts.retries : 0;
   const backoff = Array.isArray(opts.backoffMs) && opts.backoffMs.length ? opts.backoffMs : RETRY_BACKOFF_MS;
+  const tmo = (step) => (Number.isFinite(opts.requestTimeoutMs) ? opts.requestTimeoutMs : REQUEST_TIMEOUT_MS[step]);
 
   const budgetMs = Number.isFinite(opts.deadlineMs) ? opts.deadlineMs : DEFAULT_TOTAL_BUDGET_MS;
   const ctrl = new AbortController();
@@ -185,8 +239,13 @@ export async function registerAndAccept(opts = {}) {
       const step = 'POST /auth/register/agent';
       log(`registering agent: POST ${bffUrl}/auth/register/agent`);
       let reg;
-      try { reg = await postWithRetry(`${bffUrl}/auth/register/agent`, authHeaders(cfId, cfSecret), '{}', ctrl.signal, retries, backoff); }
-      catch (e) { return fail(step, describeFetchError(e)); }
+      try {
+        reg = await postWithRetry(`${bffUrl}/auth/register/agent`, authHeaders(cfId, cfSecret), '{}',
+          { signal: ctrl.signal, retries, backoff, timeoutMs: tmo('register'), kind: 'not-idempotent' });
+      } catch (e) {
+        const unsure = !isRetryable('not-idempotent', { error: e }) && e.name !== 'AbortError';
+        return fail(step, `${describeFetchError(e)}${unsure ? ' — not retried automatically: the server may already have created an identity' : ''}`);
+      }
       if (!reg.ok) return fail(step, `HTTP ${reg.status}: ${bodyExcerpt(reg.text)}`);
 
       const data = (reg.json && (reg.json.data || reg.json)) || {};
@@ -216,7 +275,7 @@ export async function registerAndAccept(opts = {}) {
     }
 
     // ---- accept invitation (decoupled + retryable across sessions) ----
-    const acc = await maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecret, signal: ctrl.signal, retries, backoff });
+    const acc = await maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecret, signal: ctrl.signal, retries, backoff, tmo });
     if (acc.accepted) { out.inviteAccepted = true; out.status = 'changed'; }
     if (acc.failed) { out.invitePending = true; return fail(acc.step, acc.reason); }
   } finally {
@@ -235,7 +294,7 @@ export async function ensureRegistered(opts = {}) {
   return res.registered;
 }
 
-async function maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecret, signal, retries = 0, backoff }) {
+async function maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecret, signal, retries = 0, backoff, tmo = (k) => REQUEST_TIMEOUT_MS[k] }) {
   const invite = cfg.invite || {};
   const invitationId = invite.invitation_id || process.env.COCO_INVITATION_ID || '';
   const inviteToken = invite.token || process.env.COCO_INVITATION_TOKEN || '';
@@ -246,7 +305,10 @@ async function maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecr
   log('invite supplied — exchanging token + accepting invitation');
   const tokStep = 'POST /auth/agent/token';
   let tok;
-  try { tok = await postWithRetry(`${bffUrl}/auth/agent/token`, { ...authHeaders(cfId, cfSecret), Authorization: `Bearer ${apiKey}` }, '{}', signal, retries, backoff); }
+  try {
+    tok = await postWithRetry(`${bffUrl}/auth/agent/token`, { ...authHeaders(cfId, cfSecret), Authorization: `Bearer ${apiKey}` }, '{}',
+      { signal, retries, backoff, timeoutMs: tmo('token'), kind: 'idempotent' });
+  }
   catch (e) { return { failed: true, step: tokStep, reason: `${describeFetchError(e)} (will retry)` }; }
   const accessToken = tok.json && (tok.json.data ? tok.json.data.access_token : tok.json.access_token);
   if (!tok.ok || !accessToken) return { failed: true, step: tokStep, reason: `HTTP ${tok.status}: no access_token (will retry)` };
@@ -260,9 +322,7 @@ async function maybeAcceptInvite({ cfg, configPath, bffUrl, apiKey, cfId, cfSecr
       `${bffUrl}/api/v1/invitations/${invitationId}/accept`,
       { ...authHeaders(cfId, cfSecret), Authorization: `Bearer ${accessToken}` },
       JSON.stringify({ token: inviteToken }),
-      signal,
-      retries,
-      backoff,
+      { signal, retries, backoff, timeoutMs: tmo('accept'), kind: 'idempotent' },
     );
   } catch (e) { return { failed: true, step: accStep, reason: `${describeFetchError(e)} (will retry)` }; }
   if (!acc.ok) return { failed: true, step: accStep, reason: `HTTP ${acc.status}: ${bodyExcerpt(acc.text)} (will retry)` };

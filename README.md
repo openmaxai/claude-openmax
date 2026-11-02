@@ -141,7 +141,9 @@ JSON
 ```
 
 `onboard.js` writes the config (0600), registers the agent and accepts the
-invitation (45 s budget, retries on network errors / 5xx), appends the OpenMax
+invitation (per-request timeouts under a 45 s budget; registration is retried only
+when the request provably never reached the server, so no orphan identity is
+created), appends the OpenMax
 tool rules to `permissions.allow`, and with `--launch` starts
 `CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax "<greeting>"`
 in tmux — a new window if you are already in tmux, otherwise a detached session
@@ -150,7 +152,10 @@ confirm Claude Code's dev-channel warning dialog yourself (the script never answ
 it). Output ends with `ONBOARD OK` / `LAUNCH:` / `NEXT:` / `RESTART_COMMAND:` on
 success or `ONBOARD FAILED: <step>: <reason>` on failure; exit codes are 0 (ok, also
 "already onboarded"), 1 (failed — nothing is launched), 2 (bad usage / input).
-Re-running it is safe. `node scripts/onboard.js --help` prints the usage.
+Re-running it is safe. A running `openmax` tmux session is reused only if this run
+kept the same agent identity; after a new registration it prints `LAUNCH: manual`
+and asks you to close the old session first. `node scripts/onboard.js --help`
+prints the usage.
 
 ### Which session receives messages
 

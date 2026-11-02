@@ -56,7 +56,7 @@ export class ClaudeChannel {
     // per-process id — SPIKE: bind to the real CC session id when available).
     this.runtimeSession = `claude_${randomUUID()}`;
     this._connected = false;
-    // Whether wakes may be delivered at all (OPENM-1107). Claude Code drops a
+    // Whether wakes may be delivered at all. Claude Code drops a
     // channel notification SILENTLY in a session that did not load the channel,
     // so "the stdio write resolved" proves nothing there. index.js enables this
     // only for a channel-active session that holds the single-instance lock;

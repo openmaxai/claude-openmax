@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * One-shot OpenMax onboarding for Claude Code (OPENM-1106).
+ * One-shot OpenMax onboarding for Claude Code.
  *
  * Run ONCE, as ONE Bash call, by the agent that received the OpenMax invitation
  * prompt — so the user approves exactly one command:
@@ -60,7 +60,7 @@ export const TMUX_NAME = 'openmax';
 export const REGISTER_BUDGET_MS = 45000;
 export const REGISTER_RETRIES = 3;
 
-// Q1: the MCP tools that may run without a per-call prompt. Claude Code names a
+// The MCP tools that may run without a per-call prompt. Claude Code names a
 // plugin's MCP tools mcp__plugin_<plugin>_<server>__<tool> (hyphens kept):
 // plugin `openmax-channel` (.claude-plugin/plugin.json), server `openmax`, tools
 // from src/mcp-tools.js. `as` (file upload/download) and `conn` (connection
@@ -75,7 +75,7 @@ export const ENV_VARS_TO_STRIP = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT'];
 // earlier does not have this shell's environment).
 const ENV_PASSTHROUGH = ['CLAUDE_CONFIG_DIR', 'CLAUDE_OPENMAX_CONFIG', 'CLAUDE_OPENMAX_DATA_DIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'CLAUDE_OPENMAX_LOG_FILE'];
 
-// Q7: the new session starts fresh (no --continue/--resume); it only needs to greet.
+// The new session starts fresh (no --continue/--resume); it only needs to greet.
 export const GREETING_PROMPT =
   'OpenMax onboarding is complete and this session has the OpenMax channel loaded. '
   + 'Send your owner a short hello on OpenMax with the comm_send tool saying you are online '
@@ -173,7 +173,7 @@ export function checkSettingsEditable(settingsPath) {
 /**
  * Append `rules` to permissions.allow — append-only, de-duplicated, every other
  * key untouched. Backs the file up to settings.json.bak-openmax-<ts> before the
- * first change. Writes in place (follows a symlinked settings file).
+ * first change. Written atomically (see writeFileAtomic).
  * @returns {{changed: boolean, added: string[], backup: string|null, path: string}}
  */
 export function mergePermissions(settingsPath, rules = ALLOW_RULES, now = Date.now()) {
@@ -187,12 +187,36 @@ export function mergePermissions(settingsPath, rules = ALLOW_RULES, now = Date.n
   if (exists) {
     backup = `${settingsPath}.bak-openmax-${stamp(now)}`;
     fs.copyFileSync(settingsPath, backup);
+    fs.chmodSync(backup, 0o600); // settings can hold env secrets (e.g. "env" block)
   } else {
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   }
   settings.permissions = { ...(settings.permissions || {}), allow: [...allow, ...added] };
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   return { changed: true, added, backup, path: settingsPath };
+}
+
+/**
+ * Atomic replace: write a temp file next to the REAL target (a symlinked
+ * settings file stays a symlink), fsync, rename over it. Keeps the existing
+ * file mode; a new file is created 0600. A crash mid-write leaves either the
+ * old or the new file, never a truncated one.
+ */
+export function writeFileAtomic(file, text) {
+  let target = file;
+  try { target = fs.realpathSync(file); } catch { /* does not exist yet */ }
+  let mode = 0o600;
+  try { mode = fs.statSync(target).mode & 0o777; } catch { /* new file */ }
+  const tmp = path.join(path.dirname(target), `.${path.basename(target)}.tmp-${process.pid}-${Date.now()}`);
+  try {
+    const fd = fs.openSync(tmp, 'wx', mode);
+    try { fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    throw e;
+  }
 }
 
 // ── launch ─────────────────────────────────────────────────────────────────────
@@ -247,10 +271,16 @@ function resolveClaudeBin(exec, env) {
 }
 
 /**
- * Start (or reuse) the channel session in tmux. Never sends keystrokes.
- * @returns {{launched: boolean, mode: string, reused?: boolean, attach?: string, reason?: string}}
+ * Start (or reuse) the channel session in tmux. Never sends keystrokes and never
+ * kills anything.
+ *
+ * `allowReuse=false` (this run registered a new identity or replaced the
+ * config): an already-running `openmax` window/session holds the OLD key in
+ * memory, so switching to it would leave the new agent offline. In that case it
+ * is reported (`stale: true`) instead of reused, and nothing is started.
+ * @returns {{launched: boolean, mode: string, reused?: boolean, stale?: boolean, attach?: string, reason?: string}}
  */
-export function launchInTmux({ mode, cwd, env, exec = defaultExec, claudeBin = 'claude' }) {
+export function launchInTmux({ mode, cwd, env, exec = defaultExec, claudeBin = 'claude', allowReuse = true }) {
   const tenv = cleanEnv(env);
   const cmd = buildLaunchCommand({ claudeBin, env, stripEnv: true });
   const run = (args) => exec('tmux', args, { env: tenv });
@@ -258,6 +288,7 @@ export function launchInTmux({ mode, cwd, env, exec = defaultExec, claudeBin = '
   if (mode === 'tmux-window') {
     const list = run(['list-windows', '-F', '#{window_name}']);
     if (list.status === 0 && list.stdout.split('\n').includes(TMUX_NAME)) {
+      if (!allowReuse) return { launched: false, mode, stale: true, reason: `tmux window "${TMUX_NAME}" is already running with the previous configuration` };
       const sel = run(['select-window', '-t', TMUX_NAME]);
       if (sel.status === 0) return { launched: true, mode, reused: true };
     }
@@ -268,7 +299,10 @@ export function launchInTmux({ mode, cwd, env, exec = defaultExec, claudeBin = '
 
   const attach = `tmux attach -t ${TMUX_NAME}`;
   const has = run(['has-session', '-t', `=${TMUX_NAME}`]);
-  if (has.status === 0) return { launched: true, mode, reused: true, attach };
+  if (has.status === 0) {
+    if (!allowReuse) return { launched: false, mode, stale: true, attach, reason: `tmux session "${TMUX_NAME}" is already running with the previous configuration` };
+    return { launched: true, mode, reused: true, attach };
+  }
   const r = run(['new-session', '-d', '-s', TMUX_NAME, '-c', cwd, cmd]);
   if (r.status !== 0) return { launched: false, mode, reason: (r.stderr || r.error?.message || 'tmux new-session failed').trim(), attach };
   return { launched: true, mode, reused: false, attach };
@@ -405,8 +439,17 @@ export async function runOnboard({
         launch = 'manual';
         say(`launch: ${choice.reason} — not starting a session automatically`);
       } else {
-        const res = launchInTmux({ mode: choice.mode, cwd, env, exec, claudeBin });
-        if (!res.launched) {
+        // A running channel session may only be reused when this run did not
+        // change the agent identity it was started with.
+        const allowReuse = !reg.registered && (keptRegistration || !configChanged);
+        const res = launchInTmux({ mode: choice.mode, cwd, env, exec, claudeBin, allowReuse });
+        if (res.stale) {
+          launch = 'manual';
+          say(`launch: ${res.reason} — not reusing it (it still holds the old agent key) and not stopping it`);
+          next = `First close the old OpenMax session in tmux ${choice.mode === 'tmux-window' ? 'window' : 'session'} "${TMUX_NAME}" `
+            + `(exit Claude Code there, or \`tmux kill-${choice.mode === 'tmux-window' ? 'window' : 'session'} -t ${TMUX_NAME}\`), `
+            + 'then run the RESTART_COMMAND below and choose "I am using this for local development" in the warning dialog.';
+        } else if (!res.launched) {
           launch = 'manual';
           say(`launch: WARN could not start tmux (${res.reason}) — run the command yourself`);
         } else if (choice.mode === 'tmux-window') {

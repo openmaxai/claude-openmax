@@ -1,0 +1,22 @@
+# Gitleaks config: the default rules, plus an allowlist for exactly four
+# SYNTHETIC fixtures in the redaction tests (they exist to prove secrets get
+# scrubbed from logs, so they must look like real secrets). Each entry needs
+# BOTH the file path AND the exact fixture value — a real secret in these files,
+# or these values anywhere else, is still reported.
+#   test/providers.test.js:71  fake JWT
+#   test/providers.test.js:73  fake cwsk_ key (api_key=...)
+#   test/redact.test.js:36-37  fake cwsk_ key (key=...)
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "synthetic redaction-test fixtures (not real credentials)"
+condition = "AND"
+paths = ['''^test/(providers|redact)\.test\.js$''']
+regexTarget = "line"
+regexes = [
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiJhZ2VudCJ9\.s3cr3tSignaturePart''',
+  '''api_key=cwsk_LIVEsecret123 and Authorization: Bearer abc\.def-ghi''',
+  '''scrubLine\('key=cwsk_abc123DEF'\)''',
+]

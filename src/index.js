@@ -14,7 +14,7 @@
  * holding <dataDir>/channel.lock. Every other session still gets the full MCP
  * tool set (comm_send goes over REST and needs no WS) but stays off the wire and
  * refuses wakes, so it can neither show the agent online nor ack messages it
- * would never display (OPENM-1107).
+ * would never display.
  *
  * Set CLAUDE_OPENMAX_MODE=channel-only to run JUST the channel + an HTTP
  * /wake server (topology 1); the bridge then runs separately (src/bridge.js)
@@ -39,7 +39,7 @@ import { startOwnerSync } from './owner-sync.js';
 import { startWakeServer } from './wake-server.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 import { PKG_VERSION } from './version.js';
-import { resolveChannelActivation, acquireChannelLock, CHANNEL_ENV } from './channel-gate.js';
+import { resolveChannelActivation, acquireChannelLock, decideChannelRole, CHANNEL_ENV } from './channel-gate.js';
 
 async function main() {
   const mode = process.env.CLAUDE_OPENMAX_MODE || 'inproc';
@@ -82,22 +82,22 @@ async function main() {
   });
   channel.registerTools(defs, handler);
 
-  // ── channel activation gate + single-instance lock (OPENM-1107) ─────────────
+  // ── channel activation gate + single-instance lock ───────────────────────────
   const activation = resolveChannelActivation();
   let channelLock = null;
   let lockBusy = null;
-  if (activation.active && mode !== 'channel-only') {
+  if (activation.active) {
     const lock = acquireChannelLock({ dataDir: storage.dataDir });
     if (lock.acquired) channelLock = lock;
     else lockBusy = lock;
   }
-  // channel-only (split topology): no WS in this process; the gate only decides
+  // channel-only (split topology): no WS in this process; the role only decides
   // whether wakes POSTed by the external bridge may be accepted.
-  const wsEnabled = !!channelLock;
-  const deliveryEnabled = mode === 'channel-only' ? activation.active : wsEnabled;
-  channel.setDeliveryEnabled(deliveryEnabled, !activation.active
-    ? `channel not active in this session (${CHANNEL_ENV} unset and no channel flag detected)`
-    : `another session holds the OpenMax channel (${lockBusy?.reason || 'lock busy'})`);
+  const role = decideChannelRole({ mode, active: activation.active, lockAcquired: !!channelLock });
+  const wsEnabled = role.wsEnabled;
+  channel.setDeliveryEnabled(role.deliveryEnabled, !activation.active
+    ? `${role.reason} (${CHANNEL_ENV} unset and no channel flag detected)`
+    : `${role.reason} (${lockBusy?.reason || 'lock busy'})`);
   if (!activation.active) {
     logger.info(`channel NOT active in this session (${CHANNEL_ENV}!=1, no channel flag on the parent) — tools only, workspace WS stays closed`);
   } else if (lockBusy) {

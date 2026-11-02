@@ -7,13 +7,14 @@ import path from 'node:path';
 import {
   ALLOW_RULES, CHANNEL_REF, GREETING_PROMPT,
   mergePermissions, checkSettingsEditable, mergeIncomingConfig, parseIncomingConfig,
-  buildLaunchCommand, chooseLaunchMode, launchInTmux, cleanEnv, shellQuote, runOnboard,
+  buildLaunchCommand, chooseLaunchMode, launchInTmux, cleanEnv, shellQuote, runOnboard, writeFileAtomic,
 } from '../scripts/onboard.js';
+import { symlinkSync, lstatSync, chmodSync } from 'node:fs';
 import { registerAndAccept } from '../hooks/auto-register.js';
 
 const tmp = (p = 'claude-openmax-onboard-') => mkdtempSync(path.join(tmpdir(), p));
 
-// ── permission rules (Q1) ──────────────────────────────────────────────────────
+// ── permission rules ──────────────────────────────────────────────────────
 
 test('ALLOW_RULES is exactly comm/comm_send/tm/kb/core under the plugin MCP prefix (no as/conn)', () => {
   assert.deepEqual(ALLOW_RULES, [
@@ -123,7 +124,7 @@ test('buildLaunchCommand: channel env + flag + plugin ref + quoted greeting, no 
   const cmd = buildLaunchCommand({ env: {} });
   assert.ok(cmd.startsWith('CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax '));
   assert.ok(cmd.endsWith(shellQuote(GREETING_PROMPT)));
-  assert.ok(!/--continue|--resume/.test(cmd), 'Q7: the new session does not resume the old conversation');
+  assert.ok(!/--continue|--resume/.test(cmd), 'the new session does not resume the old conversation');
   assert.equal(CHANNEL_REF, 'plugin:openmax-channel@openmax');
 });
 
@@ -291,10 +292,10 @@ test('runOnboard: register failure → ONBOARD FAILED, exit 1, nothing launched,
   assert.equal(existsSync(path.join(s.claudeDir, 'settings.json')), false);
 });
 
-test('runOnboard: register is retried within the budget (transient 5xx then success)', async () => {
+test('runOnboard: register is retried within the budget (transient 503 then success)', async () => {
   const s = setup();
   let n = 0;
-  const flaky = (url) => (url.endsWith('/auth/register/agent') && n++ < 2 ? jsonRes(502, {}) : happyServer(url));
+  const flaky = (url) => (url.endsWith('/auth/register/agent') && n++ < 2 ? jsonRes(503, {}) : happyServer(url));
   const { code, out } = await onboard(s, { fetchImpl: flaky });
   assert.equal(code, 0, out);
   assert.equal(n, 3);
@@ -364,4 +365,73 @@ test('runOnboard warns (does not fail) on Bedrock', async () => {
   const { code, out } = await onboard(s, { env: { ...s.env, CLAUDE_CODE_USE_BEDROCK: '1' } });
   assert.equal(code, 0);
   assert.match(out, /not available on Amazon Bedrock/);
+});
+
+// ── never reuse a running session that holds an old identity ─────────────────
+
+test('launchInTmux(allowReuse=false) reports an existing session as stale and starts/kills nothing', () => {
+  for (const [mode, key, env] of [['tmux-session', 'tmux has-session', {}], ['tmux-window', 'tmux list-windows', { TMUX: 'x' }]]) {
+    const { exec, calls } = fakeExec({ [key]: { status: 0, stdout: 'openmax\n' } });
+    const r = launchInTmux({ mode, cwd: '/w', env, exec, allowReuse: false });
+    assert.equal(r.launched, false);
+    assert.equal(r.stale, true);
+    assert.ok(!calls.some((c) => /^(new-|select-|kill-|send-keys)/.test(c.args[0])), `${mode}: ${calls.map((c) => c.args[0])}`);
+  }
+});
+
+test('runOnboard: new registration + existing openmax session → LAUNCH: manual, NEXT says close the old one first', async () => {
+  const s = setup();
+  const { exec, calls } = fakeExec({ 'tmux has-session': { status: 0 } });
+  const { code, lines } = await onboard(s, { exec });
+  assert.equal(code, 0);
+  const i = lines.indexOf('ONBOARD OK');
+  assert.equal(lines[i + 1], 'LAUNCH: manual');
+  assert.match(lines[i + 2], /^NEXT: First close the old OpenMax session in tmux session "openmax"/);
+  assert.ok(!calls.some((c) => c.cmd === 'tmux' && /^(new-session|kill-)/.test(c.args[0])));
+});
+
+test('runOnboard: replaced config (different server) + existing openmax window → not reused', async () => {
+  const s = setup();
+  mkdirSync(path.dirname(s.cfgPath), { recursive: true });
+  writeFileSync(s.cfgPath, JSON.stringify({ server: { bff_url: 'https://old' }, agent: { api_key: 'cwsk_old' }, orgs: { z: {} } }));
+  const { exec } = fakeExec({ 'tmux list-windows': { status: 0, stdout: 'openmax\n' } });
+  const { lines } = await onboard(s, { exec, env: { ...s.env, TMUX: 'x' } });
+  assert.ok(lines.includes('LAUNCH: manual'), lines.join('\n'));
+  assert.ok(lines.some((l) => l.startsWith('NEXT: First close the old OpenMax session in tmux window "openmax"')));
+});
+
+test('runOnboard: re-run with the same identity still reuses the running session', async () => {
+  const s = setup();
+  assert.equal((await onboard(s)).code, 0);
+  const { exec, calls } = fakeExec({ 'tmux has-session': { status: 0 } });
+  const { lines } = await onboard(s, { exec });
+  assert.ok(lines.includes('LAUNCH: tmux-session'));
+  assert.ok(lines.some((l) => l.includes('reusing the existing tmux session')));
+  assert.ok(!calls.some((c) => c.args[0] === 'new-session'));
+});
+
+// ── atomic settings write ────────────────────────────────────────────────────
+
+test('writeFileAtomic keeps the mode, leaves no temp file, and keeps a symlinked settings file a symlink', () => {
+  const dir = tmp();
+  const real = path.join(dir, 'real-settings.json');
+  writeFileSync(real, '{}');
+  chmodSync(real, 0o640);
+  const link = path.join(dir, 'settings.json');
+  symlinkSync(real, link);
+  writeFileAtomic(link, '{"a":1}\n');
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  assert.equal(readFileSync(real, 'utf8'), '{"a":1}\n');
+  assert.equal(statSync(real).mode & 0o777, 0o640);
+  assert.deepEqual(readdirSync(dir).filter((f) => f.includes('.tmp-')), []);
+  const fresh = path.join(dir, 'new.json');
+  writeFileAtomic(fresh, 'x');
+  assert.equal(statSync(fresh).mode & 0o777, 0o600);
+});
+
+test('mergePermissions backup is 0600', () => {
+  const file = path.join(tmp(), 'settings.json');
+  writeFileSync(file, '{}', { mode: 0o644 });
+  const r = mergePermissions(file, ALLOW_RULES, 0);
+  assert.equal(statSync(r.backup).mode & 0o777, 0o600);
 });

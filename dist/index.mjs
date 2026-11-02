@@ -26242,6 +26242,7 @@ function resolveChannelActivation({ env = process.env, parentArgv = readParentAr
   if (argvLoadsChannel(parentArgv())) return { active: true, source: "parent-argv" };
   return { active: false, source: "none" };
 }
+var LOCK_GRACE_MS = 5e3;
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -26257,39 +26258,94 @@ function acquireChannelLock({ dataDir, pid = process.pid, isAlive = pidAlive }) 
     fs7.mkdirSync(dataDir, { recursive: true });
   } catch {
   }
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const uniq = `${pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const readPid = (f) => {
     try {
-      const fd = fs7.openSync(lockPath, "wx", 384);
-      fs7.writeSync(fd, `${pid}
-`);
-      fs7.closeSync(fd);
-      let released = false;
-      const release = () => {
-        if (released) return;
-        released = true;
+      return Number.parseInt(fs7.readFileSync(f, "utf8"), 10);
+    } catch {
+      return null;
+    }
+  };
+  const tmp = `${lockPath}.tmp-${uniq}`;
+  try {
+    fs7.writeFileSync(tmp, `${pid}
+`, { mode: 384, flag: "wx" });
+  } catch (e) {
+    return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
+  }
+  const tryLink = () => {
+    try {
+      fs7.linkSync(tmp, lockPath);
+      return true;
+    } catch (e) {
+      if (e.code === "EEXIST") return false;
+      throw e;
+    }
+  };
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (tryLink()) {
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          try {
+            if (readPid(lockPath) === pid) fs7.rmSync(lockPath, { force: true });
+          } catch {
+          }
+        };
+        return { acquired: true, path: lockPath, release };
+      }
+      const holder = readPid(lockPath);
+      if (!Number.isInteger(holder)) {
+        let age = Infinity;
         try {
-          if (Number.parseInt(fs7.readFileSync(lockPath, "utf8"), 10) === pid) fs7.rmSync(lockPath, { force: true });
+          age = Date.now() - fs7.statSync(lockPath).mtimeMs;
+        } catch {
+          continue;
+        }
+        if (age < LOCK_GRACE_MS) return { acquired: false, path: lockPath, holderPid: null, reason: "lock file is being written by another session" };
+      }
+      if (Number.isInteger(holder) && holder !== pid && isAlive(holder)) {
+        return { acquired: false, path: lockPath, holderPid: holder, reason: `held by pid ${holder}` };
+      }
+      const aside = `${lockPath}.stale-${uniq}-${attempt}`;
+      try {
+        fs7.renameSync(lockPath, aside);
+      } catch {
+        continue;
+      }
+      const moved = readPid(aside);
+      if (Number.isInteger(moved) && moved !== pid && isAlive(moved)) {
+        try {
+          fs7.linkSync(aside, lockPath);
         } catch {
         }
-      };
-      return { acquired: true, path: lockPath, release };
-    } catch (e) {
-      if (e.code !== "EEXIST") return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
+        try {
+          fs7.rmSync(aside, { force: true });
+        } catch {
+        }
+        return { acquired: false, path: lockPath, holderPid: moved, reason: `held by pid ${moved}` };
+      }
+      try {
+        fs7.rmSync(aside, { force: true });
+      } catch {
+      }
     }
-    let holder = null;
+    return { acquired: false, path: lockPath, holderPid: readPid(lockPath), reason: "lock contention" };
+  } catch (e) {
+    return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
+  } finally {
     try {
-      holder = Number.parseInt(fs7.readFileSync(lockPath, "utf8"), 10);
-    } catch {
-    }
-    if (Number.isInteger(holder) && holder !== pid && isAlive(holder)) {
-      return { acquired: false, path: lockPath, holderPid: holder, reason: `held by pid ${holder}` };
-    }
-    try {
-      fs7.rmSync(lockPath, { force: true });
+      fs7.rmSync(tmp, { force: true });
     } catch {
     }
   }
-  return { acquired: false, path: lockPath, holderPid: null, reason: "lock contention" };
+}
+function decideChannelRole({ mode, active, lockAcquired }) {
+  if (!active) return { wsEnabled: false, deliveryEnabled: false, reason: "channel not active in this session" };
+  if (!lockAcquired) return { wsEnabled: false, deliveryEnabled: false, reason: "another session holds the OpenMax channel" };
+  return { wsEnabled: mode !== "channel-only", deliveryEnabled: true, reason: "" };
 }
 
 // src/index.js
@@ -26326,14 +26382,14 @@ async function main() {
   const activation = resolveChannelActivation();
   let channelLock = null;
   let lockBusy = null;
-  if (activation.active && mode !== "channel-only") {
+  if (activation.active) {
     const lock = acquireChannelLock({ dataDir: storage.dataDir });
     if (lock.acquired) channelLock = lock;
     else lockBusy = lock;
   }
-  const wsEnabled = !!channelLock;
-  const deliveryEnabled = mode === "channel-only" ? activation.active : wsEnabled;
-  channel.setDeliveryEnabled(deliveryEnabled, !activation.active ? `channel not active in this session (${CHANNEL_ENV} unset and no channel flag detected)` : `another session holds the OpenMax channel (${lockBusy?.reason || "lock busy"})`);
+  const role = decideChannelRole({ mode, active: activation.active, lockAcquired: !!channelLock });
+  const wsEnabled = role.wsEnabled;
+  channel.setDeliveryEnabled(role.deliveryEnabled, !activation.active ? `${role.reason} (${CHANNEL_ENV} unset and no channel flag detected)` : `${role.reason} (${lockBusy?.reason || "lock busy"})`);
   if (!activation.active) {
     logger.info(`channel NOT active in this session (${CHANNEL_ENV}!=1, no channel flag on the parent) \u2014 tools only, workspace WS stays closed`);
   } else if (lockBusy) {
