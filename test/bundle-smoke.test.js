@@ -212,3 +212,23 @@ async function waitFor(pred, ms, detail) {
   }
   assert.fail(`condition not met in ${ms}ms\n${detail()}`);
 }
+
+test('channel-only, key wait gives up → lock released AND /wake refused afterwards', async () => {
+  const noKey = { enabled: false, server: { bff_url: 'http://127.0.0.1:9' }, agent: { api_key: '' }, orgs: {} };
+  const s = await startChannelOnly({ CLAUDE_OPENMAX_CHANNEL: '1', CLAUDE_OPENMAX_KEY_WAIT_MS: '300' }, noKey);
+  try {
+    await s.until(/channel lock released/);
+    assert.equal(existsSync(path.join(s.dataDir, 'channel.lock')), false);
+    const r = await s.wake();
+    assert.equal(r.status, 503, 'a session that gave up must not accept wakes');
+    assert.equal(r.body.failureClass, 'runtime_unavailable');
+  } finally { s.child.kill('SIGTERM'); }
+});
+
+test('channel-only with a key: wakes are accepted once the runtime is ready', async () => {
+  const s = await startChannelOnly({ CLAUDE_OPENMAX_CHANNEL: '1' });
+  try {
+    await s.until(/runtime ready/);
+    assert.equal((await s.wake()).status, 200);
+  } finally { s.child.kill('SIGTERM'); }
+});

@@ -183,8 +183,9 @@ export function hasUsableApiKey(config) {
 /**
  * Wait until the config has a usable api_key (startup race with registration).
  *
- * The MCP server reads its config once at startup, while the SessionStart hook
- * may be registering the agent at the same moment. A server that built its
+ * The MCP server reads its config once at startup, while the onboarding command
+ * may be registering the agent at the same moment (older builds registered from
+ * the SessionStart hook, concurrently with every first session). A server that built its
  * TokenManager from the still-blank key stayed offline for the whole session
  * (the key is fixed at construction and never re-read). So when the key is
  * missing we poll the config file until registration lands, then build.

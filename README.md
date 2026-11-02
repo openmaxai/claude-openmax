@@ -173,7 +173,7 @@ and never acknowledges a message it cannot show — the message waits for `/sync
 redelivery to the channel session.
 
 **Startup and network errors:** if the config has no `agent.api_key` yet when the
-server starts (registration still running in the `SessionStart` hook), it waits up
+server starts (the onboarding command is still registering), it waits up
 to 120 s for the key to appear instead of running the whole session on an empty key;
 the tools answer "registration in progress" meanwhile. Workspace HTTP calls time out
 after 15 s waiting for a response, errors name the request and its cause

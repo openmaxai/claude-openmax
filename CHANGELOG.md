@@ -16,8 +16,9 @@ The rest of Plane OPENM-1107 / cws-core#269 (the gating part shipped in 1.3.1).
 
 - **Startup race left a session offline for good** (`src/index.js`,
   `waitForApiKey` in `src/config.js`). The MCP server read its config once at
-  startup while the `SessionStart` hook could still be registering; if it won the
-  race, the TokenManager was built with an empty key and never re-read it, so the
+  startup while registration could still be running (in 1.3.0 the `SessionStart`
+  hook registered; since 1.3.1 the onboarding command does, possibly while a session
+  is already starting); if it won the race, the TokenManager was built with an empty key and never re-read it, so the
   whole session stayed offline. With no usable key the server now advertises its
   tools at once (they answer "registration in progress"), polls the config every
   2 s for up to 120 s, and builds the runtime and connects once the key lands.
