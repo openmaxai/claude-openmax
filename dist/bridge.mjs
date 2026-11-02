@@ -8159,7 +8159,7 @@ var CwsAgentBridge = class {
 // src/version.js
 var version;
 if (true) {
-  version = "1.3.1";
+  version = "1.3.2";
 } else {
   version = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
@@ -8167,6 +8167,81 @@ if (true) {
 }
 var PKG_VERSION = version;
 var DEFAULT_APP_VERSION = `claude-openmax/${version}`;
+
+// src/fetch-guard.js
+var DEFAULT_TIMEOUT_MS = 15e3;
+var DEFAULT_RETRIES = 2;
+var DEFAULT_RETRY_DELAY_MS = 500;
+var RETRYABLE_PATH_RE = /\/auth\/(agent\/token|refresh|ws-ticket)$/;
+function requestPath(url) {
+  try {
+    return new URL(String(url)).pathname;
+  } catch {
+    return String(url).split("?")[0];
+  }
+}
+function fetchCause(e) {
+  const c = e?.cause;
+  return c && (c.code || c.message) || e?.code || e?.message || String(e);
+}
+function createGuardedFetch({
+  baseFetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  retries = DEFAULT_RETRIES,
+  retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+  logger
+} = {}) {
+  const doFetch = (...a) => (baseFetch || globalThis.fetch)(...a);
+  const once = async (url, init, method, path7) => {
+    const timed = timeoutMs > 0 && method !== "PUT" && (init?.body === void 0 || typeof init.body === "string");
+    if (!timed) return doFetch(url, init);
+    const ctrl = new AbortController();
+    const outer = init?.signal;
+    const onOuterAbort = () => ctrl.abort(outer.reason);
+    if (outer) {
+      if (outer.aborted) ctrl.abort(outer.reason);
+      else outer.addEventListener("abort", onOuterAbort, { once: true });
+    }
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, timeoutMs);
+    try {
+      return await doFetch(url, { ...init, signal: ctrl.signal });
+    } catch (e) {
+      if (timedOut) {
+        const err = new Error(`fetch timed out after ${timeoutMs}ms: ${method} ${path7}`);
+        err.name = "TimeoutError";
+        err.cause = e;
+        throw err;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (outer) outer.removeEventListener("abort", onOuterAbort);
+    }
+  };
+  return async function guardedFetch(url, init = {}) {
+    const method = String(init?.method || "GET").toUpperCase();
+    const path7 = requestPath(url);
+    const maxAttempts = 1 + (RETRYABLE_PATH_RE.test(path7) ? Math.max(0, retries) : 0);
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await once(url, init, method, path7);
+      } catch (e) {
+        const callerAborted = init?.signal?.aborted && e?.name !== "TimeoutError";
+        const err = e?.name === "TimeoutError" || callerAborted ? e : Object.assign(new Error(`fetch failed: ${method} ${path7} \u2192 ${fetchCause(e)}`), { cause: e });
+        if (callerAborted || attempt >= maxAttempts) {
+          logger?.warn?.(`[http] ${err.message}${attempt > 1 ? ` (after ${attempt} attempts)` : ""}`);
+          throw err;
+        }
+        logger?.warn?.(`[http] ${err.message} \u2014 retrying (${attempt}/${maxAttempts - 1})`);
+        await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
+      }
+    }
+  };
+}
 
 // src/config.js
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
@@ -8326,6 +8401,7 @@ function buildRuntime({
   storage,
   logger,
   httpClient,
+  fetchImpl,
   ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS,
   policySyncTimeoutMs = POLICY_SYNC_HTTP_TIMEOUT_MS,
   policyDebounceMs = POLICY_RECONCILE_DEBOUNCE_MS
@@ -8384,7 +8460,9 @@ function buildRuntime({
     return false;
   };
   const cfAccessWrapped = state.cf_access ? { cf_access: state.cf_access } : void 0;
+  const guardedFetch = fetchImpl || createGuardedFetch({ logger });
   const tokenManager = new TokenManager({
+    fetch: guardedFetch,
     apiKey: state.agent.api_key,
     coreUrl: state.server.bff_url,
     cfAccess: cfAccessWrapped,
@@ -8394,6 +8472,7 @@ function buildRuntime({
     logger
   });
   const http = httpClient || new CwsHttpClient({
+    fetch: guardedFetch,
     baseUrl: state.server.bff_url,
     apiKey: state.agent.api_key,
     deviceId: state.agent.device_id,
@@ -9003,14 +9082,26 @@ function deriveWakeRequest(inbound, opts = {}) {
     schema: WAKE_SCHEMA,
     messageId,
     conversationId,
-    contentPreview: preview(inbound.text, previewMax)
+    contentPreview: withAttachments(preview(inbound.text, previewMax), inbound.attachments)
   };
   const senderId = str(inbound.senderId);
   if (senderId) req.senderId = senderId;
+  const endpoint = str(inbound.endpoint);
+  if (endpoint) req.endpoint = endpoint;
   return req;
 }
 function str(v) {
   return typeof v === "string" ? v : v == null ? "" : String(v);
+}
+var MAX_ATTACHMENT_NAMES = 5;
+function withAttachments(previewText, attachments) {
+  const list = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
+  if (list.length === 0) return previewText;
+  const names = list.slice(0, MAX_ATTACHMENT_NAMES).map((a) => typeof a === "object" ? str(a.file_name || a.name || a.filename || a.type || "file") : "file");
+  const more = list.length > MAX_ATTACHMENT_NAMES ? `, +${list.length - MAX_ATTACHMENT_NAMES} more` : "";
+  const summary = `[${list.length} attachment${list.length === 1 ? "" : "s"}: ${names.join(", ")}${more}]`;
+  return previewText ? `${previewText}
+${summary}` : summary;
 }
 function preview(text, max) {
   const t = str(text);

@@ -172,6 +172,14 @@ other session still has all MCP tools (`comm_send` works over REST), stays offli
 and never acknowledges a message it cannot show — the message waits for `/sync`
 redelivery to the channel session.
 
+**Startup and network errors:** if the config has no `agent.api_key` yet when the
+server starts (registration still running in the `SessionStart` hook), it waits up
+to 120 s for the key to appear instead of running the whole session on an empty key;
+the tools answer "registration in progress" meanwhile. Workspace HTTP calls time out
+after 15 s waiting for a response, errors name the request and its cause
+(`fetch failed: POST /auth/ws-ticket → ECONNRESET`), and the token / ws-ticket calls
+are retried twice on network errors.
+
 **Group messages:** with the default access policy written by the invitation
 (`groupPolicy: "allowlist"`, no groups listed), a group message reaches the agent
 only when the owner @-mentions it; anything else in a group is dropped without a

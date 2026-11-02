@@ -1290,8 +1290,13 @@ export function createMcpTools({ services, bridge, defaultOrgId, mentions, logge
 
       return errResult(`unknown tool: ${name}`);
     } catch (e) {
-      logger?.warn?.(`tool ${name} failed: ${e.message}`);
-      return errResult(e.message || String(e));
+      // Keep the network cause (undici hides it in e.cause behind a bare
+      // "fetch failed") so the agent and the log can tell what actually broke.
+      const msg = e?.message || String(e);
+      const cause = e?.cause && (e.cause.code || e.cause.message);
+      const detail = cause && !msg.includes(cause) ? `${msg} (${cause})` : msg;
+      logger?.warn?.(`tool ${name} failed: ${detail}`);
+      return errResult(detail);
     }
   };
 

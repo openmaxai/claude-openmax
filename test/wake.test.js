@@ -92,3 +92,45 @@ test('channelNoticeMeta: carries routing ids, omits sender when absent', () => {
   assert.equal(meta.openmax_conversation_id, 'conv1');
   assert.equal('openmax_sender_id' in meta, false);
 });
+
+// ── OPENM-1107 parse fixes ────────────────────────────────────────────────────
+
+const THREAD_EP = 'conv1|thread:th9|parent:msg0';
+
+test('deriveWakeRequest carries the SDK endpoint (thread replies land in the thread)', () => {
+  const w = deriveWakeRequest(inbound({ endpoint: THREAD_EP }));
+  assert.equal(w.endpoint, THREAD_EP);
+  assert.doesNotThrow(() => validateWakeRequest(w), 'endpoint is an allowed optional field');
+});
+
+test('validateWakeRequest rejects an empty endpoint', () => {
+  const w = deriveWakeRequest(inbound());
+  assert.throws(() => validateWakeRequest({ ...w, endpoint: '' }), /endpoint/);
+});
+
+test('notice + meta expose the thread endpoint and tell the agent to reply with it', () => {
+  const w = deriveWakeRequest(inbound({ endpoint: THREAD_EP }));
+  const content = channelNoticeContent([w]);
+  assert.match(content, /endpoint=conv1\|thread:th9\|parent:msg0/);
+  assert.ok(content.includes(`comm_send\` ({endpoint: "${THREAD_EP}", content, replyTo: "msg1"})`), content);
+  assert.equal(channelNoticeMeta([w]).openmax_endpoint, THREAD_EP);
+});
+
+test('plain DM: endpoint == conversation id is not repeated as its own line', () => {
+  const content = channelNoticeContent([deriveWakeRequest(inbound())]);
+  assert.ok(!/^endpoint=/m.test(content));
+  assert.ok(content.includes('({endpoint: "conv1", content, replyTo: "msg1"})'));
+});
+
+test('attachment-only message gets a non-empty preview naming the attachments', () => {
+  const w = deriveWakeRequest(inbound({ text: '', attachments: [{ file_name: 'shot.png', size: 10 }, { name: 'spec.pdf' }] }));
+  assert.equal(w.contentPreview, '[2 attachments: shot.png, spec.pdf]');
+  assert.doesNotThrow(() => validateWakeRequest(w), 'contentPreview must be non-empty for the split topology');
+});
+
+test('text + attachments: summary appended; long lists are capped', () => {
+  const many = Array.from({ length: 7 }, (_, i) => ({ file_name: `f${i}.txt` }));
+  const w = deriveWakeRequest(inbound({ text: 'see files', attachments: many }));
+  assert.equal(w.contentPreview, 'see files\n[7 attachments: f0.txt, f1.txt, f2.txt, f3.txt, f4.txt, +2 more]');
+  assert.equal(deriveWakeRequest(inbound({ attachments: [] })).contentPreview, 'hello world');
+});

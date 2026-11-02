@@ -141,3 +141,35 @@ test('channel-only, channel active but lock held by a live process: /wake refuse
     assert.equal(r.status, 503);
   } finally { s.child.kill('SIGTERM'); }
 });
+
+test('startup race: a key written after the server started is picked up (no restart needed)', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'claude-openmax-race-'));
+  const cfgPath = path.join(dir, 'config.json');
+  writeFileSync(cfgPath, JSON.stringify({ enabled: false, server: { bff_url: 'http://127.0.0.1:9' }, agent: { api_key: '' }, orgs: {} }));
+  const child = spawn(process.execPath, [BUNDLE], {
+    env: { ...process.env, CLAUDE_OPENMAX_CHANNEL: '0', CLAUDE_OPENMAX_DATA_DIR: path.join(dir, 'data'), CLAUDE_OPENMAX_CONFIG: cfgPath },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let err = '';
+  let out = '';
+  child.stderr.on('data', (d) => { err += d; });
+  child.stdout.on('data', (d) => { out += d; });
+  child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}\n');
+  child.stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"core","arguments":{"method":"me"}}}\n');
+  try {
+    await waitFor(() => /registration is still in progress/.test(out), 10000, () => `stdout:\n${out}\nstderr:\n${err}`);
+    writeFileSync(cfgPath, JSON.stringify({ enabled: false, server: { bff_url: 'http://127.0.0.1:9' }, agent: { api_key: 'cwsk_written_later' }, orgs: {} }));
+    await waitFor(() => /agent\.api_key found — continuing startup/.test(err), 10000, () => err);
+  } finally {
+    child.kill('SIGTERM');
+  }
+});
+
+async function waitFor(pred, ms, detail) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.fail(`condition not met in ${ms}ms\n${detail()}`);
+}

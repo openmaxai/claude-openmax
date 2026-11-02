@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [1.3.2] - 2026-11-02
+
+The rest of Plane OPENM-1107 / cws-core#269 (the gating part shipped in 1.3.1).
+
+### Fixed
+
+- **Startup race left a session offline for good** (`src/index.js`,
+  `waitForApiKey` in `src/config.js`). The MCP server read its config once at
+  startup while the `SessionStart` hook could still be registering; if it won the
+  race, the TokenManager was built with an empty key and never re-read it, so the
+  whole session stayed offline. With no usable key the server now advertises its
+  tools at once (they answer "registration in progress"), polls the config every
+  2 s for up to 120 s, and builds the runtime and connects once the key lands.
+- **"fetch failed" with no detail, and requests that could hang forever**
+  (`src/fetch-guard.js`, injected into the SDK `TokenManager` + `CwsHttpClient`).
+  15 s time-to-headers timeout for JSON API calls (uploads exempt); errors now read
+  `fetch failed: <METHOD> <path> → <cause>` / `fetch timed out after 15000ms: …`
+  (path only, no query string); token / refresh / ws-ticket calls retry twice on
+  network errors. Tool errors returned to Claude keep the cause too.
+- **Thread replies went to the main conversation** (`src/wake.js`). The wake now
+  carries the SDK's `endpoint` (`<conv>|thread:…|parent:…`) in the notice text,
+  the reply hint and `meta.openmax_endpoint`.
+- **Attachment-only messages had an empty preview** — the preview now ends with
+  `[N attachments: name, …]` (names only, at most five listed). This also keeps
+  such wakes valid for the split topology, which requires a non-empty preview.
+- A permanently terminated org connection (WS close 4002/4005/4006) is now also
+  pushed into the channel session as a notice instead of only being logged.
+
+### Documentation
+
+- Group-message behaviour is unchanged and now documented (README, CLAUDE.md):
+  with the default policy the agent only sees group messages that @-mention it.
+
+
 ## [1.3.1] - 2026-11-02
 
 Onboarding in one approval (Plane OPENM-1106 / cws-core#268), plus the three
