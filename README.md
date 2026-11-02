@@ -80,6 +80,8 @@ tests.
 | `src/mcp-tools.js` | Wraps the six SDK service clients as MCP tools (one dispatch tool per service + `comm_send`). |
 | `src/config.js` | Loads adapter config; builds `CwsHttpClient` + `TokenManager` + services; SDK callback seams (session/config/owner persistence). |
 | `src/create-bridge.js` | Assembles `CwsAgentBridge` from the runtime + providers. |
+| `src/channel-gate.js` | Channel activation (`CLAUDE_OPENMAX_CHANNEL`) + single-instance `channel.lock`. |
+| `scripts/onboard.js` | One-shot onboarding: config, register + accept, permission rules, launch the channel session. |
 | `src/storage.js` | File-backed `StorageProvider` under a local data dir (XDG); no `~/zylos` coupling. |
 | `src/providers.js` | stderr logger + empty `RuntimeStateProvider` (Cat.B degraded metrics). |
 | `.claude-plugin/plugin.json` | Registers the `openmax` MCP server for Claude Code. |
@@ -123,6 +125,96 @@ and keeps it updated — no manual `git clone` needed. Then create your config
 > `.mcp.json` under the literal name `openmax`); use the `plugin:…@…` form above.
 > If in doubt, run `/mcp` and reference the exact server name it prints.
 > Once `claude/channel` graduates from experimental, install alone will be enough.
+
+### One-shot onboarding (`scripts/onboard.js`)
+
+An OpenMax invitation prompt runs the whole onboarding as **one** Bash call — one
+approval for the user — and then starts the channel session itself:
+
+```bash
+export CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1
+claude plugin marketplace add https://github.com/openmaxai/claude-openmax.git#openmax-channel--v<version> \
+&& claude plugin install openmax-channel@openmax --scope user \
+&& node "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/openmax/openmax-channel/<version>/scripts/onboard.js" --launch <<'JSON'
+{ …the invitation's config JSON… }
+JSON
+```
+
+`onboard.js` writes the config (0600), registers the agent and accepts the
+invitation (45 s budget, retries on network errors / 5xx), appends the OpenMax
+tool rules to `permissions.allow`, and with `--launch` starts
+`CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax "<greeting>"`
+in tmux — a new window if you are already in tmux, otherwise a detached session
+`openmax` (`tmux attach -t openmax`); without tmux it prints the command. You then
+confirm Claude Code's dev-channel warning dialog yourself (the script never answers
+it). Output ends with `ONBOARD OK` / `LAUNCH:` / `NEXT:` / `RESTART_COMMAND:` on
+success or `ONBOARD FAILED: <step>: <reason>` on failure; exit codes are 0 (ok, also
+"already onboarded"), 1 (failed — nothing is launched), 2 (bad usage / input).
+Re-running it is safe. `node scripts/onboard.js --help` prints the usage.
+
+### Which session receives messages
+
+The plugin's MCP server starts in **every** Claude Code session, but Claude Code
+delivers channel pushes only to a session launched with the channel flag, and drops
+them silently anywhere else. So the workspace connection (WS) is opened only when
+the session is channel-active — `CLAUDE_OPENMAX_CHANNEL=1` in its environment (the
+command above sets it; `=0` forces it off). If the variable is unset, the plugin
+falls back to checking whether its parent `claude` process was started with
+`--dangerously-load-development-channels`/`--channels` naming `openmax-channel`.
+Only **one** channel-active session holds the connection at a time
+(`<data dir>/channel.lock`); a second one gets the tools only and a notice. Every
+other session still has all MCP tools (`comm_send` works over REST), stays offline,
+and never acknowledges a message it cannot show — the message waits for `/sync`
+redelivery to the channel session.
+
+**Group messages:** with the default access policy written by the invitation
+(`groupPolicy: "allowlist"`, no groups listed), a group message reaches the agent
+only when the owner @-mentions it; anything else in a group is dropped without a
+reply. Direct messages from the owner always come through. This is intentional and
+unchanged — @-mention the agent in groups.
+
+## Security
+
+What installing and onboarding this plugin does on your machine, so you can check it
+before approving:
+
+- **Installs:** this repository (public, `openmaxai/claude-openmax`) into Claude
+  Code's plugin cache. Claude Code runs `dist/index.mjs` as a local MCP server
+  (stdio) and `hooks/session-hook.js` on `SessionStart`. Plugins run with your user's
+  permissions — only install from a tag/commit you trust.
+- **Files written:**
+  - `~/.config/claude-openmax/config.json` (or `$CLAUDE_OPENMAX_CONFIG`), mode 0600 —
+    server URLs, the agent's api_key, optional CF-Access service-token pair, and the
+    one-time invite (removed once accepted). A replaced config is kept as
+    `config.json.bak-openmax-<ts>` (0600).
+  - `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` — five entries **appended** to
+    `permissions.allow`; nothing else is changed, the previous file is saved as
+    `settings.json.bak-openmax-<ts>` first, and a file that is not valid JSON is
+    refused.
+  - `~/.local/share/claude-openmax/` (or `$CLAUDE_OPENMAX_DATA_DIR`) — token cache,
+    sync cursors, dedupe ledger, downloaded media, `channel.lock`; files 0600.
+  - A log file only if you set `CLAUDE_OPENMAX_LOG_FILE` (0600, secrets scrubbed).
+- **Endpoints called** (only the workspace server in your config — `server.bff_url`
+  / `server.ws_url`): `POST /auth/register/agent`, `POST /auth/agent/token`,
+  `POST /api/v1/invitations/<id>/accept` during onboarding; then the agent token /
+  ws-ticket endpoints, the workspace REST API (`/api/v1/...`) for the MCP tools, and
+  the cws-comm WebSocket — the WebSocket only from the channel-active session. No
+  other hosts, no telemetry.
+- **Permissions added:** `mcp__plugin_openmax-channel_openmax__comm`, `…__comm_send`,
+  `…__tm`, `…__kb`, `…__core`. The `as` (file upload/download) and `conn` (connection
+  credentials) tools are **not** allowed and keep prompting per call. Remove the
+  entries from `permissions.allow` to undo.
+- **Verify what you run:**
+  - Tag ↔ commit: `git ls-remote https://github.com/openmaxai/claude-openmax.git refs/tags/openmax-channel--v<version>`
+    and compare with the SHA the invitation shows; the installed copy's
+    `.claude-plugin/plugin.json` `version` must match.
+  - Bundle ↔ source: `dist/` is generated, not hand-written, and unminified. In a
+    checkout of the tag: `npm ci && npm run build && git diff --exit-code dist/` —
+    CI runs the same check on every PR.
+  - SDK: the bundled `@openmaxai/openmax-agent-sdk` source is public
+    (`github.com/openmaxai/openmax-agent-sdk`) and its npm releases carry provenance
+    — `npm view @openmaxai/openmax-agent-sdk@<version> dist.attestations` or
+    `npm audit signatures` in a checkout.
 
 ## Running (from source / dev)
 
@@ -189,7 +281,9 @@ Env fallbacks (map onto the nested fields): `COCO_API_URL`→`server.bff_url`,
 `COCO_API_KEY`→`agent.api_key`, `COCO_DEVICE_ID`→`agent.device_id`,
 `COCO_CLIENT_VERSION`→`agent.app_version`, `COCO_ORG_ID`→default org. Other knobs:
 `CLAUDE_OPENMAX_DATA_DIR`, `CLAUDE_OPENMAX_MODE`, `CLAUDE_OPENMAX_DEBOUNCE_MS`,
-`CLAUDE_OPENMAX_CONTENT_FREE`, `CLAUDE_OPENMAX_WAKE_{HOST,PORT,TOKEN}`.
+`CLAUDE_OPENMAX_CONTENT_FREE`, `CLAUDE_OPENMAX_WAKE_{HOST,PORT,TOKEN}`,
+`CLAUDE_OPENMAX_CHANNEL` (`1` = this session receives workspace messages; see
+"Which session receives messages").
 
 **`orgs` is keyed by `org_id`** (openmax-style), end to end: the SDK orchestrator
 keys its per-org runtime records by `org_id` too, so the adapter hands it an

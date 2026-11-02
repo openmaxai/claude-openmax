@@ -8,6 +8,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [1.3.1] - 2026-11-02
+
+Onboarding in one approval (Plane OPENM-1106 / cws-core#268), plus the three
+OPENM-1107 gating fixes it depends on (Plane OPENM-1107 / cws-core#269): the
+onboard script starts a second Claude Code session while the first is still
+running, and without the gate both would hold the workspace connection.
+
+### Added
+
+- **`scripts/onboard.js`** — one command for the invitation prompt: write the
+  config from stdin (0600), register + accept the invitation (45 s budget, 3
+  retries on network errors / 5xx), append the OpenMax tool rules to
+  `permissions.allow` in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`
+  (append-only, backup first, corrupt JSON refused), self-check, and with
+  `--launch` start `CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax`
+  in tmux (new window inside tmux, detached `openmax` session outside, printed
+  command without tmux). Prints `ONBOARD OK` … `RESTART_COMMAND: …` or
+  `ONBOARD FAILED: <step>: <reason>`; exit 0 / 1 / 2. Idempotent: a re-run keeps
+  the existing registration, does not duplicate rules and reuses the tmux window.
+  Nothing is launched after any failure, and no dialog is ever answered for the user.
+- Allowed tools: `comm`, `comm_send`, `tm`, `kb`, `core`. `as` and `conn` still
+  prompt per call.
+- README **Security** section: what is installed, files written, endpoints called,
+  permissions added, how to verify tag / commit / bundle / SDK provenance.
+
+### Fixed
+
+- **Only a channel-active session connects to the workspace** (`src/channel-gate.js`,
+  `src/index.js`). Every Claude Code session started the MCP server and opened the WS,
+  so a session without the channel showed the agent online while Claude Code dropped
+  its pushes. The WS now opens only with `CLAUDE_OPENMAX_CHANNEL=1` (fallback when
+  unset: the parent `claude` argv carries the channel flag for this plugin); other
+  sessions keep every tool.
+- **Single instance:** `<data dir>/channel.lock` (pid, O_EXCL, stale lock taken over).
+  A second channel-active session runs tools-only and is told so, instead of
+  processing every message twice.
+- **No false delivery ack:** a session that may not deliver refuses the wake
+  (`runtime_unavailable`), so the SDK returns `ok:false`, does not mark the message
+  read or advance the cursor, and redelivers it via `/sync` to the channel session.
+- `hooks/auto-register.js` run standalone printed `no-op (already registered / nothing
+  to do)` and exited 0 when registration **failed**. It now prints `FAILED: <step> →
+  <reason>` (with the network cause, e.g. `fetch failed (ECONNREFUSED)`) and exits 1;
+  a real no-op still exits 0. The SessionStart hook keeps its 8 s budget and always
+  exits 0.
+
+
 ## [1.3.0] - 2026-09-18
 
 Makes the outbound `@mention` resolution that landed in the previous commit

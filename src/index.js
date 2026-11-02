@@ -9,6 +9,13 @@
  * channel — the /wake HTTP hop is skipped but its wire shape (WakeRequest) is
  * preserved so the split can be cut later.
  *
+ * The workspace WS is opened ONLY in a session where the channel is active
+ * (CLAUDE_OPENMAX_CHANNEL=1, see channel-gate.js) and only by the one process
+ * holding <dataDir>/channel.lock. Every other session still gets the full MCP
+ * tool set (comm_send goes over REST and needs no WS) but stays off the wire and
+ * refuses wakes, so it can neither show the agent online nor ack messages it
+ * would never display (OPENM-1107).
+ *
  * Set CLAUDE_OPENMAX_MODE=channel-only to run JUST the channel + an HTTP
  * /wake server (topology 1); the bridge then runs separately (src/bridge.js)
  * and survives Claude Code session restarts, redelivering via SDK /sync.
@@ -32,6 +39,7 @@ import { startOwnerSync } from './owner-sync.js';
 import { startWakeServer } from './wake-server.js';
 import { guardStaleTokenCache, writeApiKeyMarkers } from './token-guard.js';
 import { PKG_VERSION } from './version.js';
+import { resolveChannelActivation, acquireChannelLock, CHANNEL_ENV } from './channel-gate.js';
 
 async function main() {
   const mode = process.env.CLAUDE_OPENMAX_MODE || 'inproc';
@@ -73,6 +81,31 @@ async function main() {
     logger,
   });
   channel.registerTools(defs, handler);
+
+  // ── channel activation gate + single-instance lock (OPENM-1107) ─────────────
+  const activation = resolveChannelActivation();
+  let channelLock = null;
+  let lockBusy = null;
+  if (activation.active && mode !== 'channel-only') {
+    const lock = acquireChannelLock({ dataDir: storage.dataDir });
+    if (lock.acquired) channelLock = lock;
+    else lockBusy = lock;
+  }
+  // channel-only (split topology): no WS in this process; the gate only decides
+  // whether wakes POSTed by the external bridge may be accepted.
+  const wsEnabled = !!channelLock;
+  const deliveryEnabled = mode === 'channel-only' ? activation.active : wsEnabled;
+  channel.setDeliveryEnabled(deliveryEnabled, !activation.active
+    ? `channel not active in this session (${CHANNEL_ENV} unset and no channel flag detected)`
+    : `another session holds the OpenMax channel (${lockBusy?.reason || 'lock busy'})`);
+  if (!activation.active) {
+    logger.info(`channel NOT active in this session (${CHANNEL_ENV}!=1, no channel flag on the parent) — tools only, workspace WS stays closed`);
+  } else if (lockBusy) {
+    logger.warn(`channel active but ${lockBusy.path} is ${lockBusy.reason} — this session runs tools only; the other session keeps receiving messages`);
+  } else if (channelLock) {
+    logger.info(`channel active (source=${activation.source}); holding ${channelLock.path}`);
+  }
+  if (channelLock) process.once('exit', () => channelLock.release());
 
   const notifier = new DebouncedWakeNotifier({
     notify: (wakes) => channel.notifyWake(wakes),
@@ -126,7 +159,17 @@ async function main() {
   // so the channel is ready to accept a wake the moment the WS delivers one.
   await channel.connect(new StdioServerTransport());
 
-  if (bridge) {
+  if (lockBusy) {
+    // This session loaded the channel, so it can see this notice.
+    void channel.notifyNotice(
+      'OpenMax: another Claude Code session is already connected to the workspace channel'
+      + `${lockBusy.holderPid ? ` (pid ${lockBusy.holderPid})` : ''}. This session will NOT receive workspace `
+      + 'messages; the OpenMax tools (comm_send, tm, kb, ...) still work here. Close the other session '
+      + 'and restart this one to move the channel here.',
+    );
+  }
+
+  if (bridge && wsEnabled) {
     // Belt-and-suspenders for the org-keyed token cache bug: if agent.api_key
     // changed since the last successful connect, purge the org's cached
     // token/session/inbox BEFORE connecting so a fresh JWT is exchanged for the
@@ -154,6 +197,7 @@ async function main() {
     try { if (bridge) await bridge.stop(); } catch { /* ignore */ }
     try { if (wakeServer) await wakeServer.close(); } catch { /* ignore */ }
     try { await channel.close(); } catch { /* ignore */ }
+    try { if (channelLock) channelLock.release(); } catch { /* ignore */ }
     process.exit(0);
   };
   process.stdin.once('end', () => void shutdown());

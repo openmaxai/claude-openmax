@@ -8159,7 +8159,7 @@ var CwsAgentBridge = class {
 // src/version.js
 var version;
 if (true) {
-  version = "1.3.0";
+  version = "1.3.1";
 } else {
   version = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")

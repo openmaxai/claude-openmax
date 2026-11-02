@@ -17,7 +17,7 @@ const BUNDLE = fileURLToPath(new URL('../dist/index.mjs', import.meta.url));
 const EXPECTED_TOOLS = ['tm', 'kb', 'as', 'comm', 'core', 'conn', 'comm_send'];
 
 /** Spawn the bundle, send JSON-RPC init + tools/list, resolve with {tools, stderr}. */
-function probeBundle() {
+function probeBundle(extraEnv = {}) {
   // Hermetic: disabled + no orgs => no workspace WS; bff_url points at a
   // closed port so the best-effort /me fails fast instead of reaching out.
   const dir = mkdtempSync(path.join(tmpdir(), 'claude-openmax-smoke-'));
@@ -26,7 +26,7 @@ function probeBundle() {
 
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BUNDLE], {
-      env: { ...process.env, CLAUDE_OPENMAX_CONFIG: cfgPath },
+      env: { ...process.env, CLAUDE_OPENMAX_CHANNEL: '', CLAUDE_OPENMAX_DATA_DIR: path.join(dir, 'data'), CLAUDE_OPENMAX_CONFIG: cfgPath, ...extraEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let out = '';
@@ -64,4 +64,16 @@ test('shipped bundle starts over stdio and lists all service tools (no dynamic-r
   for (const name of EXPECTED_TOOLS) {
     assert.ok(tools.includes(name), `bundle did not expose the "${name}" tool; got: ${tools.join(', ')}`);
   }
+});
+
+test('bundle in a session WITHOUT the channel stays off the WS (tools only)', async () => {
+  const { tools, stderr } = await probeBundle({ CLAUDE_OPENMAX_CHANNEL: '0' });
+  assert.ok(tools.includes('comm_send'));
+  assert.match(stderr, /channel NOT active in this session/);
+  assert.ok(!/bridge started/.test(stderr), 'must not start the bridge without the channel');
+});
+
+test('bundle with CLAUDE_OPENMAX_CHANNEL=1 takes the channel lock', async () => {
+  const { stderr } = await probeBundle({ CLAUDE_OPENMAX_CHANNEL: '1' });
+  assert.match(stderr, /channel active \(source=env\); holding .*channel\.lock/);
 });

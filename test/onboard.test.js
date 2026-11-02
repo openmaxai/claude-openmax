@@ -1,0 +1,367 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, statSync, existsSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+import {
+  ALLOW_RULES, CHANNEL_REF, GREETING_PROMPT,
+  mergePermissions, checkSettingsEditable, mergeIncomingConfig, parseIncomingConfig,
+  buildLaunchCommand, chooseLaunchMode, launchInTmux, cleanEnv, shellQuote, runOnboard,
+} from '../scripts/onboard.js';
+import { registerAndAccept } from '../hooks/auto-register.js';
+
+const tmp = (p = 'claude-openmax-onboard-') => mkdtempSync(path.join(tmpdir(), p));
+
+// ── permission rules (Q1) ──────────────────────────────────────────────────────
+
+test('ALLOW_RULES is exactly comm/comm_send/tm/kb/core under the plugin MCP prefix (no as/conn)', () => {
+  assert.deepEqual(ALLOW_RULES, [
+    'mcp__plugin_openmax-channel_openmax__comm',
+    'mcp__plugin_openmax-channel_openmax__comm_send',
+    'mcp__plugin_openmax-channel_openmax__tm',
+    'mcp__plugin_openmax-channel_openmax__kb',
+    'mcp__plugin_openmax-channel_openmax__core',
+  ]);
+  assert.ok(!ALLOW_RULES.some((r) => /__(as|conn)$/.test(r)));
+});
+
+test('rule names match the real plugin/server/tool names', async () => {
+  const plugin = JSON.parse(readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8'));
+  const server = Object.keys(plugin.mcpServers)[0];
+  const { createMcpTools } = await import('../src/mcp-tools.js');
+  const stub = Object.fromEntries(['tm', 'kb', 'as', 'comm', 'core', 'conn'].map((k) => [k, {}]));
+  const toolNames = createMcpTools({ services: stub }).defs.map((d) => d.name);
+  for (const rule of ALLOW_RULES) {
+    const m = rule.match(/^mcp__plugin_(.+?)_(.+?)__(.+)$/);
+    assert.equal(m[1], plugin.name);
+    assert.equal(m[2], server);
+    assert.ok(toolNames.includes(m[3]), `${m[3]} is a real tool`);
+  }
+});
+
+test('mergePermissions creates settings.json when absent (no backup needed)', () => {
+  const file = path.join(tmp(), 'nested', 'settings.json');
+  const r = mergePermissions(file, ALLOW_RULES, 0);
+  assert.equal(r.changed, true);
+  assert.equal(r.backup, null);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { permissions: { allow: ALLOW_RULES } });
+});
+
+test('mergePermissions is append-only: keeps other keys + existing rules order, backs up first, no duplicates', () => {
+  const dir = tmp();
+  const file = path.join(dir, 'settings.json');
+  const original = { model: 'opus', permissions: { allow: ['Bash(ls:*)', ALLOW_RULES[1]], deny: ['Read(.env)'] }, hooks: { x: 1 } };
+  writeFileSync(file, JSON.stringify(original));
+  const r = mergePermissions(file, ALLOW_RULES, Date.UTC(2026, 10, 2, 12, 0, 0));
+  assert.equal(r.changed, true);
+  assert.deepEqual(r.added, ALLOW_RULES.filter((x) => x !== ALLOW_RULES[1]));
+  const out = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(out.model, 'opus');
+  assert.deepEqual(out.hooks, { x: 1 });
+  assert.deepEqual(out.permissions.deny, ['Read(.env)']);
+  assert.deepEqual(out.permissions.allow.slice(0, 2), ['Bash(ls:*)', ALLOW_RULES[1]]);
+  assert.equal(out.permissions.allow.length, 2 + 4);
+  assert.ok(r.backup.endsWith('settings.json.bak-openmax-20261102T120000Z'));
+  assert.deepEqual(JSON.parse(readFileSync(r.backup, 'utf8')), original);
+
+  // idempotent: second run changes nothing and makes no second backup
+  const r2 = mergePermissions(file, ALLOW_RULES, Date.UTC(2026, 10, 2, 13, 0, 0));
+  assert.equal(r2.changed, false);
+  assert.equal(readdirSync(dir).filter((f) => f.includes('.bak-openmax-')).length, 1);
+});
+
+test('mergePermissions refuses a corrupt settings.json and leaves it untouched', () => {
+  const file = path.join(tmp(), 'settings.json');
+  writeFileSync(file, '{ "permissions": { "allow": [ ');
+  assert.throws(() => mergePermissions(file), /not valid JSON/);
+  assert.equal(readFileSync(file, 'utf8'), '{ "permissions": { "allow": [ ');
+});
+
+test('checkSettingsEditable refuses a non-array permissions.allow', () => {
+  const file = path.join(tmp(), 'settings.json');
+  writeFileSync(file, JSON.stringify({ permissions: { allow: 'mcp__x' } }));
+  assert.throws(() => checkSettingsEditable(file), /permissions\.allow" is not an array/);
+});
+
+// ── config merge ──────────────────────────────────────────────────────────────
+
+const incoming = () => ({
+  server: { bff_url: 'https://core.test', ws_url: 'wss://ws.test' },
+  agent: { identity_id: '', api_key: '', device_id: 'dev-1' },
+  orgs: { o1: { org_id: 'o1', owner: { member_id: 'own', name: 'Gavin' } } },
+  invite: { invitation_id: 'inv-1', token: 'tok-1' },
+});
+
+test('mergeIncomingConfig keeps an existing registration for the same server + org (re-run)', () => {
+  const existing = { server: { bff_url: 'https://core.test/' }, agent: { identity_id: 'id-1', api_key: 'cwsk_live' }, orgs: { o1: { org_id: 'o1', self: { member_id: 'm1' } } } };
+  const { config, preserved } = mergeIncomingConfig(existing, incoming());
+  assert.equal(preserved, true);
+  assert.equal(config.agent.api_key, 'cwsk_live');
+  assert.equal(config.orgs.o1.self.member_id, 'm1');
+  assert.deepEqual(config.invite, { invitation_id: 'inv-1', token: 'tok-1' });
+  assert.equal(config.server.ws_url, 'wss://ws.test');
+});
+
+test('mergeIncomingConfig replaces the config for a different server, a new org, or no key', () => {
+  const base = { server: { bff_url: 'https://core.test' }, agent: { api_key: 'cwsk_live' }, orgs: { o1: {} } };
+  assert.equal(mergeIncomingConfig({ ...base, server: { bff_url: 'https://other' } }, incoming()).preserved, false);
+  assert.equal(mergeIncomingConfig({ ...base, orgs: { o2: {} } }, incoming()).preserved, false);
+  assert.equal(mergeIncomingConfig({ ...base, agent: { api_key: 'cwsk_replace_me' } }, incoming()).preserved, false);
+  assert.equal(mergeIncomingConfig(undefined, incoming()).preserved, false);
+});
+
+test('parseIncomingConfig rejects non-JSON and configs without bff_url/orgs (exit code 2)', () => {
+  assert.throws(() => parseIncomingConfig('nope'), (e) => e.code === 2);
+  assert.throws(() => parseIncomingConfig('{"orgs":{"a":{}}}'), (e) => e.code === 2 && /bff_url/.test(e.reason));
+  assert.throws(() => parseIncomingConfig('{"server":{"bff_url":"x"},"orgs":{}}'), (e) => e.code === 2 && /orgs/.test(e.reason));
+});
+
+// ── launch command + mode ────────────────────────────────────────────────────
+
+test('buildLaunchCommand: channel env + flag + plugin ref + quoted greeting, no resume', () => {
+  const cmd = buildLaunchCommand({ env: {} });
+  assert.ok(cmd.startsWith('CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax '));
+  assert.ok(cmd.endsWith(shellQuote(GREETING_PROMPT)));
+  assert.ok(!/--continue|--resume/.test(cmd), 'Q7: the new session does not resume the old conversation');
+  assert.equal(CHANNEL_REF, 'plugin:openmax-channel@openmax');
+});
+
+test('buildLaunchCommand(stripEnv) unsets the "already running" markers and forwards location overrides', () => {
+  const cmd = buildLaunchCommand({ claudeBin: '/opt/bin/claude', stripEnv: true, env: { CLAUDE_CONFIG_DIR: '/h/my dir', CLAUDECODE: '1' } });
+  assert.ok(cmd.startsWith('env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT '));
+  assert.ok(cmd.includes("CLAUDE_CONFIG_DIR='/h/my dir'"));
+  assert.ok(cmd.includes('CLAUDE_OPENMAX_CHANNEL=1 /opt/bin/claude --dangerously-load-development-channels'));
+});
+
+test('shellQuote survives single quotes', () => {
+  assert.equal(shellQuote("it's"), `'it'\\''s'`);
+});
+
+test('cleanEnv strips CLAUDECODE + CLAUDE_CODE_ENTRYPOINT only', () => {
+  assert.deepEqual(cleanEnv({ CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', PATH: '/bin' }), { PATH: '/bin' });
+});
+
+test('chooseLaunchMode: tmux window inside tmux, detached session outside, manual otherwise', () => {
+  assert.equal(chooseLaunchMode({ env: { TMUX: '/tmp/t,1,0' }, platform: 'linux', tmuxAvailable: true }).mode, 'tmux-window');
+  assert.equal(chooseLaunchMode({ env: {}, platform: 'darwin', tmuxAvailable: true }).mode, 'tmux-session');
+  assert.equal(chooseLaunchMode({ env: {}, platform: 'darwin', tmuxAvailable: false }).mode, 'manual');
+  assert.equal(chooseLaunchMode({ env: {}, platform: 'win32', tmuxAvailable: true }).mode, 'manual');
+  assert.equal(chooseLaunchMode({ env: { CLAUDE_CODE_ENTRYPOINT: 'claude-vscode' }, platform: 'linux', tmuxAvailable: true }).mode, 'manual');
+  assert.equal(chooseLaunchMode({ env: { CLAUDE_CODE_ENTRYPOINT: 'cli' }, platform: 'linux', tmuxAvailable: true }).mode, 'tmux-session');
+});
+
+function fakeExec(responses = {}) {
+  const calls = [];
+  const exec = (cmd, args, opts) => {
+    calls.push({ cmd, args, env: opts?.env });
+    const key = `${cmd} ${args[0] || ''}`;
+    const r = responses[key];
+    return typeof r === 'function' ? r(args) : (r || { status: 0, stdout: '', stderr: '' });
+  };
+  return { exec, calls };
+}
+
+test('launchInTmux inside tmux opens a new window running the channel command (env cleaned, no send-keys)', () => {
+  const { exec, calls } = fakeExec({ 'tmux list-windows': { status: 0, stdout: 'main\n' } });
+  const r = launchInTmux({ mode: 'tmux-window', cwd: '/work', env: { TMUX: 'x', CLAUDECODE: '1' }, exec, claudeBin: 'claude' });
+  assert.deepEqual(r, { launched: true, mode: 'tmux-window', reused: false });
+  const nw = calls.find((c) => c.args[0] === 'new-window');
+  assert.deepEqual(nw.args.slice(0, 5), ['new-window', '-n', 'openmax', '-c', '/work']);
+  assert.ok(nw.args[5].includes('CLAUDE_OPENMAX_CHANNEL=1'));
+  assert.equal(nw.env.CLAUDECODE, undefined);
+  assert.ok(!calls.some((c) => c.args.includes('send-keys')));
+});
+
+test('launchInTmux reuses an existing "openmax" window instead of starting a second session', () => {
+  const { exec, calls } = fakeExec({ 'tmux list-windows': { status: 0, stdout: 'main\nopenmax\n' } });
+  const r = launchInTmux({ mode: 'tmux-window', cwd: '/w', env: { TMUX: 'x' }, exec });
+  assert.equal(r.reused, true);
+  assert.ok(calls.some((c) => c.args[0] === 'select-window'));
+  assert.ok(!calls.some((c) => c.args[0] === 'new-window'));
+});
+
+test('launchInTmux outside tmux starts a detached "openmax" session and returns the attach command', () => {
+  const { exec, calls } = fakeExec({ 'tmux has-session': { status: 1 } });
+  const r = launchInTmux({ mode: 'tmux-session', cwd: '/w', env: {}, exec });
+  assert.equal(r.launched, true);
+  assert.equal(r.attach, 'tmux attach -t openmax');
+  assert.deepEqual(calls.find((c) => c.args[0] === 'new-session').args.slice(0, 6), ['new-session', '-d', '-s', 'openmax', '-c', '/w']);
+});
+
+test('launchInTmux reuses an existing detached session', () => {
+  const { exec, calls } = fakeExec({ 'tmux has-session': { status: 0 } });
+  const r = launchInTmux({ mode: 'tmux-session', cwd: '/w', env: {}, exec });
+  assert.equal(r.reused, true);
+  assert.ok(!calls.some((c) => c.args[0] === 'new-session'));
+});
+
+// ── end-to-end runOnboard (real registerAndAccept, mocked fetch) ───────────────
+
+const jsonRes = (status, body) => ({ ok: status >= 200 && status < 300, status, async text() { return JSON.stringify(body); } });
+
+async function withEnv(vars, fn) {
+  const prev = {};
+  for (const k of Object.keys(vars)) { prev[k] = process.env[k]; process.env[k] = vars[k]; }
+  try { return await fn(); } finally {
+    for (const k of Object.keys(vars)) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; }
+  }
+}
+
+async function withFetch(impl, fn) {
+  const orig = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, opts) => { calls.push({ url, opts }); return impl(url, opts); };
+  try { return await fn(calls); } finally { globalThis.fetch = orig; }
+}
+
+const happyServer = (url) => {
+  if (url.endsWith('/auth/register/agent')) return jsonRes(200, { data: { identity_id: 'id-new', api_key: 'cwsk_secret_value' } });
+  if (url.endsWith('/auth/agent/token')) return jsonRes(200, { data: { access_token: 'acc-tok' } });
+  if (url.includes('/invitations/inv-1/accept')) return jsonRes(200, { data: { member_id: 'm1' } });
+  return jsonRes(404, {});
+};
+
+function setup() {
+  const dir = tmp();
+  const cfgPath = path.join(dir, 'cfg', 'config.json');
+  const claudeDir = path.join(dir, 'claude');
+  return { dir, cfgPath, claudeDir, env: { HOME: dir, CLAUDE_CONFIG_DIR: claudeDir, PATH: '/usr/bin' } };
+}
+
+async function onboard(s, { argv = ['--launch'], stdinText = JSON.stringify(incoming()), env = s.env, exec, register, fetchImpl = happyServer } = {}) {
+  const lines = [];
+  const fx = exec || fakeExec({ 'tmux has-session': { status: 1 }, 'claude --version': { status: 0, stdout: '2.1.308 (Claude Code)\n' } }).exec;
+  const code = await withEnv({ CLAUDE_OPENMAX_CONFIG: s.cfgPath }, () => withFetch(fetchImpl, (calls) => runOnboard({
+    argv, stdinText, env, cwd: s.dir, platform: 'linux', print: (l) => lines.push(l), exec: fx,
+    register: register || ((o) => registerAndAccept({ ...o, backoffMs: [1] })),
+    now: Date.UTC(2026, 10, 2),
+  }).then((c) => { lines.fetchCalls = calls; return c; })));
+  return { code, lines, out: lines.join('\n') };
+}
+
+test('runOnboard happy path: 0600 config, registered + accepted, rules merged, tmux session, ONBOARD OK then RESTART_COMMAND last', async () => {
+  const s = setup();
+  const { exec, calls } = fakeExec({ 'tmux has-session': { status: 1 }, 'claude --version': { status: 0, stdout: '2.1.308\n' } });
+  const { code, lines, out } = await onboard(s, { exec });
+  assert.equal(code, 0, out);
+  assert.equal(statSync(s.cfgPath).mode & 0o777, 0o600);
+  const cfg = JSON.parse(readFileSync(s.cfgPath, 'utf8'));
+  assert.equal(cfg.agent.api_key, 'cwsk_secret_value');
+  assert.equal(cfg.invite, undefined, 'invite cleared after accept');
+  const settings = JSON.parse(readFileSync(path.join(s.claudeDir, 'settings.json'), 'utf8'));
+  assert.deepEqual(settings.permissions.allow, ALLOW_RULES);
+  const okIdx = lines.indexOf('ONBOARD OK');
+  assert.ok(okIdx > 0);
+  assert.equal(lines[okIdx + 1], 'LAUNCH: tmux-session');
+  assert.ok(lines[okIdx + 2].startsWith('NEXT: Run `tmux attach -t openmax`'));
+  assert.ok(lines.at(-1).startsWith('RESTART_COMMAND: '));
+  assert.ok(lines.at(-1).includes('CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax'));
+  assert.ok(calls.some((c) => c.cmd === 'tmux' && c.args[0] === 'new-session'));
+  assert.ok(!out.includes('cwsk_secret_value'), 'never prints the api_key');
+  assert.ok(!out.includes('tok-1'), 'never prints the invitation token');
+});
+
+test('runOnboard without --launch prints the restart command and launches nothing', async () => {
+  const s = setup();
+  const { exec, calls } = fakeExec();
+  const { code, lines } = await onboard(s, { argv: [], exec });
+  assert.equal(code, 0);
+  assert.ok(lines.includes('LAUNCH: none'));
+  assert.ok(!calls.some((c) => c.cmd === 'tmux'));
+});
+
+test('runOnboard without tmux falls back to LAUNCH: manual with the exact command', async () => {
+  const s = setup();
+  const { exec } = fakeExec({ 'tmux -V': { status: null, error: new Error('ENOENT') } });
+  const { code, lines } = await onboard(s, { exec });
+  assert.equal(code, 0);
+  assert.ok(lines.includes('LAUNCH: manual'));
+  assert.ok(lines.at(-1).includes('--dangerously-load-development-channels plugin:openmax-channel@openmax'));
+});
+
+test('runOnboard: register failure → ONBOARD FAILED, exit 1, nothing launched, settings untouched', async () => {
+  const s = setup();
+  const { exec, calls } = fakeExec();
+  const { code, lines } = await onboard(s, { exec, fetchImpl: () => jsonRes(503, { error: 'down' }) });
+  assert.equal(code, 1);
+  assert.equal(lines.at(-1), 'ONBOARD FAILED: POST /auth/register/agent: HTTP 503: {"error":"down"}');
+  assert.ok(!lines.includes('ONBOARD OK'));
+  assert.ok(!calls.some((c) => c.cmd === 'tmux'));
+  assert.equal(existsSync(path.join(s.claudeDir, 'settings.json')), false);
+});
+
+test('runOnboard: register is retried within the budget (transient 5xx then success)', async () => {
+  const s = setup();
+  let n = 0;
+  const flaky = (url) => (url.endsWith('/auth/register/agent') && n++ < 2 ? jsonRes(502, {}) : happyServer(url));
+  const { code, out } = await onboard(s, { fetchImpl: flaky });
+  assert.equal(code, 0, out);
+  assert.equal(n, 3);
+});
+
+test('runOnboard: accept failure → FAILED and the invite is kept for retry', async () => {
+  const s = setup();
+  const fetchImpl = (url) => (url.includes('/accept') ? jsonRes(410, { error: { detail: 'expired' } }) : happyServer(url));
+  const { code, lines } = await onboard(s, { fetchImpl });
+  assert.equal(code, 1);
+  assert.match(lines.at(-1), /^ONBOARD FAILED: POST \/api\/v1\/invitations\/<id>\/accept: HTTP 410/);
+  assert.ok(JSON.parse(readFileSync(s.cfgPath, 'utf8')).invite);
+});
+
+test('runOnboard: corrupt settings.json fails in preflight BEFORE any network call', async () => {
+  const s = setup();
+  mkdirSync(s.claudeDir, { recursive: true });
+  writeFileSync(path.join(s.claudeDir, 'settings.json'), '{broken');
+  let registered = false;
+  const { code, lines } = await onboard(s, { register: async () => { registered = true; return { status: 'changed' }; } });
+  assert.equal(code, 1);
+  assert.match(lines.at(-1), /^ONBOARD FAILED: preflight: .*not valid JSON/);
+  assert.equal(registered, false);
+  assert.equal(existsSync(s.cfgPath), false, 'config not written either');
+});
+
+test('runOnboard: invalid stdin JSON → exit 2', async () => {
+  const s = setup();
+  const { code, lines } = await onboard(s, { stdinText: '{nope' });
+  assert.equal(code, 2);
+  assert.match(lines.at(-1), /^ONBOARD FAILED: config: stdin is not valid JSON/);
+});
+
+test('runOnboard re-run of the same invitation is idempotent: key kept, no re-register, no duplicate rules', async () => {
+  const s = setup();
+  assert.equal((await onboard(s)).code, 0);
+  const key1 = JSON.parse(readFileSync(s.cfgPath, 'utf8')).agent.api_key;
+  const second = await onboard(s);
+  assert.equal(second.code, 0, second.out);
+  assert.ok(second.lines.includes('[onboard] already onboarded'), second.out);
+  assert.ok(!second.lines.fetchCalls.some((c) => c.url.endsWith('/auth/register/agent')), 'must not register a second identity');
+  assert.equal(JSON.parse(readFileSync(s.cfgPath, 'utf8')).agent.api_key, key1);
+  const settings = JSON.parse(readFileSync(path.join(s.claudeDir, 'settings.json'), 'utf8'));
+  assert.equal(settings.permissions.allow.length, ALLOW_RULES.length);
+});
+
+test('runOnboard replacing a registered config for a different server backs the old one up (0600)', async () => {
+  const s = setup();
+  mkdirSync(path.dirname(s.cfgPath), { recursive: true });
+  writeFileSync(s.cfgPath, JSON.stringify({ server: { bff_url: 'https://old' }, agent: { api_key: 'cwsk_old' }, orgs: { z: {} } }));
+  const { code } = await onboard(s);
+  assert.equal(code, 0);
+  const bak = readdirSync(path.dirname(s.cfgPath)).find((f) => f.startsWith('config.json.bak-openmax-'));
+  assert.ok(bak);
+  assert.equal(statSync(path.join(path.dirname(s.cfgPath), bak)).mode & 0o777, 0o600);
+});
+
+test('runOnboard --no-stdin with no existing config → exit 2', async () => {
+  const s = setup();
+  const { code, lines } = await onboard(s, { argv: ['--no-stdin'], stdinText: '' });
+  assert.equal(code, 2);
+  assert.match(lines.at(-1), /no config on stdin/);
+});
+
+test('runOnboard warns (does not fail) on Bedrock', async () => {
+  const s = setup();
+  const { code, out } = await onboard(s, { env: { ...s.env, CLAUDE_CODE_USE_BEDROCK: '1' } });
+  assert.equal(code, 0);
+  assert.match(out, /not available on Amazon Bedrock/);
+});

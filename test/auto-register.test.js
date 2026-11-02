@@ -4,7 +4,10 @@ import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync } from '
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { ensureRegistered, resolveConfigPath } from '../hooks/auto-register.js';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+import { ensureRegistered, resolveConfigPath, registerAndAccept, describeOutcome, describeFetchError } from '../hooks/auto-register.js';
 
 function seedConfig(overrides = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'claude-openmax-reg-'));
@@ -254,4 +257,93 @@ test('invite is NOT cleared when acceptance fails (so it retries next session)',
     return jsonRes(404, {});
   }, () => ensureRegistered()));
   assert.deepEqual(JSON.parse(readFileSync(cfgPath, 'utf8')).invite, { invitation_id: 'inv-f', token: 'tok-f' }, 'invite retained on failure');
+});
+
+// ── structured outcome + retries (OPENM-1106) ─────────────────────────────────
+
+test('registerAndAccept reports failed (not "no-op") when registration fails, with step + reason', async () => {
+  const cfgPath = seedConfig();
+  const res = await runWith(cfgPath, () => withFetch(() => jsonRes(500, { error: 'boom' }), () => registerAndAccept()));
+  assert.equal(res.status, 'failed');
+  assert.equal(res.step, 'POST /auth/register/agent');
+  assert.match(res.reason, /^HTTP 500/);
+  assert.match(describeOutcome(res), /^FAILED: POST \/auth\/register\/agent → HTTP 500/);
+});
+
+test('registerAndAccept retries 5xx and network errors when retries > 0, then succeeds', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const res = await runWith(cfgPath, () => withFetch((url) => {
+    n++;
+    if (n === 1) { const e = new TypeError('fetch failed'); e.cause = { code: 'ECONNRESET' }; throw e; }
+    if (n === 2) return jsonRes(503, {});
+    return jsonRes(200, { identity_id: 'id-r', api_key: 'cwsk_r' });
+  }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
+  assert.equal(n, 3);
+  assert.equal(res.status, 'changed');
+  assert.equal(res.registered, true);
+});
+
+test('registerAndAccept does NOT retry a 4xx', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const res = await runWith(cfgPath, () => withFetch(() => { n++; return jsonRes(403, {}); }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
+  assert.equal(n, 1);
+  assert.equal(res.status, 'failed');
+});
+
+test('registerAndAccept gives up after retries are exhausted and surfaces the network cause', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const res = await runWith(cfgPath, () => withFetch(() => { n++; const e = new TypeError('fetch failed'); e.cause = { code: 'ECONNREFUSED' }; throw e; },
+    () => registerAndAccept({ retries: 2, backoffMs: [1] })));
+  assert.equal(n, 3);
+  assert.equal(res.status, 'failed');
+  assert.equal(res.reason, 'fetch failed (ECONNREFUSED)');
+});
+
+test('registerAndAccept: an already-registered config with no invite is a genuine no-op', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' } });
+  const res = await runWith(cfgPath, () => withFetch(() => { throw new Error('no fetch expected'); }, () => registerAndAccept()));
+  assert.equal(res.status, 'unchanged');
+  assert.equal(describeOutcome(res), 'no-op (already registered, no invitation pending)');
+});
+
+test('registerAndAccept: failed invite accept is a failure with invitePending', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' }, invite: { invitation_id: 'i', token: 't' } });
+  const res = await runWith(cfgPath, () => withFetch((url) => (url.endsWith('/auth/agent/token') ? jsonRes(401, {}) : jsonRes(404, {})), () => registerAndAccept()));
+  assert.equal(res.status, 'failed');
+  assert.equal(res.invitePending, true);
+  assert.equal(res.step, 'POST /auth/agent/token');
+});
+
+test('error excerpts are secret-scrubbed', async () => {
+  const cfgPath = seedConfig();
+  const res = await runWith(cfgPath, () => withFetch(() => jsonRes(500, { api_key: 'cwsk_leaky' }), () => registerAndAccept()));
+  assert.ok(!res.reason.includes('cwsk_leaky'), res.reason);
+});
+
+test('describeFetchError: abort → "timed out"; cause code appended', () => {
+  const abort = new Error('x'); abort.name = 'AbortError';
+  assert.equal(describeFetchError(abort), 'timed out');
+  const e = new TypeError('fetch failed'); e.cause = { code: 'ENOTFOUND' };
+  assert.equal(describeFetchError(e), 'fetch failed (ENOTFOUND)');
+});
+
+const AR = fileURLToPath(new URL('../hooks/auto-register.js', import.meta.url));
+const runCli = (cfgPath) => spawnSync(process.execPath, [AR], { encoding: 'utf8', env: { ...process.env, CLAUDE_OPENMAX_CONFIG: cfgPath, COCO_API_URL: '', COCO_API_KEY: '' }, timeout: 20000 });
+
+test('standalone CLI: exits 1 and prints FAILED when it cannot register', () => {
+  const cfgPath = seedConfig({ server: {} }); // no bff_url → cannot register
+  const r = runCli(cfgPath);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /FAILED: register → no bff_url/);
+  assert.ok(!/no-op/.test(r.stderr));
+});
+
+test('standalone CLI: exits 0 with a real no-op message when already registered', () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' } });
+  const r = runCli(cfgPath);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /no-op \(already registered, no invitation pending\)/);
 });

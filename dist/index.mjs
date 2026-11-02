@@ -3784,8 +3784,8 @@ var init_as = __esm({
         this.http = http2;
         this.storage = storage;
       }
-      _p(path7) {
-        return this.http.apiPath(path7);
+      _p(path8) {
+        return this.http.apiPath(path8);
       }
       async _resolveDownloadDir() {
         if (this.storage && typeof this.storage.downloadDir === "function") {
@@ -7099,8 +7099,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path7) {
-      let input = path7;
+    function removeDotSegments(path8) {
+      let input = path8;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -7352,8 +7352,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path7, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path7 && path7 !== "/" ? path7 : void 0;
+        const [path8, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path8 && path8 !== "/" ? path8 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -10752,12 +10752,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f;
     };
-    function addFormats(ajv, list, fs7, exportName) {
+    function addFormats(ajv, list, fs8, exportName) {
       var _a3;
       var _b;
       (_a3 = (_b = ajv.opts.code).formats) !== null && _a3 !== void 0 ? _a3 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f of list)
-        ajv.addFormat(f, fs7[f]);
+        ajv.addFormat(f, fs8[f]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -11008,10 +11008,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path7) {
-  if (!path7)
+function getElementAtPath(obj, path8) {
+  if (!path8)
     return obj;
-  return path7.reduce((acc, key) => acc?.[key], obj);
+  return path8.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -11420,11 +11420,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path7, issues) {
+function prefixIssues(path8, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path7);
+    iss.path.unshift(path8);
     return iss;
   });
 }
@@ -11571,16 +11571,16 @@ function flattenError(error2, mapper = (issue2) => issue2.message) {
 }
 function formatError(error2, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error3, path7 = []) => {
+  const processError = (error3, path8 = []) => {
     for (const issue2 of error3.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path7, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path8, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path7, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path8, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path7, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path8, ...issue2.path]);
       } else {
-        const fullpath = [...path7, ...issue2.path];
+        const fullpath = [...path8, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -18276,9 +18276,9 @@ function rewriteInitForRedirect(init, status) {
   if (!downgradeToGet) return init;
   return { ...init, method: "GET", body: void 0, headers: stripBodyHeaders(init.headers) };
 }
-function buildUrl(baseUrl, path7, query) {
+function buildUrl(baseUrl, path8, query) {
   const base = (baseUrl || "").replace(/\/$/, "");
-  let url = path7.startsWith("http") ? path7 : `${base}${path7}`;
+  let url = path8.startsWith("http") ? path8 : `${base}${path8}`;
   if (!query) return url;
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
@@ -18490,8 +18490,8 @@ var CwsHttpClient = class {
     }
   }
   // ── generic request impl (baseUrl + headers injected by caller) ─────────────
-  async _doRequest(baseUrl, method, path7, { body, query, extraHeaders, orgId } = {}) {
-    const url = buildUrl(baseUrl, path7, query);
+  async _doRequest(baseUrl, method, path8, { body, query, extraHeaders, orgId } = {}) {
+    const url = buildUrl(baseUrl, path8, query);
     const trusted = this._isTrustedTarget(url);
     const sendOnce = async () => {
       const headers = {
@@ -18557,8 +18557,8 @@ var CwsHttpClient = class {
     return true;
   }
   // ── cws-core client (D8 envelope unwrap) ────────────────────────────────────
-  async _request(method, path7, opts = {}) {
-    const result = await this._doRequest(this._resolveBaseUrl(), method, path7, {
+  async _request(method, path8, opts = {}) {
+    const result = await this._doRequest(this._resolveBaseUrl(), method, path8, {
       ...opts,
       extraHeaders: { ...this._resolveCoreHeaders(), ...opts.extraHeaders || {} }
     });
@@ -18571,41 +18571,41 @@ var CwsHttpClient = class {
     return result;
   }
   // Default-org variants (use COCO_ORG_ID env or resolveDefaultOrgId).
-  get(path7, query) {
-    return this._request("GET", path7, { query });
+  get(path8, query) {
+    return this._request("GET", path8, { query });
   }
-  post(path7, body) {
-    return this._request("POST", path7, { body });
+  post(path8, body) {
+    return this._request("POST", path8, { body });
   }
-  patch(path7, body) {
-    return this._request("PATCH", path7, { body });
+  patch(path8, body) {
+    return this._request("PATCH", path8, { body });
   }
-  put(path7, body) {
-    return this._request("PUT", path7, { body });
+  put(path8, body) {
+    return this._request("PUT", path8, { body });
   }
-  del(path7) {
-    return this._request("DELETE", path7);
+  del(path8) {
+    return this._request("DELETE", path8);
   }
   // Org-aware variants — resolve the JWT against that specific org's cache.
-  getForOrg(orgId, path7, query) {
-    return this._request("GET", path7, { query, orgId });
+  getForOrg(orgId, path8, query) {
+    return this._request("GET", path8, { query, orgId });
   }
-  postForOrg(orgId, path7, body) {
-    return this._request("POST", path7, { body, orgId });
+  postForOrg(orgId, path8, body) {
+    return this._request("POST", path8, { body, orgId });
   }
   // Org-scoped GET that also attaches caller-supplied request headers (e.g.
   // cws-connect's X-Channel-Bind-Token). Same JWT resolution + D8 unwrap.
-  getForOrgWithHeaders(orgId, path7, extraHeaders, query) {
-    return this._request("GET", path7, { query, orgId, extraHeaders });
+  getForOrgWithHeaders(orgId, path8, extraHeaders, query) {
+    return this._request("GET", path8, { query, orgId, extraHeaders });
   }
-  patchForOrg(orgId, path7, body) {
-    return this._request("PATCH", path7, { body, orgId });
+  patchForOrg(orgId, path8, body) {
+    return this._request("PATCH", path8, { body, orgId });
   }
-  putForOrg(orgId, path7, body) {
-    return this._request("PUT", path7, { body, orgId });
+  putForOrg(orgId, path8, body) {
+    return this._request("PUT", path8, { body, orgId });
   }
-  delForOrg(orgId, path7) {
-    return this._request("DELETE", path7, { orgId });
+  delForOrg(orgId, path8) {
+    return this._request("DELETE", path8, { orgId });
   }
   /**
    * Prefix a logical path with the cws-core API prefix.
@@ -18619,24 +18619,24 @@ var CwsHttpClient = class {
    * Build a browser-navigable frontend URL. The frontend SPA is mounted at
    * `frontendBasePath` (default /workspace) on the same origin as the bff URL.
    */
-  frontendUrl(path7) {
+  frontendUrl(path8) {
     const base = this._resolveBaseUrl().replace(/\/$/, "");
     const prefix = (this._frontendBasePath || "/workspace").replace(/\/$/, "");
-    const p = path7 && !path7.startsWith("/") ? `/${path7}` : path7 || "";
+    const p = path8 && !path8.startsWith("/") ? `/${path8}` : path8 || "";
     return `${base}${prefix}${p}`;
   }
   // ── org-scoped clients for KB and AS routes ─────────────────────────────────
   _makeClient(baseUrl, scopeHeaders, orgId) {
-    const wrap = (method) => (path7, second) => {
+    const wrap = (method) => (path8, second) => {
       const opts = method === "GET" ? { query: second } : { body: second };
-      return this._doRequest(baseUrl, method, path7, { ...opts, extraHeaders: scopeHeaders, orgId });
+      return this._doRequest(baseUrl, method, path8, { ...opts, extraHeaders: scopeHeaders, orgId });
     };
     return {
       get: wrap("GET"),
       post: wrap("POST"),
       patch: wrap("PATCH"),
       put: wrap("PUT"),
-      del: (path7) => this._doRequest(baseUrl, "DELETE", path7, { extraHeaders: scopeHeaders, orgId }),
+      del: (path8) => this._doRequest(baseUrl, "DELETE", path8, { extraHeaders: scopeHeaders, orgId }),
       baseUrl,
       headers: scopeHeaders,
       orgId
@@ -19513,8 +19513,8 @@ var TmService = class {
     if (!http2) throw new Error("TmService requires a CwsHttpClient");
     this.http = http2;
   }
-  _p(path7) {
-    return this.http.apiPath(path7);
+  _p(path8) {
+    return this.http.apiPath(path8);
   }
   // ===========================================================================
   //  PROJECT
@@ -19803,8 +19803,8 @@ var KbService = class {
     this.http = http2;
     this.as = as;
   }
-  _p(path7) {
-    return this.http.apiPath(path7);
+  _p(path8) {
+    return this.http.apiPath(path8);
   }
   _requireKbId(params) {
     const id = params.kbId || params.kb_id;
@@ -20080,8 +20080,8 @@ var CommService = class {
     this.http = http2;
     this.config = config2;
   }
-  _p(path7) {
-    return this.http.apiPath(path7);
+  _p(path8) {
+    return this.http.apiPath(path8);
   }
   _requireConfig(method) {
     if (!this.config) {
@@ -20305,8 +20305,8 @@ var CoreService = class {
     this.config = config2;
     this.agentDomainProvider = agentDomain;
   }
-  _p(path7) {
-    return this.http.apiPath(path7);
+  _p(path8) {
+    return this.http.apiPath(path8);
   }
   // ---- Identity ------------------------------------------------------------
   me() {
@@ -20486,8 +20486,8 @@ var ConnService = class {
     this.storage = storage;
     this._resolveSelfMemberId = resolveSelfMemberId;
   }
-  _p(path7) {
-    return this.http.apiPath(path7);
+  _p(path8) {
+    return this.http.apiPath(path8);
   }
   _agentId(params) {
     const explicit = params.agentMemberId || params.agent_member_id;
@@ -20762,8 +20762,8 @@ var SyncEngine = class {
   _warn(...a) {
     this.logger?.warn?.(...a);
   }
-  _p(path7) {
-    return this.http.apiPath(path7);
+  _p(path8) {
+    return this.http.apiPath(path8);
   }
   /**
    * Reconnect catch-up: page `/sync` from `sessionRef.sync_seq`, feed each event
@@ -21984,7 +21984,7 @@ var CwsAgentBridge = class {
 // src/version.js
 var version2;
 if (true) {
-  version2 = "1.3.0";
+  version2 = "1.3.1";
 } else {
   version2 = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
@@ -24663,6 +24663,8 @@ var ClaudeChannel = class {
     this.includePreview = includePreview;
     this.runtimeSession = `claude_${randomUUID3()}`;
     this._connected = false;
+    this._deliveryEnabled = true;
+    this._deliveryDisabledReason = "";
     this._toolDefs = [];
     this._toolHandler = async () => {
       throw new Error("no tool handler registered");
@@ -24709,6 +24711,38 @@ var ClaudeChannel = class {
     return this._connected;
   }
   /**
+   * Enable/disable wake delivery. Disabled → notifyWake throws
+   * runtime_unavailable (never a false ok:true).
+   * @param {boolean} enabled
+   * @param {string} [reason]  diagnostic, included in the thrown error
+   */
+  setDeliveryEnabled(enabled, reason = "") {
+    this._deliveryEnabled = !!enabled;
+    this._deliveryDisabledReason = enabled ? "" : String(reason || "channel not active");
+  }
+  get deliveryEnabled() {
+    return this._deliveryEnabled;
+  }
+  /**
+   * Push a plain informational notice (not a message wake) into the session —
+   * e.g. "another session holds the OpenMax channel". Best-effort: only
+   * meaningful in a session that loaded the channel, never throws.
+   * @param {string} text
+   */
+  async notifyNotice(text) {
+    if (!this._connected) return false;
+    try {
+      await this.server.notification({
+        method: "notifications/claude/channel",
+        params: { content: String(text), meta: { openmax_notice: "status" } }
+      });
+      return true;
+    } catch (e) {
+      this.logger?.warn?.(`claude/channel notice failed: ${e.message}`);
+      return false;
+    }
+  }
+  /**
    * Push a wake into the agent's visible context via `notifications/claude/channel`.
    *
    * Resolves ONLY when the notification write to the transport resolved — the
@@ -24723,6 +24757,11 @@ var ClaudeChannel = class {
   async notifyWake(wakes) {
     if (!this._connected) {
       const err = new Error("claude/channel not connected \u2014 runtime unavailable");
+      err.failureClass = "runtime_unavailable";
+      throw err;
+    }
+    if (!this._deliveryEnabled) {
+      const err = new Error(`claude/channel delivery disabled (${this._deliveryDisabledReason}) \u2014 runtime unavailable`);
       err.failureClass = "runtime_unavailable";
       throw err;
     }
@@ -26164,6 +26203,95 @@ function writeJson(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
+// src/channel-gate.js
+import fs7 from "node:fs";
+import path7 from "node:path";
+import { execFileSync } from "node:child_process";
+var CHANNEL_ENV = "CLAUDE_OPENMAX_CHANNEL";
+var CHANNEL_FLAGS = ["--dangerously-load-development-channels", "--channels"];
+function readParentArgv(ppid = process.ppid) {
+  if (!ppid || ppid <= 1) return [];
+  try {
+    const raw = fs7.readFileSync(`/proc/${ppid}/cmdline`, "utf8");
+    return raw.split("\0").filter(Boolean);
+  } catch {
+  }
+  if (process.platform === "win32") return [];
+  try {
+    const out = execFileSync("ps", ["-o", "args=", "-p", String(ppid)], { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"] });
+    return out.trim().split(/\s+/).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+function argvLoadsChannel(argv) {
+  if (!Array.isArray(argv)) return false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    for (const flag of CHANNEL_FLAGS) {
+      if (a === flag && typeof argv[i + 1] === "string" && argv[i + 1].includes("openmax-channel")) return true;
+      if (a.startsWith(`${flag}=`) && a.includes("openmax-channel")) return true;
+    }
+  }
+  return false;
+}
+function resolveChannelActivation({ env = process.env, parentArgv = readParentArgv } = {}) {
+  const v = env[CHANNEL_ENV];
+  if (v === "1" || v === "true") return { active: true, source: "env" };
+  if (v === "0" || v === "false") return { active: false, source: "env" };
+  if (argvLoadsChannel(parentArgv())) return { active: true, source: "parent-argv" };
+  return { active: false, source: "none" };
+}
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+function acquireChannelLock({ dataDir, pid = process.pid, isAlive = pidAlive }) {
+  const lockPath = path7.join(dataDir, "channel.lock");
+  try {
+    fs7.mkdirSync(dataDir, { recursive: true });
+  } catch {
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs7.openSync(lockPath, "wx", 384);
+      fs7.writeSync(fd, `${pid}
+`);
+      fs7.closeSync(fd);
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        try {
+          if (Number.parseInt(fs7.readFileSync(lockPath, "utf8"), 10) === pid) fs7.rmSync(lockPath, { force: true });
+        } catch {
+        }
+      };
+      return { acquired: true, path: lockPath, release };
+    } catch (e) {
+      if (e.code !== "EEXIST") return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
+    }
+    let holder = null;
+    try {
+      holder = Number.parseInt(fs7.readFileSync(lockPath, "utf8"), 10);
+    } catch {
+    }
+    if (Number.isInteger(holder) && holder !== pid && isAlive(holder)) {
+      return { acquired: false, path: lockPath, holderPid: holder, reason: `held by pid ${holder}` };
+    }
+    try {
+      fs7.rmSync(lockPath, { force: true });
+    } catch {
+    }
+  }
+  return { acquired: false, path: lockPath, holderPid: null, reason: "lock contention" };
+}
+
 // src/index.js
 async function main() {
   const mode = process.env.CLAUDE_OPENMAX_MODE || "inproc";
@@ -26195,6 +26323,25 @@ async function main() {
     logger
   });
   channel.registerTools(defs, handler);
+  const activation = resolveChannelActivation();
+  let channelLock = null;
+  let lockBusy = null;
+  if (activation.active && mode !== "channel-only") {
+    const lock = acquireChannelLock({ dataDir: storage.dataDir });
+    if (lock.acquired) channelLock = lock;
+    else lockBusy = lock;
+  }
+  const wsEnabled = !!channelLock;
+  const deliveryEnabled = mode === "channel-only" ? activation.active : wsEnabled;
+  channel.setDeliveryEnabled(deliveryEnabled, !activation.active ? `channel not active in this session (${CHANNEL_ENV} unset and no channel flag detected)` : `another session holds the OpenMax channel (${lockBusy?.reason || "lock busy"})`);
+  if (!activation.active) {
+    logger.info(`channel NOT active in this session (${CHANNEL_ENV}!=1, no channel flag on the parent) \u2014 tools only, workspace WS stays closed`);
+  } else if (lockBusy) {
+    logger.warn(`channel active but ${lockBusy.path} is ${lockBusy.reason} \u2014 this session runs tools only; the other session keeps receiving messages`);
+  } else if (channelLock) {
+    logger.info(`channel active (source=${activation.source}); holding ${channelLock.path}`);
+  }
+  if (channelLock) process.once("exit", () => channelLock.release());
   const notifier = new DebouncedWakeNotifier({
     notify: (wakes) => channel.notifyWake(wakes),
     debounceMs
@@ -26238,7 +26385,12 @@ async function main() {
     channel.registerTools(withBridge.defs, withBridge.handler);
   }
   await channel.connect(new StdioServerTransport());
-  if (bridge) {
+  if (lockBusy) {
+    void channel.notifyNotice(
+      `OpenMax: another Claude Code session is already connected to the workspace channel${lockBusy.holderPid ? ` (pid ${lockBusy.holderPid})` : ""}. This session will NOT receive workspace messages; the OpenMax tools (comm_send, tm, kb, ...) still work here. Close the other session and restart this one to move the channel here.`
+    );
+  }
+  if (bridge && wsEnabled) {
     const orgIds = runtime.orgConfigs.map((o) => o.org_id);
     await guardStaleTokenCache({ storage, orgIds, apiKey: config2.agent.api_key, logger });
     await bridge.start();
@@ -26265,6 +26417,10 @@ async function main() {
     }
     try {
       await channel.close();
+    } catch {
+    }
+    try {
+      if (channelLock) channelLock.release();
     } catch {
     }
     process.exit(0);
