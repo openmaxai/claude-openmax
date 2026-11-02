@@ -26243,6 +26243,7 @@ function resolveChannelActivation({ env = process.env, parentArgv = readParentAr
   return { active: false, source: "none" };
 }
 var LOCK_GRACE_MS = 5e3;
+var TAKEOVER_STALE_MS = 5e3;
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -26252,26 +26253,87 @@ function pidAlive(pid) {
     return e.code === "EPERM";
   }
 }
-function acquireChannelLock({ dataDir, pid = process.pid, isAlive = pidAlive }) {
+function processStartTime(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const stat = fs7.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return rest[19] || null;
+  } catch {
+  }
+  if (process.platform === "win32" || process.platform === "linux") return null;
+  try {
+    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+function currentBootId() {
+  try {
+    return fs7.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
+  } catch {
+  }
+  if (process.platform !== "darwin") return null;
+  try {
+    return execFileSync("sysctl", ["-n", "kern.boottime"], { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+function parseLock(text) {
+  if (typeof text !== "string") return null;
+  const lines = text.split("\n");
+  const pid = Number.parseInt(lines[0], 10);
+  const field = (k) => {
+    const l = lines.find((x) => x.startsWith(`${k}=`));
+    return l ? l.slice(k.length + 1) || null : null;
+  };
+  return { pid: Number.isInteger(pid) ? pid : null, start: field("start"), boot: field("boot") };
+}
+function holderIsLive(info, { isAlive = pidAlive, startTimeOf = processStartTime, bootId = currentBootId() } = {}) {
+  if (!info || !Number.isInteger(info.pid)) return false;
+  if (info.boot && bootId && info.boot !== bootId) return false;
+  if (!isAlive(info.pid)) return false;
+  if (info.start) {
+    const now = startTimeOf(info.pid);
+    if (now && now !== info.start) return false;
+  }
+  return true;
+}
+function acquireChannelLock({
+  dataDir,
+  pid = process.pid,
+  isAlive = pidAlive,
+  startTimeOf = processStartTime,
+  bootId = currentBootId(),
+  _hooks = {}
+}) {
   const lockPath = path7.join(dataDir, "channel.lock");
+  const mutexPath = `${lockPath}.takeover`;
   try {
     fs7.mkdirSync(dataDir, { recursive: true });
   } catch {
   }
   const uniq = `${pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const readPid = (f) => {
+  const read = (f) => {
     try {
-      return Number.parseInt(fs7.readFileSync(f, "utf8"), 10);
+      return fs7.readFileSync(f, "utf8");
     } catch {
       return null;
     }
   };
+  const ownRecord = `${pid}
+start=${startTimeOf(pid) || ""}
+boot=${bootId || ""}
+`;
+  const busy = (holderPid, reason) => ({ acquired: false, path: lockPath, holderPid, reason });
+  const live = (info) => holderIsLive(info, { isAlive, startTimeOf, bootId });
   const tmp = `${lockPath}.tmp-${uniq}`;
   try {
-    fs7.writeFileSync(tmp, `${pid}
-`, { mode: 384, flag: "wx" });
+    fs7.writeFileSync(tmp, ownRecord, { mode: 384, flag: "wx" });
   } catch (e) {
-    return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
+    return busy(null, `cannot create lock: ${e.message}`);
   }
   const tryLink = () => {
     try {
@@ -26282,59 +26344,102 @@ function acquireChannelLock({ dataDir, pid = process.pid, isAlive = pidAlive }) 
       throw e;
     }
   };
+  const takeMutex = () => {
+    for (let i = 0; i < 2; i++) {
+      try {
+        fs7.closeSync(fs7.openSync(mutexPath, "wx", 384));
+        return true;
+      } catch (e) {
+        if (e.code !== "EEXIST") return false;
+        let age = 0;
+        try {
+          age = Date.now() - fs7.statSync(mutexPath).mtimeMs;
+        } catch {
+          continue;
+        }
+        if (age < TAKEOVER_STALE_MS) return false;
+        try {
+          fs7.rmSync(mutexPath, { force: true });
+        } catch {
+        }
+      }
+    }
+    return false;
+  };
+  const takeOver = (observed) => {
+    if (!takeMutex()) return busy(null, "another session is taking over the lock");
+    try {
+      const cur = read(lockPath);
+      if (cur === null || cur !== observed) return "retry";
+      _hooks.beforeRename?.();
+      const aside = `${lockPath}.stale-${uniq}`;
+      try {
+        fs7.renameSync(lockPath, aside);
+      } catch {
+        return "retry";
+      }
+      _hooks.afterRename?.();
+      const moved = read(aside);
+      if (moved !== observed) {
+        try {
+          fs7.linkSync(aside, lockPath);
+        } catch {
+          return busy(parseLock(moved)?.pid ?? null, "lock changed during takeover (moved lock left in place)");
+        }
+        try {
+          fs7.rmSync(aside, { force: true });
+        } catch {
+        }
+        return busy(parseLock(moved)?.pid ?? null, `held by pid ${parseLock(moved)?.pid}`);
+      }
+      try {
+        fs7.rmSync(aside, { force: true });
+      } catch {
+      }
+      return "retry";
+    } finally {
+      try {
+        fs7.rmSync(mutexPath, { force: true });
+      } catch {
+      }
+    }
+  };
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       if (tryLink()) {
+        _hooks.afterLink?.();
+        if (read(lockPath) !== ownRecord) return busy(parseLock(read(lockPath))?.pid ?? null, "lock taken by another session");
         let released = false;
         const release = () => {
           if (released) return;
           released = true;
           try {
-            if (readPid(lockPath) === pid) fs7.rmSync(lockPath, { force: true });
+            if (read(lockPath) === ownRecord) fs7.rmSync(lockPath, { force: true });
           } catch {
           }
         };
         return { acquired: true, path: lockPath, release };
       }
-      const holder = readPid(lockPath);
-      if (!Number.isInteger(holder)) {
+      const observed = read(lockPath);
+      if (observed === null) continue;
+      const info = parseLock(observed);
+      if (!Number.isInteger(info.pid)) {
         let age = Infinity;
         try {
           age = Date.now() - fs7.statSync(lockPath).mtimeMs;
         } catch {
           continue;
         }
-        if (age < LOCK_GRACE_MS) return { acquired: false, path: lockPath, holderPid: null, reason: "lock file is being written by another session" };
+        if (age < LOCK_GRACE_MS) return busy(null, "lock file is being written by another session");
+      } else if (info.pid !== pid && live(info)) {
+        return busy(info.pid, `held by pid ${info.pid}`);
       }
-      if (Number.isInteger(holder) && holder !== pid && isAlive(holder)) {
-        return { acquired: false, path: lockPath, holderPid: holder, reason: `held by pid ${holder}` };
-      }
-      const aside = `${lockPath}.stale-${uniq}-${attempt}`;
-      try {
-        fs7.renameSync(lockPath, aside);
-      } catch {
-        continue;
-      }
-      const moved = readPid(aside);
-      if (Number.isInteger(moved) && moved !== pid && isAlive(moved)) {
-        try {
-          fs7.linkSync(aside, lockPath);
-        } catch {
-        }
-        try {
-          fs7.rmSync(aside, { force: true });
-        } catch {
-        }
-        return { acquired: false, path: lockPath, holderPid: moved, reason: `held by pid ${moved}` };
-      }
-      try {
-        fs7.rmSync(aside, { force: true });
-      } catch {
-      }
+      const r = takeOver(observed);
+      if (r !== "retry") return r;
     }
-    return { acquired: false, path: lockPath, holderPid: readPid(lockPath), reason: "lock contention" };
+    return busy(parseLock(read(lockPath))?.pid ?? null, "lock contention");
   } catch (e) {
-    return { acquired: false, path: lockPath, holderPid: null, reason: `cannot create lock: ${e.message}` };
+    return busy(null, `cannot create lock: ${e.message}`);
   } finally {
     try {
       fs7.rmSync(tmp, { force: true });

@@ -435,3 +435,25 @@ test('mergePermissions backup is 0600', () => {
   const r = mergePermissions(file, ALLOW_RULES, 0);
   assert.equal(statSync(r.backup).mode & 0o777, 0o600);
 });
+
+test('runOnboard: unchanged config but a NEW registration (earlier run failed before registering) → running session not reused', async () => {
+  const s = setup();
+  // A previous attempt wrote this exact config and then failed to register.
+  mkdirSync(path.dirname(s.cfgPath), { recursive: true });
+  writeFileSync(s.cfgPath, JSON.stringify(incoming(), null, 2) + '\n');
+  const { exec, calls } = fakeExec({ 'tmux has-session': { status: 0 } });
+  const { code, lines } = await onboard(s, { exec });
+  assert.equal(code, 0);
+  assert.ok(lines.some((l) => /config: .* unchanged/.test(l)), lines.join('\n'));
+  assert.ok(lines.includes('LAUNCH: manual'), lines.join('\n'));
+  assert.ok(!calls.some((c) => c.cmd === 'tmux' && /^(new-session|kill-)/.test(c.args[0])));
+});
+
+test('runOnboard --no-stdin with a blank-key config registers and does not reuse the running session', async () => {
+  const s = setup();
+  mkdirSync(path.dirname(s.cfgPath), { recursive: true });
+  writeFileSync(s.cfgPath, JSON.stringify(incoming()));
+  const { exec } = fakeExec({ 'tmux has-session': { status: 0 } });
+  const { lines } = await onboard(s, { exec, argv: ['--launch', '--no-stdin'], stdinText: '' });
+  assert.ok(lines.includes('LAUNCH: manual'), lines.join('\n'));
+});

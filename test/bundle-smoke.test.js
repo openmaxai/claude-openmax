@@ -77,3 +77,67 @@ test('bundle with CLAUDE_OPENMAX_CHANNEL=1 takes the channel lock', async () => 
   const { stderr } = await probeBundle({ CLAUDE_OPENMAX_CHANNEL: '1' });
   assert.match(stderr, /channel active \(source=env\); holding .*channel\.lock/);
 });
+
+// ── delivery wiring in the shipped bundle (channel-only /wake answers) ────────
+
+/** Start the bundle in channel-only mode, return its /wake endpoint + helpers. */
+async function startChannelOnly(extraEnv = {}, config = null) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'claude-openmax-co-'));
+  const cfgPath = path.join(dir, 'config.json');
+  const dataDir = extraEnv.CLAUDE_OPENMAX_DATA_DIR || path.join(dir, 'data');
+  writeFileSync(cfgPath, JSON.stringify(config || { enabled: false, server: { bff_url: 'http://127.0.0.1:9' }, agent: { api_key: 'cwsk_smoke_fixture' }, orgs: {} }));
+  const child = spawn(process.execPath, [BUNDLE], {
+    env: { ...process.env, CLAUDE_OPENMAX_CHANNEL: '', CLAUDE_OPENMAX_MODE: 'channel-only', CLAUDE_OPENMAX_WAKE_PORT: '0', CLAUDE_OPENMAX_WAKE_TOKEN: '', CLAUDE_OPENMAX_DATA_DIR: dataDir, CLAUDE_OPENMAX_CONFIG: cfgPath, ...extraEnv },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let err = '';
+  child.stderr.on('data', (d) => { err += d; });
+  child.stdout.on('data', () => {});
+  child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}\n');
+  const until = async (re, ms = 15000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { const m = err.match(re); if (m) return m; await new Promise((r) => setTimeout(r, 25)); }
+    child.kill('SIGKILL');
+    throw new Error(`stderr never matched ${re}:\n${err}`);
+  };
+  const m = await until(/wake-server listening at (http:\/\/\S+\/wake)/);
+  const wake = async () => {
+    const res = await fetch(m[1], { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ schema: 'raft-channel-wake.v1', messageId: 'm1', conversationId: 'c1', contentPreview: 'hi' }) });
+    return { status: res.status, body: await res.json() };
+  };
+  return { child, wake, until, dataDir, stderr: () => err };
+}
+
+test('channel-only, channel NOT active: /wake is refused (503 runtime_unavailable) — no false ack', async () => {
+  const s = await startChannelOnly({ CLAUDE_OPENMAX_CHANNEL: '0' });
+  try {
+    const r = await s.wake();
+    assert.equal(r.status, 503);
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.failureClass, 'runtime_unavailable');
+  } finally { s.child.kill('SIGTERM'); }
+});
+
+test('channel-only, channel active: takes the lock and accepts /wake (200 ok:true)', async () => {
+  const s = await startChannelOnly({ CLAUDE_OPENMAX_CHANNEL: '1' });
+  try {
+    assert.match(s.stderr(), /holding .*channel\.lock/);
+    const r = await s.wake();
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+  } finally { s.child.kill('SIGTERM'); }
+});
+
+test('channel-only, channel active but lock held by a live process: /wake refused', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'claude-openmax-co-busy-'));
+  const dataDir = path.join(dir, 'data');
+  const { mkdirSync } = await import('node:fs');
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(path.join(dataDir, 'channel.lock'), `${process.pid}\n`); // this test process: alive
+  const s = await startChannelOnly({ CLAUDE_OPENMAX_CHANNEL: '1', CLAUDE_OPENMAX_DATA_DIR: dataDir });
+  try {
+    assert.match(s.stderr(), /channel active but .*held by pid/);
+    const r = await s.wake();
+    assert.equal(r.status, 503);
+  } finally { s.child.kill('SIGTERM'); }
+});

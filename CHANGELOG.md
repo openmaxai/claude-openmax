@@ -50,8 +50,12 @@ running, and without the gate both would hold the workspace connection.
   sessions keep every tool.
 - **Single instance:** `<data dir>/channel.lock`, created atomically (pid written to
   a temp file, then hard-linked into place, so it is never seen empty); a stale lock
-  is renamed aside before takeover so only one contender can win. Applies in
-  `channel-only` mode too.
+  is taken over only under an O_EXCL takeover mutex, re-checked before and after it
+  is moved aside, and a live lock moved by mistake is put back (or left in place,
+  never deleted). The lock records pid + process start time + boot id, so a pid
+  reused after a restart or reboot is recognised as stale; when start time / boot
+  id cannot be read it falls back to pid liveness. Applies in `channel-only` mode
+  too.
   A second channel-active session runs tools-only and is told so, instead of
   processing every message twice.
 - **No false delivery ack:** a session that may not deliver refuses the wake
@@ -60,8 +64,14 @@ running, and without the gate both would hold the workspace connection.
 - `hooks/auto-register.js` run standalone printed `no-op (already registered / nothing
   to do)` and exited 0 when registration **failed**. It now prints `FAILED: <step> →
   <reason>` (with the network cause, e.g. `fetch failed (ECONNREFUSED)`) and exits 1;
-  a real no-op still exits 0. The SessionStart hook keeps its 8 s budget and always
-  exits 0.
+  a real no-op still exits 0.
+- **The SessionStart hook no longer registers the agent** — it only accepts a
+  still-pending invitation (8 s budget, always exits 0). Its budget is shorter than
+  a slow registration, and a registration aborted after it reached the server lost
+  the new identity's key, so the next session registered yet another identity.
+  Registration now happens only in the onboarding command. A registration whose
+  outcome is unknown (timeout, budget abort, reset, HTTP 502/504) is never retried
+  automatically and says what to do.
 
 
 ## [1.3.0] - 2026-09-18

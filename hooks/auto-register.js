@@ -2,9 +2,15 @@
  * SessionStart-time agent auto-registration (idempotent) — the claude-openmax
  * analog of `zylos add`'s post-install auto-register.
  *
- * Claude Code has no literal install/upgrade hook, so this runs on SessionStart:
- * on the first session after install (or after an upgrade) it self-heals a config
- * that has no api_key yet; on every subsequent session it is a no-op.
+ * Two callers:
+ *  - the onboarding (scripts/onboard.js, or `node hooks/auto-register.js`
+ *    standalone) — registers and accepts, with a 45 s budget;
+ *  - the SessionStart hook — ONLY accepts a still-pending invitation (idempotent).
+ *    It does NOT register: its 8 s budget is shorter than a slow registration, and
+ *    a registration aborted after it reached the server leaves an identity whose
+ *    key is lost, so every later session would mint another one. Registration
+ *    therefore only runs where it has the time to finish (opts.register=false
+ *    for the hook).
  *
  * Behavior:
  *  - If the effective api_key is still blank/placeholder AND we have a bff_url,
@@ -194,6 +200,8 @@ export function writeConfig0600(configPath, cfg) {
  *   deadlineMs — total network budget (default 8s, sized for the SessionStart hook);
  *   retries    — extra attempts per request on network errors / 5xx (default 0);
  *   backoffMs  — TEST SEAM: delays between retries (default 1s, 2s, 4s);
+ *   register   — false: never register (SessionStart hook); only accept a pending
+ *                invite when a key already exists. Default true.
  *   requestTimeoutMs — TEST SEAM: per-request timeout for every step
  *                (default REQUEST_TIMEOUT_MS per step, always within deadlineMs).
  */
@@ -228,6 +236,10 @@ export async function registerAndAccept(opts = {}) {
   const timer = setTimeout(() => ctrl.abort(), budgetMs);
   try {
     // ---- register (only when there is no usable key yet) ----
+    if (PLACEHOLDER_API_KEYS.has(apiKey) && opts.register === false) {
+      log('no api_key yet — not registering from the SessionStart hook; run the OpenMax onboarding command');
+      return { ...out, status: 'unchanged', notRegistered: true };
+    }
     if (PLACEHOLDER_API_KEYS.has(apiKey)) {
       if (!bffUrl) {
         // Nothing to register against. Not an error for the SessionStart hook
@@ -237,16 +249,20 @@ export async function registerAndAccept(opts = {}) {
       }
 
       const step = 'POST /auth/register/agent';
+      if (ctrl.signal.aborted) return fail(step, 'time budget exhausted before registering (nothing was sent)');
       log(`registering agent: POST ${bffUrl}/auth/register/agent`);
       let reg;
       try {
         reg = await postWithRetry(`${bffUrl}/auth/register/agent`, authHeaders(cfId, cfSecret), '{}',
           { signal: ctrl.signal, retries, backoff, timeoutMs: tmo('register'), kind: 'not-idempotent' });
       } catch (e) {
-        const unsure = !isRetryable('not-idempotent', { error: e }) && e.name !== 'AbortError';
-        return fail(step, `${describeFetchError(e)}${unsure ? ' — not retried automatically: the server may already have created an identity' : ''}`);
+        // Anything other than "provably never sent" — a timeout, the overall
+        // budget aborting the in-flight request, a reset — may have created an
+        // identity server-side.
+        const unsure = !isRetryable('not-idempotent', { error: e });
+        return fail(step, `${describeFetchError(e)}${unsure ? maybeCreatedHint(bffUrl) : ''}`);
       }
-      if (!reg.ok) return fail(step, `HTTP ${reg.status}: ${bodyExcerpt(reg.text)}`);
+      if (!reg.ok) return fail(step, `HTTP ${reg.status}: ${bodyExcerpt(reg.text)}${reg.status === 502 || reg.status === 504 ? maybeCreatedHint(bffUrl) : ''}`);
 
       const data = (reg.json && (reg.json.data || reg.json)) || {};
       const identityId = data.identity_id || '';
@@ -282,6 +298,20 @@ export async function registerAndAccept(opts = {}) {
     clearTimeout(timer);
   }
   return out;
+}
+
+/**
+ * What to tell the user when a registration may have been processed but its
+ * answer was lost. Such an identity exists only as a bare registration: the
+ * invitation is accepted only AFTER a successful registration, so it never
+ * joined the workspace — it does not show up there and nothing needs removing.
+ */
+export function maybeCreatedHint(bffUrl) {
+  return ' — NOT retried automatically: the server may already have created an agent identity whose key never '
+    + 'reached this machine. That identity never joined the workspace (the invitation is accepted only after a '
+    + 'successful registration), so nothing appears in the workspace and nothing needs cleaning up. '
+    + `Check that this machine can reach ${bffUrl || 'the workspace server'} reliably, then re-run the same onboarding command `
+    + '(it registers a fresh identity and accepts the invitation).';
 }
 
 /**

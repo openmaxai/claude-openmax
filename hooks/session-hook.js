@@ -34,9 +34,13 @@ async function main() {
   // SessionStart hook timeout.
   const out = buildSessionStartOutput(payload);
   if (out) process.stdout.write(out + '\n');
-  // Auto-register on first session (idempotent, best-effort, never throws), with
-  // a total network budget kept safely below the hook timeout (hooks.json: 10s).
-  await ensureRegistered({ deadlineMs: 8000 }).catch(() => undefined);
+  // Accept a still-pending invitation (idempotent, best-effort, never throws),
+  // with a total network budget kept safely below the hook timeout (hooks.json:
+  // 10s). Registration is deliberately NOT done here: a registration this budget
+  // aborts after it reached the server would lose the new identity's key, and
+  // every later session would register yet another one. The onboarding command
+  // registers, with the time to finish.
+  await ensureRegistered({ deadlineMs: 8000, register: false }).catch(() => undefined);
 }
 
 main().catch(() => undefined).finally(() => process.exit(0));

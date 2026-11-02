@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync } from '
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { ensureRegistered, resolveConfigPath, registerAndAccept, describeOutcome, describeFetchError, isRetryable } from '../hooks/auto-register.js';
@@ -363,7 +363,7 @@ test('register: a dropped connection after the server may have created the ident
   }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
   assert.equal(created, 1, 'exactly one register call — a retry would orphan the first identity');
   assert.equal(res.status, 'failed');
-  assert.match(res.reason, /ECONNRESET.*may already have created an identity/);
+  assert.match(res.reason, /ECONNRESET.*may already have created an agent identity/);
 });
 
 test('register: HTTP 500 / 502 / 504 are not retried (may have been processed)', async () => {
@@ -414,4 +414,73 @@ test('isRetryable policy table', () => {
   assert.equal(isRetryable('idempotent', { status: 502 }), true);
   assert.equal(isRetryable('idempotent', { status: 404 }), false);
   assert.equal(isRetryable('idempotent', { error: Object.assign(new Error('x'), { name: 'AbortError' }) }), false);
+});
+
+// ── SessionStart never registers; aborted registration is "may have created" ──
+
+import http from 'node:http';
+
+test('register aborted by the overall budget while in flight → "may already have created" with what to do', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const res = await runWith(cfgPath, () => withFetch((url, opts) => { n++; return hangUntilAbort(url, opts); },
+    () => registerAndAccept({ retries: 3, backoffMs: [1], deadlineMs: 50, requestTimeoutMs: 10000 })));
+  assert.equal(n, 1);
+  assert.equal(res.status, 'failed');
+  assert.match(res.reason, /^timed out \(total budget exhausted\) — NOT retried automatically: the server may already have created an agent identity/);
+  assert.match(res.reason, /nothing appears in the workspace and nothing needs cleaning up/);
+  assert.match(res.reason, /re-run the same onboarding command/);
+  assert.match(res.reason, /reach https:\/\/core\.test/);
+});
+
+test('register: HTTP 504 carries the same hint; 500 does not', async () => {
+  for (const [status, hinted] of [[504, true], [502, true], [500, false]]) {
+    const cfgPath = seedConfig();
+    const res = await runWith(cfgPath, () => withFetch(() => jsonRes(status, {}), () => registerAndAccept()));
+    assert.equal(/may already have created/.test(res.reason), hinted, `HTTP ${status}: ${res.reason}`);
+  }
+});
+
+test('register:false (SessionStart) never registers, even with no key', async () => {
+  const cfgPath = seedConfig();
+  const res = await runWith(cfgPath, () => withFetch(() => { throw new Error('no network call expected'); },
+    () => registerAndAccept({ register: false })));
+  assert.equal(res.status, 'unchanged');
+  assert.equal(res.notRegistered, true);
+  assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).agent.api_key, '');
+});
+
+test('register:false still accepts a pending invite when a key exists', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' }, invite: { invitation_id: 'inv-h', token: 't' } });
+  const res = await runWith(cfgPath, () => withFetch((url) => {
+    if (url.endsWith('/auth/register/agent')) throw new Error('must not register');
+    if (url.endsWith('/auth/agent/token')) return jsonRes(200, { access_token: 'a' });
+    return jsonRes(200, {});
+  }, () => registerAndAccept({ register: false })));
+  assert.equal(res.inviteAccepted, true);
+});
+
+const HOOK = fileURLToPath(new URL('../hooks/session-hook.js', import.meta.url));
+
+test('SessionStart hook end-to-end: blank key → zero register calls, orientation printed, exit 0', async () => {
+  const hits = [];
+  const srv = http.createServer((req, res) => { hits.push(req.url); res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"data":{"identity_id":"x","api_key":"cwsk_x"}}'); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const cfgPath = seedConfig({ server: { bff_url: `http://127.0.0.1:${srv.address().port}` } });
+    const r = await new Promise((resolve) => {
+      const c = spawn(process.execPath, [HOOK], { env: { ...process.env, CLAUDE_OPENMAX_CONFIG: cfgPath, COCO_API_KEY: '' } });
+      let out = '';
+      let err = '';
+      c.stdout.on('data', (d) => { out += d; });
+      c.stderr.on('data', (d) => { err += d; });
+      c.on('exit', (code) => resolve({ code, out, err }));
+      c.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart' }));
+    });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /hookSpecificOutput/);
+    assert.deepEqual(hits, [], 'the hook must not call /auth/register/agent');
+    assert.match(r.err, /not registering from the SessionStart hook/);
+    assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).agent.api_key, '');
+  } finally { srv.close(); }
 });

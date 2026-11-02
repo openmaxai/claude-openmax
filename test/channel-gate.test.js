@@ -7,7 +7,10 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { utimesSync, readdirSync } from 'node:fs';
 
-import { resolveChannelActivation, argvLoadsChannel, acquireChannelLock, decideChannelRole } from '../src/channel-gate.js';
+import {
+  resolveChannelActivation, argvLoadsChannel, acquireChannelLock, decideChannelRole,
+  parseLock, holderIsLive, processStartTime, currentBootId,
+} from '../src/channel-gate.js';
 import { ClaudeChannel } from '../src/channel.js';
 import { createInboundDelivery } from '../src/inbound-delivery.js';
 
@@ -45,7 +48,7 @@ test('channel lock: first acquirer wins, a live second one is refused with the h
   const dataDir = tmp();
   const a = acquireChannelLock({ dataDir, pid: 1111, isAlive: () => true });
   assert.equal(a.acquired, true);
-  assert.equal(readFileSync(a.path, 'utf8').trim(), '1111');
+  assert.equal(parseLock(readFileSync(a.path, 'utf8')).pid, 1111);
   const b = acquireChannelLock({ dataDir, pid: 2222, isAlive: (p) => p === 1111 });
   assert.equal(b.acquired, false);
   assert.equal(b.holderPid, 1111);
@@ -60,7 +63,7 @@ test('channel lock: a stale lock (holder pid gone) is taken over', () => {
   writeFileSync(path.join(dataDir, 'channel.lock'), '999999\n');
   const r = acquireChannelLock({ dataDir, pid: 3333, isAlive: () => false });
   assert.equal(r.acquired, true);
-  assert.equal(readFileSync(r.path, 'utf8').trim(), '3333');
+  assert.equal(parseLock(readFileSync(r.path, 'utf8')).pid, 3333);
 });
 
 test('channel lock: release never deletes a successor\'s lock', () => {
@@ -117,14 +120,13 @@ test('an OLD lock file without a pid is debris and is taken over', () => {
   utimesSync(f, old, old);
   const r = acquireChannelLock({ dataDir, pid: 7778, isAlive: () => false });
   assert.equal(r.acquired, true);
-  assert.equal(readFileSync(f, 'utf8').trim(), '7778');
+  assert.equal(parseLock(readFileSync(f, 'utf8')).pid, 7778);
 });
 
 test('lock file is never left without a pid and no temp/stale files linger', () => {
   const dataDir = tmp();
   const a = acquireChannelLock({ dataDir, pid: 8001, isAlive: () => false });
-  assert.equal(readFileSync(a.path, 'utf8'), '8001\n');
-  writeFileSync(a.path, '8001\n');
+  assert.equal(parseLock(readFileSync(a.path, 'utf8')).pid, 8001);
   const b = acquireChannelLock({ dataDir, pid: 8002, isAlive: () => false }); // 8001 "dead" → takeover
   assert.equal(b.acquired, true);
   assert.deepEqual(readdirSync(dataDir).sort(), ['channel.lock']);
@@ -168,4 +170,117 @@ test('decideChannelRole: inactive or lock busy → no WS and no delivery, in BOT
 test('decideChannelRole: active + lock → inproc opens the WS; channel-only only accepts wakes', () => {
   assert.deepEqual(decideChannelRole({ mode: 'inproc', active: true, lockAcquired: true }), { wsEnabled: true, deliveryEnabled: true, reason: '' });
   assert.deepEqual(decideChannelRole({ mode: 'channel-only', active: true, lockAcquired: true }), { wsEnabled: false, deliveryEnabled: true, reason: '' });
+});
+
+// ── takeover: never delete a lock that was not judged stale ───────────────────
+
+const liveRecord = (p) => `${p}\nstart=S${p}\nboot=B\n`;
+const seams = (alive) => ({ isAlive: (p) => alive.has(p), startTimeOf: (p) => `S${p}`, bootId: 'B' });
+
+test('takeover moved a LIVE lock (racer replaced the stale one): it is put back, we report busy', () => {
+  const dataDir = tmp();
+  const f = path.join(dataDir, 'channel.lock');
+  writeFileSync(f, liveRecord(111)); // stale (111 dead)
+  const alive = new Set([222]);
+  const r = acquireChannelLock({
+    dataDir, pid: 333, ...seams(alive),
+    _hooks: { beforeRename: () => writeFileSync(f, liveRecord(222)) }, // racer's fresh live lock
+  });
+  assert.equal(r.acquired, false);
+  assert.equal(r.holderPid, 222);
+  assert.equal(readFileSync(f, 'utf8'), liveRecord(222), 'live lock restored');
+  assert.deepEqual(readdirSync(dataDir).sort(), ['channel.lock'], 'no aside file left after a successful put-back');
+});
+
+test('takeover moved a live lock and put-back fails (third racer linked in): moved lock is NOT deleted, busy', () => {
+  const dataDir = tmp();
+  const f = path.join(dataDir, 'channel.lock');
+  writeFileSync(f, liveRecord(111));
+  const alive = new Set([222, 444]);
+  const r = acquireChannelLock({
+    dataDir, pid: 333, ...seams(alive),
+    _hooks: {
+      beforeRename: () => writeFileSync(f, liveRecord(222)),
+      afterRename: () => writeFileSync(f, liveRecord(444)),
+    },
+  });
+  assert.equal(r.acquired, false);
+  assert.match(r.reason, /moved lock left in place/);
+  assert.equal(readFileSync(f, 'utf8'), liveRecord(444), "third racer's lock untouched");
+  const aside = readdirSync(dataDir).filter((x) => x.includes('.stale-'));
+  assert.equal(aside.length, 1, 'moved live lock kept, not deleted');
+  assert.equal(readFileSync(path.join(dataDir, aside[0]), 'utf8'), liveRecord(222));
+});
+
+test('after a successful link the lock is re-read and must be ours', () => {
+  const dataDir = tmp();
+  const f = path.join(dataDir, 'channel.lock');
+  const r = acquireChannelLock({ dataDir, pid: 555, ...seams(new Set([666])), _hooks: { afterLink: () => writeFileSync(f, liveRecord(666)) } });
+  assert.equal(r.acquired, false);
+  assert.equal(r.holderPid, 666);
+});
+
+test('a takeover already in progress (fresh mutex) → busy; a crashed one (old mutex) is cleared', () => {
+  const dataDir = tmp();
+  const f = path.join(dataDir, 'channel.lock');
+  writeFileSync(f, liveRecord(111));
+  writeFileSync(`${f}.takeover`, '');
+  const r = acquireChannelLock({ dataDir, pid: 333, ...seams(new Set()) });
+  assert.equal(r.acquired, false);
+  assert.match(r.reason, /taking over/);
+  const old = (Date.now() - 60_000) / 1000;
+  utimesSync(`${f}.takeover`, old, old);
+  const r2 = acquireChannelLock({ dataDir, pid: 333, ...seams(new Set()) });
+  assert.equal(r2.acquired, true);
+  assert.equal(existsSync(`${f}.takeover`), false);
+});
+
+// ── pid reuse / reboot ────────────────────────────────────────────────────────
+
+test('holderIsLive: different boot id → stale even if the pid runs', () => {
+  assert.equal(holderIsLive({ pid: 10, start: 'S10', boot: 'OLD' }, { isAlive: () => true, startTimeOf: () => 'S10', bootId: 'NEW' }), false);
+});
+
+test('holderIsLive: pid reused (start time differs) → stale', () => {
+  assert.equal(holderIsLive({ pid: 10, start: 'S10', boot: 'B' }, { isAlive: () => true, startTimeOf: () => 'OTHER', bootId: 'B' }), false);
+});
+
+test('holderIsLive: same pid + start + boot → live; pid not running → stale', () => {
+  assert.equal(holderIsLive({ pid: 10, start: 'S10', boot: 'B' }, { isAlive: () => true, startTimeOf: () => 'S10', bootId: 'B' }), true);
+  assert.equal(holderIsLive({ pid: 10, start: 'S10', boot: 'B' }, { isAlive: () => false, startTimeOf: () => 'S10', bootId: 'B' }), false);
+});
+
+test('holderIsLive fallback: unknown start time / boot id (either side) → pid-only liveness, never "stale because unknown"', () => {
+  const alive = { isAlive: () => true };
+  assert.equal(holderIsLive({ pid: 10, start: null, boot: null }, { ...alive, startTimeOf: () => 'S', bootId: 'B' }), true, 'old-format lock');
+  assert.equal(holderIsLive({ pid: 10, start: 'S10', boot: 'B' }, { ...alive, startTimeOf: () => null, bootId: null }), true, 'cannot read now (e.g. no /proc, ps failed)');
+  assert.equal(holderIsLive({ pid: 10, start: 'S10', boot: 'B' }, { ...alive, startTimeOf: () => null, bootId: 'B' }), true);
+  assert.equal(holderIsLive({ pid: 10, start: null, boot: null }, { isAlive: () => false, startTimeOf: () => null, bootId: null }), false);
+});
+
+test('EPERM (pid owned by another user) counts as running, then start time decides', () => {
+  // pid 1 exists and is not ours on a normal system: kill(1,0) → EPERM (or ok as root).
+  assert.equal(holderIsLive({ pid: 1, start: null, boot: null }), true, 'EPERM alone is not "dead"');
+  const s1 = processStartTime(1);
+  if (s1) assert.equal(holderIsLive({ pid: 1, start: `${s1}x`, boot: null }), false, 'but a start-time mismatch is pid reuse');
+});
+
+test('lock acquired via a reused pid is taken over; rebooted lock is taken over', () => {
+  for (const rec of [`77\nstart=OLDSTART\nboot=B\n`, `77\nstart=S77\nboot=PREVBOOT\n`]) {
+    const dataDir = tmp();
+    writeFileSync(path.join(dataDir, 'channel.lock'), rec);
+    const r = acquireChannelLock({ dataDir, pid: 88, isAlive: () => true, startTimeOf: (p) => `S${p}`, bootId: 'B' });
+    assert.equal(r.acquired, true, rec);
+    r.release();
+  }
+});
+
+test('the real identity readers work on this platform (or return null, never throw)', () => {
+  const st = processStartTime(process.pid);
+  assert.ok(st === null || typeof st === 'string');
+  assert.equal(processStartTime(process.pid), st, 'stable for a running process');
+  const b = currentBootId();
+  assert.ok(b === null || typeof b === 'string');
+  const rec = parseLock(`${process.pid}\nstart=${st || ''}\nboot=${b || ''}\n`);
+  assert.equal(holderIsLive(rec), true);
 });
