@@ -17679,6 +17679,9 @@ var FIRST_SYNC_KEY = "first-sync.json";
 function inboxStartCursor() {
   return Object(0);
 }
+function ledgerAccessor(bridge) {
+  return (orgId) => bridge?._orgs?.get?.(orgId)?.ledger || null;
+}
 function createFirstSync({ storage, apiKey, logger }) {
   const fp = apiKeyFingerprint(apiKey);
   const read = async () => {
@@ -17691,8 +17694,18 @@ function createFirstSync({ storage, apiKey, logger }) {
       return null;
     }
   };
-  const pendingFor = (m, orgId) => !!m && !!fp && m.fp === fp && !(Array.isArray(m.done) && m.done.includes(orgId));
+  const pendingFor = (m, orgId) => !!m && !!fp && m.fp === fp && Array.isArray(m.orgs) && m.orgs.includes(orgId) && !(Array.isArray(m.done) && m.done.includes(orgId));
+  let ledgerFor = () => null;
   return {
+    /**
+     * Give access to the started orgs' inbox ledgers. SDK 1.1.0 has no public
+     * accessor; `CwsAgentBridge._orgs` (orgId → {ledger, …}) is the record the
+     * orchestrator keeps per started org (test/first-sync.test.js pins it).
+     * @param {(orgId:string) => ({setAckedSeq:Function, getAckedSeq?:Function}|null|undefined)} fn
+     */
+    bindLedgers(fn) {
+      if (typeof fn === "function") ledgerFor = fn;
+    },
     /**
      * The cursor to hand the SDK for an org that has NO persisted session, or
      * null to keep the SDK default (seek to the inbox end).
@@ -17708,6 +17721,18 @@ function createFirstSync({ storage, apiKey, logger }) {
       if (!(typeof seq === "number" && seq > 0)) return;
       const m = await read();
       if (!pendingFor(m, orgId)) return;
+      try {
+        const ledger = ledgerFor(orgId);
+        if (ledger && typeof ledger.setAckedSeq === "function") {
+          const before = ledger.getAckedSeq?.() ?? 0;
+          ledger.setAckedSeq(seq);
+          if (seq > before) logger?.info?.(`[first-sync] org=${orgId}: inbox ledger advanced ${before} \u2192 ${seq} after the first catch-up`);
+        } else {
+          logger?.warn?.(`[first-sync] org=${orgId}: inbox ledger not reachable \u2014 gap sweeps from 0 may repeat this session`);
+        }
+      } catch (e) {
+        logger?.warn?.(`[first-sync] org=${orgId}: could not advance the inbox ledger: ${e.message}`);
+      }
       try {
         await storage.set(FIRST_SYNC_KEY, JSON.stringify({ ...m, done: [...Array.isArray(m.done) ? m.done : [], orgId] }));
       } catch (e) {
@@ -22808,6 +22833,9 @@ function buildRuntime({
   return {
     http: http2,
     tokenManager,
+    // First-sync (first channel session after onboarding) — index.js binds the
+    // started bridge's inbox ledgers to it (see first-sync.js).
+    firstSync,
     services,
     // enabled orgs only — the SDK connects to what's here; `enabled:false` opts out.
     orgConfigs: activeOrgs(),
@@ -26273,7 +26301,7 @@ function createMcpTools({ services, bridge, defaultOrgId, mentions, logger } = {
 
 // src/create-bridge.js
 function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
-  return new CwsAgentBridge({
+  const bridge = new CwsAgentBridge({
     http: runtime.http,
     tokenManager: runtime.tokenManager,
     ws: {
@@ -26297,6 +26325,8 @@ function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfi
       version: PKG_VERSION
     }
   });
+  runtime.firstSync?.bindLedgers(ledgerAccessor(bridge));
+  return bridge;
 }
 
 // src/owner-sync.js

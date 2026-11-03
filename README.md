@@ -151,8 +151,11 @@ in tmux — a new window if you are already in tmux, otherwise a detached sessio
 `openmax` (`tmux attach -t openmax`); without tmux it prints the command. (The `--`
 matters: the channel flag takes several values, so without it Claude Code reads the
 greeting as a second channel and exits.) A new window/session is reported as
-launched only if it is still running a few seconds later; otherwise the script
-prints `launch: FAILED …` with the exit status and output and `LAUNCH: manual`. You then
+launched only if it is still running 3 s after it was started; if it has exited by
+then, the script prints `launch: FAILED …` with the exit status and output and
+`LAUNCH: manual`. This catches start-up failures (bad arguments, missing binary);
+a session that dies LATER than 3 s (for example after the dev-channel dialog) is
+not detected and still counts as launched. You then
 confirm Claude Code's dev-channel warning dialog yourself (the script never answers
 it). Output ends with `ONBOARD OK` / `LAUNCH:` / `NEXT:` / `RESTART_COMMAND:` on
 success or `ONBOARD FAILED: <step>: <reason>` on failure; exit codes are 0 (ok, also
@@ -212,7 +215,8 @@ before approving:
     refused.
   - `~/.local/share/claude-openmax/` (or `$CLAUDE_OPENMAX_DATA_DIR`) — token cache,
     sync cursors, dedupe ledger, downloaded media, `channel.lock`, and after a new
-    registration `first-sync.json` (api_key fingerprint only); files 0600.
+    registration `first-sync.json` (api_key fingerprint + the onboarded org ids);
+    files 0600.
   - A log file only if you set `CLAUDE_OPENMAX_LOG_FILE` (0600, secrets scrubbed).
 - **Endpoints called** (only the workspace server in your config — `server.bff_url`
   / `server.ws_url`): `POST /auth/register/agent`, `POST /auth/agent/token`,

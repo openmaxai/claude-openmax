@@ -537,6 +537,22 @@ test('launchInTmux: a new window that is gone after the settle delay is not repo
   assert.equal(calls.find((c) => c.args[0] === 'display-message').args[3], '@7', 'checks the window it created');
 });
 
+test('launchInTmux: a dead new window is killed by the id it was created with, and its output is scrubbed', async () => {
+  const { exec, calls } = fakeExec({
+    'tmux list-windows': { status: 0, stdout: 'main\nopenmax-old\n' },
+    'tmux new-window': { status: 0, stdout: '@9\n' },
+    'tmux display-message': { status: 0, stdout: '1 2\n' },
+    'tmux capture-pane': { status: 0, stdout: 'auth failed for cwsk_abcdef1234567890XYZ\n' },
+  });
+  const r = await launchInTmux({ ...NO_SETTLE, mode: 'tmux-window', cwd: '/w', env: { TMUX: 'x' }, exec });
+  assert.equal(r.exited, true);
+  assert.deepEqual(calls.find((c) => c.args[0] === 'kill-window').args, ['kill-window', '-t', '@9'], 'never by name — that could hit another "openmax" window');
+  assert.deepEqual(calls.find((c) => c.args[0] === 'capture-pane').args.slice(0, 4), ['capture-pane', '-p', '-J', '-t']);
+  assert.ok(!r.reason.includes('cwsk_abcdef1234567890XYZ'), r.reason);
+  assert.ok(!r.output.includes('cwsk_'), r.output);
+  assert.match(r.reason, /auth failed for \[redacted-key\]/);
+});
+
 test('launchInTmux: a live new window is launched and remain-on-exit is reset to the default', async () => {
   const { exec, calls } = fakeExec({
     'tmux list-windows': { status: 0, stdout: 'main\n' },
@@ -603,6 +619,7 @@ test('runOnboard: a NEW registration leaves the first-sync marker in the data di
   const marker = path.join(dataDir, 'first-sync.json');
   const m = JSON.parse(readFileSync(marker, 'utf8'));
   assert.equal(m.identity_id, 'id-new');
+  assert.deepEqual(m.orgs, ['o1'], 'limited to the orgs joined by this onboarding');
   assert.match(m.fp, /^[0-9a-f]{8}$/);
   assert.ok(!readFileSync(marker, 'utf8').includes('cwsk_secret_value'), 'no api_key in the marker');
   assert.ok(first.lines.some((l) => l.startsWith('[onboard] first-sync: ')));

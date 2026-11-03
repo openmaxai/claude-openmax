@@ -480,7 +480,9 @@ export async function runOnboard({
       // The first channel session must pick up messages sent from now on, instead
       // of seeking past them to the inbox end (see src/first-sync.js).
       const dataDir = defaultDataDir(env);
-      if (writeFirstSyncMarker({ dataDir, apiKey: key, identityId: reg.identityId, now })) say(`first-sync: messages from now on reach the first channel session (${path.join(dataDir, 'first-sync.json')})`);
+      // Only the orgs this onboarding joined; an org added later keeps the SDK default.
+      const orgIds = isObject(after.orgs) ? Object.entries(after.orgs).map(([id, o]) => o?.org_id || id) : [];
+      if (writeFirstSyncMarker({ dataDir, apiKey: key, identityId: reg.identityId, orgIds, now })) say(`first-sync: messages from now on reach the first channel session (${path.join(dataDir, 'first-sync.json')})`);
       else say(`first-sync: WARN could not write ${path.join(dataDir, 'first-sync.json')} — messages sent before the first channel session starts may be skipped`);
     }
     say(`invitation: ${!reg.inviteAccepted ? 'none pending' : keptRegistration ? 'already accepted (re-confirmed)' : 'accepted'}`);

@@ -1085,6 +1085,9 @@ export function buildRuntime({
   return {
     http,
     tokenManager,
+    // First-sync (first channel session after onboarding) — index.js binds the
+    // started bridge's inbox ledgers to it (see first-sync.js).
+    firstSync,
     services,
     // enabled orgs only — the SDK connects to what's here; `enabled:false` opts out.
     orgConfigs: activeOrgs(),

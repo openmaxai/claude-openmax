@@ -14,6 +14,7 @@
 
 import { CwsAgentBridge } from '@openmaxai/openmax-agent-sdk';
 import { PKG_VERSION } from './version.js';
+import { ledgerAccessor } from './first-sync.js';
 
 /**
  * @param {object} params
@@ -28,7 +29,7 @@ import { PKG_VERSION } from './version.js';
  * @returns {CwsAgentBridge}
  */
 export function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
-  return new CwsAgentBridge({
+  const bridge = new CwsAgentBridge({
     http: runtime.http,
     tokenManager: runtime.tokenManager,
     ws: {
@@ -52,4 +53,8 @@ export function createBridge({ runtime, inbound, storage, runtimeState, logger, 
       version: PKG_VERSION,
     },
   });
+  // First channel session after onboarding: let first-sync advance the inbox
+  // ledger once the first catch-up cursor is persisted (see first-sync.js).
+  runtime.firstSync?.bindLedgers(ledgerAccessor(bridge));
+  return bridge;
 }

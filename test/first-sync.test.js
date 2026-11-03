@@ -11,8 +11,9 @@ import { EventEmitter } from 'node:events';
 import { CwsAgentBridge } from '@openmaxai/openmax-agent-sdk';
 import { normalizeConfig, buildRuntime } from '../src/config.js';
 import { createFileStorage } from '../src/storage.js';
+import { createBridge } from '../src/create-bridge.js';
 import {
-  FIRST_SYNC_KEY, inboxStartCursor, writeFirstSyncMarker, createFirstSync,
+  FIRST_SYNC_KEY, inboxStartCursor, writeFirstSyncMarker, createFirstSync, ledgerAccessor,
 } from '../src/first-sync.js';
 
 const silent = { info() {}, log() {}, warn() {}, error() {}, debug() {} };
@@ -34,9 +35,9 @@ test('inboxStartCursor is truthy, compares and computes as 0, and serialises as 
 
 // ── marker lifecycle ─────────────────────────────────────────────────────────
 
-test('marker: pending for the onboarded api_key only, retired per org once a real cursor is saved', async () => {
+test('marker: pending for the onboarded api_key + onboarded orgs only, retired per org once a real cursor is saved', async () => {
   const dir = tmpDir();
-  assert.equal(writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, identityId: 'id-1', now: 0 }), true);
+  assert.equal(writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, identityId: 'id-1', orgIds: [ORG, 'org-2'], now: 0 }), true);
   assert.equal(fs.statSync(path.join(dir, FIRST_SYNC_KEY)).mode & 0o777, 0o600);
   const storage = createFileStorage({ dataDir: dir });
 
@@ -45,12 +46,32 @@ test('marker: pending for the onboarded api_key only, retired per org once a rea
 
   const fs1 = createFirstSync({ storage, apiKey: API_KEY, logger: silent });
   assert.ok(await fs1.initialCursor(ORG));
+  assert.equal(await fs1.initialCursor('org-joined-later'), null, 'an org that was not onboarded keeps the SDK default');
   await fs1.cursorSaved(ORG, inboxStartCursor());   // not a real cursor
   await fs1.cursorSaved(ORG, 0);
   assert.ok(await fs1.initialCursor(ORG), 'still pending');
   await fs1.cursorSaved(ORG, 3);
   assert.equal(await fs1.initialCursor(ORG), null, 'spent for this org');
-  assert.ok(await fs1.initialCursor('org-2'), 'other orgs keep theirs');
+  assert.ok(await fs1.initialCursor('org-2'), 'other onboarded orgs keep theirs');
+});
+
+test('writeFirstSyncMarker refuses a marker that would apply to no org', () => {
+  const dir = tmpDir();
+  assert.equal(writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [] }), false);
+  assert.equal(fs.existsSync(path.join(dir, FIRST_SYNC_KEY)), false);
+});
+
+test('cursorSaved advances the bound inbox ledger to the first real cursor (closes a gap below it)', async () => {
+  const dir = tmpDir();
+  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [ORG] });
+  const fsx = createFirstSync({ storage: createFileStorage({ dataDir: dir }), apiKey: API_KEY, logger: silent });
+  let acked = 0;
+  const ledger = { getAckedSeq: () => acked, setAckedSeq: (n) => { if (n > acked) acked = n; } };
+  fsx.bindLedgers((id) => (id === ORG ? ledger : null));
+  await fsx.cursorSaved(ORG, 7);
+  assert.equal(acked, 7);
+  await fsx.cursorSaved(ORG, 9);   // marker spent → no more ledger writes
+  assert.equal(acked, 7);
 });
 
 test('no marker → loadSession keeps the SDK default (empty session → seek to the inbox end)', async () => {
@@ -59,15 +80,23 @@ test('no marker → loadSession keeps the SDK default (empty session → seek to
   assert.deepEqual(await rt.callbacks.loadSession(ORG), {});
 });
 
-test('marker + existing session → the existing cursor wins; saveSession retires the marker', async () => {
+test('marker + an EXISTING session → the existing cursor wins (the marker is not consulted)', async () => {
   const dir = tmpDir();
-  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY });
+  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [ORG] });
+  fs.mkdirSync(path.join(dir, 'sessions'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'sessions', `${ORG}.json`), JSON.stringify({ sync_seq: 4 }));
+  const rt = runtime(dir);
+  assert.deepEqual(await rt.callbacks.loadSession(ORG), { sync_seq: 4 });
+});
+
+test('marker, no session → start-of-inbox cursor; saveSession retires it; a purged session never replays again', async () => {
+  const dir = tmpDir();
+  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [ORG] });
   const rt = runtime(dir);
   const first = await rt.callbacks.loadSession(ORG);
   assert.ok(first.sync_seq && !(first.sync_seq > 0), 'start-of-inbox cursor');
   await rt.callbacks.saveSession(ORG, { sync_seq: 4 });
   assert.deepEqual(await rt.callbacks.loadSession(ORG), { sync_seq: 4 });
-  // Even after the local session is purged, the spent marker never replays the inbox again.
   fs.rmSync(path.join(dir, 'sessions', `${ORG}.json`));
   assert.deepEqual(await rt.callbacks.loadSession(ORG), {});
 });
@@ -86,8 +115,12 @@ function runtime(dataDir) {
   });
 }
 
-// The inbox: the owner's DM (seq 1) arrived after onboarding, before the first channel session.
-function makeFakeHttp() {
+// Default inbox: the owner's DM (seq 1) arrived after onboarding, before the first channel session.
+const DM_ONLY = [{ seq: 1, conversation_id: 'C1', message_id: 'M1' }];
+// The inbox starts with a seq that is not a deliverable message (no message_id).
+const NON_MESSAGE_FIRST = [{ seq: 1, conversation_id: 'C1' }, { seq: 2, conversation_id: 'C1', message_id: 'M1' }];
+
+function makeFakeHttp(inbox = DM_ONLY) {
   const calls = [];
   const http = {
     calls,
@@ -96,7 +129,8 @@ function makeFakeHttp() {
       calls.push(['GET', p]);
       if (p.endsWith('/me')) return { identity_id: 'agent-1', display_name: 'Bot' };
       if (p === '/api/v1/conversations/C1/messages/M1') {
-        return { id: 'M1', conversation_id: 'C1', sender_id: OWNER, sender_type: 'HUMAN', type: 'TEXT', inbox_seq: 1, seq: 1, content: { content_type: 'text', body: { text: 'hello?' } } };
+        const seq = inbox.find((e) => e.message_id === 'M1').seq;
+        return { id: 'M1', conversation_id: 'C1', sender_id: OWNER, sender_type: 'HUMAN', type: 'TEXT', inbox_seq: seq, seq, content: { content_type: 'text', body: { text: 'hello?' } } };
       }
       if (p === '/api/v1/conversations/C1') return { id: 'C1', type: 'dm' };
       return {};
@@ -104,8 +138,9 @@ function makeFakeHttp() {
     async postForOrg(_org, p, body) {
       calls.push(['POST', p, body]);
       if (p === '/api/v1/sync') {
-        return body.since_seq < 1
-          ? { events: [{ seq: 1, conversation_id: 'C1', message_id: 'M1' }], next_cursor: '1', has_more: false }
+        const events = inbox.filter((e) => e.seq > body.since_seq);
+        return events.length
+          ? { events, next_cursor: String(events.at(-1).seq), has_more: false }
           : { events: [], has_more: false };
       }
       return {};
@@ -117,8 +152,8 @@ function makeFakeHttp() {
 }
 const fakeHttp = { current: null };
 
-async function firstChannelSession(dataDir) {
-  fakeHttp.current = makeFakeHttp();
+async function firstChannelSession(dataDir, { inbox, holdMs = 20, inspect } = {}) {
+  fakeHttp.current = makeFakeHttp(inbox);
   const rt = runtime(dataDir);
   const delivered = [];
   const sock = new EventEmitter();
@@ -132,18 +167,20 @@ async function firstChannelSession(dataDir) {
     callbacks: rt.callbacks,
     reporters: { metrics: false, frameMetrics: false, markReadOnDeliver: false },
   });
+  rt.firstSync.bindLedgers(ledgerAccessor(bridge));   // what createBridge() does
   await bridge.start();
   for (let i = 0; i < 100 && !fakeHttp.current.calls.some(([m, p]) => m === 'POST' && p === '/api/v1/sync/ack'); i++) {
     await new Promise((r) => setTimeout(r, 10));
   }
-  await new Promise((r) => setTimeout(r, 20));
+  await new Promise((r) => setTimeout(r, holdMs));
+  const state = inspect ? inspect(bridge) : undefined;
   await bridge.stop();
-  return { delivered, calls: fakeHttp.current.calls };
+  return { delivered, calls: fakeHttp.current.calls, state };
 }
 
 test('first channel session after onboarding delivers the DM sent before it started (real SDK pipeline)', async () => {
   const dir = tmpDir();
-  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, identityId: 'agent-1' });
+  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, identityId: 'agent-1', orgIds: [ORG] });
   const { delivered, calls } = await firstChannelSession(dir);
   const syncs = calls.filter(([m, p]) => m === 'POST' && p === '/api/v1/sync');
   assert.equal(Number(syncs[0][2].since_seq), 0, '/sync starts at the beginning of the inbox');
@@ -163,4 +200,45 @@ test('without the onboarding marker the SDK still seeks to the inbox end (no his
   const { delivered, calls } = await firstChannelSession(dir);
   assert.deepEqual(delivered, [], 'old inbox content is not replayed');
   assert.ok(calls.some(([m, p]) => m === 'POST' && p === '/api/v1/sync'), 'the SDK init /sync ran');
+});
+
+const syncCount = (calls) => calls.filter(([m, p]) => m === 'POST' && p === '/api/v1/sync').length;
+const ledgerState = (bridge) => {
+  const l = bridge._orgs.get(ORG).ledger;
+  return { acked: l.getAckedSeq(), pendingBelow: [1, 2].filter((n) => !l.has(n)) };
+};
+
+test('inbox starting with a non-message seq: the first catch-up advances the ledger past it (no gap left)', async () => {
+  const dir = tmpDir();
+  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [ORG] });
+  const { delivered, calls, state } = await firstChannelSession(dir, { inbox: NON_MESSAGE_FIRST, holdMs: 100, inspect: ledgerState });
+  assert.deepEqual(delivered, ['M1']);
+  assert.equal(syncCount(calls), 1);
+  assert.equal(state.acked, 2, 'watermark advanced to the swept cursor (1.3.3 first cut left it at 0)');
+  assert.deepEqual(state.pendingBelow, [], 'no hole for the gap timer to chase');
+  const persisted = JSON.parse(fs.readFileSync(path.join(dir, `inbox-${ORG}.json`), 'utf8'));
+  assert.equal(persisted.acked_seq, 2);
+});
+
+test('inbox starting with a non-message seq: exactly ONE /sync over 22 s (the gap timer never re-sweeps from 0)', { timeout: 60000 }, async () => {
+  // The ledger ticks every 5 s and re-syncs a gap older than 10 s, so a leftover
+  // hole shows up as a second /sync at the ~20 s tick.
+  const dir = tmpDir();
+  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [ORG] });
+  const { delivered, calls, state } = await firstChannelSession(dir, { inbox: NON_MESSAGE_FIRST, holdMs: 22000, inspect: ledgerState });
+  assert.deepEqual(delivered, ['M1']);
+  assert.equal(syncCount(calls), 1, `expected a single /sync, saw ${syncCount(calls)}`);
+  assert.equal(state.acked, 2);
+});
+
+test('createBridge binds the started bridge\'s inbox ledgers to first-sync', () => {
+  let bound = null;
+  const rt = runtime(tmpDir());
+  rt.firstSync.bindLedgers = (fn) => { bound = fn; };
+  const bridge = createBridge({ runtime: rt, inbound: { deliver: async () => ({ ok: true }) }, storage: createFileStorage({ dataDir: tmpDir() }), runtimeState: {}, logger: silent, wsConfig: rt.wsConfig });
+  assert.equal(typeof bound, 'function');
+  const fake = { setAckedSeq() {} };
+  bridge._orgs.set(ORG, { ledger: fake });
+  assert.equal(bound(ORG), fake, 'resolves the SDK per-org ledger');
+  assert.equal(bound('nope'), null);
 });

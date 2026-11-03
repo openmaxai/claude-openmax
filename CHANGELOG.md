@@ -28,17 +28,21 @@ Fixes from the INT real-machine end-to-end test of 1.3.2 (Claude Code 2.1.308).
   with a NEXT line that says what went wrong. A live one gets `remain-on-exit`
   reset to the user's default.
 - **The first channel session skipped messages sent right after onboarding**
-  (`src/first-sync.js`, `loadSession` in `src/config.js`, `scripts/onboard.js`).
-  With no saved `/sync` cursor the SDK seeks to the END of the inbox (`init
-  sync_seq=N (seeked to inbox end)`), so a DM sent between onboarding and the first
-  channel session was never delivered or answered. When the onboarding registers a
-  NEW identity it now writes `<dataDir>/first-sync.json` (api_key fingerprint only,
-  0600); the first channel session for that identity then catches up the inbox from
-  seq 0 through the normal dedupe → access-policy → deliver path. A new identity has
-  no older inbox history, so nothing from before the onboarding is replayed. The
-  marker is ignored for any other api_key, never used when a cursor exists, and
-  retired per org once a real cursor is saved. Existing identities keep the
-  seek-to-end behaviour.
+  (`src/first-sync.js`, `loadSession` in `src/config.js`, `src/create-bridge.js`,
+  `scripts/onboard.js`). With no saved `/sync` cursor the SDK seeks to the END of
+  the inbox (`init sync_seq=N (seeked to inbox end)`), so a DM sent between
+  onboarding and the first channel session was never delivered or answered. When
+  the onboarding registers a NEW identity it now writes `<dataDir>/first-sync.json`
+  (api_key fingerprint + the org ids it joined, 0600); the first channel session for
+  that identity then catches up those orgs' inboxes from seq 0 through the normal
+  dedupe → access-policy → deliver path. A new identity has no older inbox history,
+  so nothing from before the onboarding is replayed. When the first real cursor is
+  saved, the SDK inbox ledger is advanced to it (as the seek-to-end path does) —
+  otherwise a first seq that is not a deliverable message would leave a permanent
+  hole and the ledger would re-run `/sync` from 0 every ~10 s. The marker is
+  ignored for any other api_key and for orgs joined later, never used when a
+  cursor exists, and retired per org once a real cursor is saved. Existing
+  identities keep the seek-to-end behaviour.
 - **Routine token logs at ERROR level** (`ERROR [token] ws-ticket ok …`). The SDK
   TokenManager's exchange / refresh / ws-ticket progress lines are now logged at
   INFO, its cache-discard notice at WARN (`levelTokenLogs` in `src/providers.js`).
@@ -48,12 +52,15 @@ Fixes from the INT real-machine end-to-end test of 1.3.2 (Claude Code 2.1.308).
 
 ### Notes
 
-- `inbox-ledger: gap persisted … triggering /sync from 0` with no `/sync` request
-  after it: SDK 1.1.0 `syncMissedEvents` returns early while the session cursor is
-  0, which happens when the first-ever connect found an empty inbox. For a freshly
-  onboarded agent (where this was seen) the first-sync cursor above makes that
-  sweep run; the general case needs an SDK change and is left to the SDK.
-
+- A launched session that dies more than 3 s after starting is not detected (it
+  still counts as launched).
+- `inbox-ledger: gap persisted … triggering /sync from 0` (seen four times without
+  a `/sync` request in the E2E log): SDK 1.1.0 `syncMissedEvents` returns early
+  while the session cursor is 0, which is the state after a first connect that
+  found an empty inbox; the ledger then keeps re-triggering a sweep that never
+  runs. Not changed here (SDK-side). The first-sync path above starts with a
+  non-zero cursor and advances the ledger, so it neither hits that early return nor
+  leaves a gap of its own.
 
 ## [1.3.2] - 2026-11-02
 

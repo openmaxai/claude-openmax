@@ -243,7 +243,7 @@ test('bundle: the first channel session after onboarding catches up the inbox fr
   const dataDir = path.join(dir, 'data');
   const apiKey = 'cwsk_smoke_fixture_fresh';
   const { writeFirstSyncMarker } = await import('../src/first-sync.js');
-  assert.equal(writeFirstSyncMarker({ dataDir, apiKey }), true);
+  assert.equal(writeFirstSyncMarker({ dataDir, apiKey, orgIds: ['org-smoke'] }), true);
   const config = { server: { bff_url: 'http://127.0.0.1:9', ws_url: 'ws://127.0.0.1:9/ws' }, agent: { api_key: apiKey }, orgs: { 'org-smoke': { org_id: 'org-smoke' } } };
   const { stderr } = await probeBundle({ CLAUDE_OPENMAX_CHANNEL: '1', CLAUDE_OPENMAX_DATA_DIR: dataDir }, { config, until: /\[first-sync\]|warm-restart|\] started/ });
   assert.match(stderr, /\[first-sync\] org=org-smoke: first channel session after onboarding/);

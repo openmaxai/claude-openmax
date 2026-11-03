@@ -19,8 +19,20 @@
  * the messages that arrived after registration are delivered. A brand-new
  * identity has no inbox history from before its registration, so nothing older
  * than the onboarding is replayed. The marker is ignored for any other api_key
- * and is retired per org as soon as that org has a real cursor (so a later
- * purge of the local session state never replays the whole inbox).
+ * and for orgs that were not in the config at onboarding time (an org joined
+ * later keeps the SDK default), and is retired per org as soon as that org has
+ * a real cursor (so a later purge of the local session state never replays the
+ * whole inbox).
+ *
+ * Ledger watermark: the SDK's seek-to-end path seeds the inbox ledger with the
+ * cursor (`setAckedSeq`). The catch-up path does not, and `/sync` events that
+ * are not deliverable messages (no message_id) are skipped WITHOUT being
+ * recorded — so if the inbox starts with such a seq the ledger's contiguous
+ * watermark would stay at 0 and its gap timer would re-run `/sync` from 0 every
+ * ~10 s for the whole session. When the first real cursor is persisted for an
+ * org in first-sync mode (the SDK only persists it after a sweep that processed
+ * every event up to it, or from the ledger's own watermark), the ledger is
+ * advanced to that cursor — exactly what the seek-to-end path would have done.
  *
  * inboxStartCursor(): the SDK (1.1.0, `orchestrator.#startOrgWs` / `SyncEngine`)
  * treats a FALSY `sync_seq` as "first-ever connect → seek to the end", and
@@ -51,22 +63,32 @@ export function inboxStartCursor() {
 /**
  * Called by the onboarding after it registered a NEW identity (sync fs; never
  * throws — returns false when the marker could not be written).
- * @param {{dataDir:string, apiKey:string, identityId?:string, now?:number}} o
+ * @param {{dataDir:string, apiKey:string, identityId?:string, orgIds:string[], now?:number}} o
+ *        orgIds: the orgs in the config at onboarding time — the only ones the marker applies to
  */
-export function writeFirstSyncMarker({ dataDir, apiKey, identityId = '', now = Date.now() }) {
+export function writeFirstSyncMarker({ dataDir, apiKey, identityId = '', orgIds = [], now = Date.now() }) {
   try {
     const fp = apiKeyFingerprint(apiKey);
-    if (!dataDir || !fp) return false;
+    const orgs = [...new Set((orgIds || []).filter((id) => typeof id === 'string' && id))];
+    if (!dataDir || !fp || orgs.length === 0) return false;
     fs.mkdirSync(dataDir, { recursive: true });
     const file = path.join(dataDir, FIRST_SYNC_KEY);
     const tmp = `${file}.tmp-${process.pid}`;
-    const body = { fp, identity_id: identityId, created_at: new Date(now).toISOString(), done: [] };
+    const body = { fp, identity_id: identityId, orgs, created_at: new Date(now).toISOString(), done: [] };
     fs.writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
     fs.renameSync(tmp, file);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * (orgId) => inbox ledger of a started org of an SDK 1.1.0 CwsAgentBridge.
+ * @param {object} bridge
+ */
+export function ledgerAccessor(bridge) {
+  return (orgId) => bridge?._orgs?.get?.(orgId)?.ledger || null;
 }
 
 /**
@@ -86,9 +108,21 @@ export function createFirstSync({ storage, apiKey, logger }) {
   };
 
   const pendingFor = (m, orgId) => !!m && !!fp && m.fp === fp
+    && Array.isArray(m.orgs) && m.orgs.includes(orgId)
     && !(Array.isArray(m.done) && m.done.includes(orgId));
 
+  // (orgId) => the SDK's inbox ledger for that org, bound once the bridge exists.
+  let ledgerFor = () => null;
+
   return {
+    /**
+     * Give access to the started orgs' inbox ledgers. SDK 1.1.0 has no public
+     * accessor; `CwsAgentBridge._orgs` (orgId → {ledger, …}) is the record the
+     * orchestrator keeps per started org (test/first-sync.test.js pins it).
+     * @param {(orgId:string) => ({setAckedSeq:Function, getAckedSeq?:Function}|null|undefined)} fn
+     */
+    bindLedgers(fn) { if (typeof fn === 'function') ledgerFor = fn; },
+
     /**
      * The cursor to hand the SDK for an org that has NO persisted session, or
      * null to keep the SDK default (seek to the inbox end).
@@ -106,6 +140,19 @@ export function createFirstSync({ storage, apiKey, logger }) {
       if (!(typeof seq === 'number' && seq > 0)) return;
       const m = await read();
       if (!pendingFor(m, orgId)) return;
+      // Close the ledger gap below the cursor (see header) before retiring.
+      try {
+        const ledger = ledgerFor(orgId);
+        if (ledger && typeof ledger.setAckedSeq === 'function') {
+          const before = ledger.getAckedSeq?.() ?? 0;
+          ledger.setAckedSeq(seq);
+          if (seq > before) logger?.info?.(`[first-sync] org=${orgId}: inbox ledger advanced ${before} → ${seq} after the first catch-up`);
+        } else {
+          logger?.warn?.(`[first-sync] org=${orgId}: inbox ledger not reachable — gap sweeps from 0 may repeat this session`);
+        }
+      } catch (e) {
+        logger?.warn?.(`[first-sync] org=${orgId}: could not advance the inbox ledger: ${e.message}`);
+      }
       try {
         await storage.set(FIRST_SYNC_KEY, JSON.stringify({ ...m, done: [...(Array.isArray(m.done) ? m.done : []), orgId] }));
       } catch (e) {
