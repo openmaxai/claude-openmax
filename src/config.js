@@ -80,6 +80,7 @@ import {
   createConnService,
 } from '@openmaxai/openmax-agent-sdk';
 import { DEFAULT_APP_VERSION } from './version.js';
+import { createGuardedFetch } from './fetch-guard.js';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 
 // Hard cap on how long a single owner-sync core HTTP call may block the caller
@@ -170,6 +171,45 @@ export function loadAdapterConfig(explicitPath) {
   }
   const config = normalizeConfig(raw);
   return { config, file };
+}
+
+const PLACEHOLDER_API_KEYS = new Set(['', 'cwsk_replace_me']);
+
+/** True when the normalized config carries a usable agent api_key. */
+export function hasUsableApiKey(config) {
+  return !PLACEHOLDER_API_KEYS.has(config?.agent?.api_key || '');
+}
+
+/**
+ * Wait until the config has a usable api_key (startup race with registration).
+ *
+ * The MCP server reads its config once at startup, while the onboarding command
+ * may be registering the agent at the same moment (older builds registered from
+ * the SessionStart hook, concurrently with every first session). A server that built its
+ * TokenManager from the still-blank key stayed offline for the whole session
+ * (the key is fixed at construction and never re-read). So when the key is
+ * missing we poll the config file until registration lands, then build.
+ *
+ * @param {object} o
+ * @param {object} o.initial                normalized config already loaded
+ * @param {() => {config:object}} [o.load]  re-reader (default loadAdapterConfig)
+ * @param {number} [o.intervalMs]           default 2000
+ * @param {number} [o.timeoutMs]            default 120000
+ * @param {object} [o.logger]
+ * @param {() => boolean} [o.cancelled]     stop early (shutdown)
+ * @returns {Promise<object|null>} the config with a key, or null on timeout/cancel
+ */
+export async function waitForApiKey({ initial, load = () => loadAdapterConfig(), intervalMs = 2000, timeoutMs = 120_000, logger, cancelled = () => false } = {}) {
+  if (hasUsableApiKey(initial)) return initial;
+  logger?.warn?.(`agent.api_key not set yet — waiting up to ${Math.round(timeoutMs / 1000)}s for the onboarding to write it (tools answer "waiting for the API key" meanwhile)`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !cancelled()) {
+    await new Promise((r) => setTimeout(r, intervalMs));
+    let cfg;
+    try { cfg = load().config; } catch (e) { logger?.warn?.(`config re-read failed: ${e.message}`); continue; }
+    if (hasUsableApiKey(cfg)) { logger?.info?.('agent.api_key found — continuing startup'); return cfg; }
+  }
+  return null;
 }
 
 /** True when `raw` is an OLD-shape config (top-level http/auth or array orgs). */
@@ -343,12 +383,16 @@ export async function resolveAndCacheIdentityId({ http, agent, persist, logger }
  *        keep a hanging-stub timeout test fast.
  * @param {number} [params.policySyncTimeoutMs]  TEST SEAM ONLY — same, for the
  *        policy-reconcile calls (POLICY_SYNC_HTTP_TIMEOUT_MS in production).
+ * @param {typeof fetch} [params.fetchImpl]  fetch handed to TokenManager + CwsHttpClient
+ *        (default: createGuardedFetch() — 15s header timeout, request path + cause in
+ *        errors, short retries for token / ws-ticket; see fetch-guard.js).
  * @param {number} [params.policyDebounceMs]  TEST SEAM ONLY — debounce before an
  *        access change is reconciled (POLICY_RECONCILE_DEBOUNCE_MS in production);
  *        tests shorten it so they do not wait three seconds.
  */
 export function buildRuntime({
   config, file, storage, logger, httpClient,
+  fetchImpl,
   ownerSyncTimeoutMs = OWNER_SYNC_HTTP_TIMEOUT_MS,
   policySyncTimeoutMs = POLICY_SYNC_HTTP_TIMEOUT_MS,
   policyDebounceMs = POLICY_RECONCILE_DEBOUNCE_MS,
@@ -435,7 +479,10 @@ export function buildRuntime({
   // read `.cf_access` off the wrong object and emit EMPTY CF-Access headers.
   const cfAccessWrapped = state.cf_access ? { cf_access: state.cf_access } : undefined;
 
+  const guardedFetch = fetchImpl || createGuardedFetch({ logger });
+
   const tokenManager = new TokenManager({
+    fetch: guardedFetch,
     apiKey: state.agent.api_key,
     coreUrl: state.server.bff_url,
     cfAccess: cfAccessWrapped,
@@ -446,6 +493,7 @@ export function buildRuntime({
   });
 
   const http = httpClient || new CwsHttpClient({
+    fetch: guardedFetch,
     baseUrl: state.server.bff_url,
     apiKey: state.agent.api_key,
     deviceId: state.agent.device_id,

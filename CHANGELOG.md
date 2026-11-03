@@ -8,6 +8,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [1.3.2] - 2026-11-02
+
+The rest of Plane OPENM-1107 / cws-core#269 (the gating part shipped in 1.3.1).
+
+### Fixed
+
+- **Startup race left a session offline for good** (`src/index.js`,
+  `waitForApiKey` in `src/config.js`). The MCP server read its config once at
+  startup while registration could still be running (in 1.3.0 the `SessionStart`
+  hook registered; since 1.3.1 the onboarding command does, possibly while a session
+  is already starting); if it won the race, the TokenManager was built with an empty key and never re-read it, so the
+  whole session stayed offline. With no usable key the server now advertises its
+  tools at once (they answer "waiting for the API key — run the onboarding command
+  if you haven't"), polls the config every
+  2 s for up to 120 s, and builds the runtime and connects once the key lands.
+  If it gives up, it releases `channel.lock`, so a later session is not locked out.
+- **"fetch failed" with no detail, and requests that could hang forever**
+  (`src/fetch-guard.js`, injected into the SDK `TokenManager` + `CwsHttpClient`).
+  15 s time-to-headers timeout for JSON API calls (uploads exempt); errors now read
+  `fetch failed: <METHOD> <path> → <cause>` / `fetch timed out after 15000ms: …`
+  (path only, no query string); token / refresh / ws-ticket calls retry twice on
+  network errors. Tool errors returned to Claude keep the cause too.
+- **Thread replies went to the main conversation** (`src/wake.js`). The wake now
+  carries the SDK's `endpoint` (`<conv>|thread:…|parent:…`) in the notice text,
+  the reply hint and `meta.openmax_endpoint`.
+- **Attachment-only messages had an empty preview** — the preview now ends with
+  `[N attachments: name, …]` (names only, at most five listed). This also keeps
+  such wakes valid for the split topology, which requires a non-empty preview.
+- A permanently terminated org connection (WS close 4002/4005/4006) is now also
+  pushed into the channel session as a notice instead of only being logged.
+
+### Documentation
+
+- Group-message behaviour is unchanged and now documented (README, CLAUDE.md):
+  with the default policy the agent only sees group messages that @-mention it.
+
+
+## [1.3.1] - 2026-11-02
+
+Onboarding in one approval (Plane OPENM-1106 / cws-core#268), plus the three
+OPENM-1107 gating fixes it depends on (Plane OPENM-1107 / cws-core#269): the
+onboard script starts a second Claude Code session while the first is still
+running, and without the gate both would hold the workspace connection.
+
+### Added
+
+- **`scripts/onboard.js`** — one command for the invitation prompt: write the
+  config from stdin (0600), register + accept the invitation (per-request
+  timeouts under a 45 s total budget; up to 3 retries — for registration only on
+  failures that prove no identity was created, i.e. connection never established
+  or HTTP 503/429, so a retry can never leave an orphan identity), append the OpenMax tool rules to
+  `permissions.allow` in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`
+  (append-only, backup first, corrupt JSON refused), self-check, and with
+  `--launch` start `CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax`
+  in tmux (new window inside tmux, detached `openmax` session outside, printed
+  command without tmux). Prints `ONBOARD OK` … `RESTART_COMMAND: …` or
+  `ONBOARD FAILED: <step>: <reason>`; exit 0 / 1 / 2. Idempotent: a re-run keeps
+  the existing registration, does not duplicate rules and reuses the tmux window.
+  A running `openmax` window/session is NOT reused when this run registered a new
+  identity or replaced the config (it would still hold the old key): the script
+  prints `LAUNCH: manual` and asks the user to close it first, and never kills it.
+  `settings.json` is replaced atomically (temp file + rename, mode kept, 0600
+  backup). Nothing is launched after any failure, and no dialog is ever answered
+  for the user.
+- Allowed tools: `comm`, `comm_send`, `tm`, `kb`, `core`. `as` and `conn` still
+  prompt per call.
+- README **Security** section: what is installed, files written, endpoints called,
+  permissions added, how to verify tag / commit / bundle / SDK provenance.
+
+### Fixed
+
+- **Only a channel-active session connects to the workspace** (`src/channel-gate.js`,
+  `src/index.js`). Every Claude Code session started the MCP server and opened the WS,
+  so a session without the channel showed the agent online while Claude Code dropped
+  its pushes. The WS now opens only with `CLAUDE_OPENMAX_CHANNEL=1` (fallback when
+  unset: the parent `claude` argv carries the channel flag for this plugin); other
+  sessions keep every tool.
+- **Single instance:** `<data dir>/channel.lock`, created atomically (pid written to
+  a temp file, then hard-linked into place, so it is never seen empty); a stale lock
+  is taken over only under an O_EXCL takeover mutex, re-checked before and after it
+  is moved aside, and a live lock moved by mistake is put back (or left in place,
+  never deleted). The lock records pid + process start time + boot id, so a pid
+  reused after a restart or reboot is recognised as stale (Linux: `/proc/<pid>/stat`
+  starttime + `boot_id`; macOS: `ps -o lstart` read with `LC_ALL=C TZ=UTC0` and
+  compared as epoch seconds, so sessions with different time zones or locales
+  agree). macOS has no boot-id check: `kern.boottime` moves whenever the clock is
+  adjusted, and pid + start time already catch a reboot. When the start time /
+  boot id cannot be read it falls back to pid liveness. Applies in `channel-only` mode
+  too.
+  A second channel-active session runs tools-only and is told so, instead of
+  processing every message twice.
+- **No false delivery ack:** a session that may not deliver refuses the wake
+  (`runtime_unavailable`), so the SDK returns `ok:false`, does not mark the message
+  read or advance the cursor, and redelivers it via `/sync` to the channel session.
+- `hooks/auto-register.js` run standalone printed `no-op (already registered / nothing
+  to do)` and exited 0 when registration **failed**. It now prints `FAILED: <step> →
+  <reason>` (with the network cause, e.g. `fetch failed (ECONNREFUSED)`) and exits 1;
+  a real no-op still exits 0.
+- **The SessionStart hook no longer registers the agent** — it only accepts a
+  still-pending invitation (8 s budget, always exits 0). Its budget is shorter than
+  a slow registration, and a registration aborted after it reached the server lost
+  the new identity's key, so the next session registered yet another identity.
+  Registration now happens only in the onboarding command. A registration whose
+  outcome is unknown (timeout, budget abort, reset, HTTP 502/504) is never retried
+  automatically and says what to do.
+
+
 ## [1.3.0] - 2026-09-18
 
 Makes the outbound `@mention` resolution that landed in the previous commit

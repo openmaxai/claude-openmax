@@ -56,6 +56,14 @@ export class ClaudeChannel {
     // per-process id — SPIKE: bind to the real CC session id when available).
     this.runtimeSession = `claude_${randomUUID()}`;
     this._connected = false;
+    // Whether wakes may be delivered at all. Claude Code drops a
+    // channel notification SILENTLY in a session that did not load the channel,
+    // so "the stdio write resolved" proves nothing there. index.js enables this
+    // only for a channel-active session that holds the single-instance lock;
+    // otherwise notifyWake refuses, InboundDelivery returns ok:false and the SDK
+    // keeps the message for /sync redelivery instead of acking it into the void.
+    this._deliveryEnabled = true;
+    this._deliveryDisabledReason = '';
     this._toolDefs = [];
     this._toolHandler = async () => { throw new Error('no tool handler registered'); };
 
@@ -102,6 +110,39 @@ export class ClaudeChannel {
   get connected() { return this._connected; }
 
   /**
+   * Enable/disable wake delivery. Disabled → notifyWake throws
+   * runtime_unavailable (never a false ok:true).
+   * @param {boolean} enabled
+   * @param {string} [reason]  diagnostic, included in the thrown error
+   */
+  setDeliveryEnabled(enabled, reason = '') {
+    this._deliveryEnabled = !!enabled;
+    this._deliveryDisabledReason = enabled ? '' : String(reason || 'channel not active');
+  }
+
+  get deliveryEnabled() { return this._deliveryEnabled; }
+
+  /**
+   * Push a plain informational notice (not a message wake) into the session —
+   * e.g. "another session holds the OpenMax channel". Best-effort: only
+   * meaningful in a session that loaded the channel, never throws.
+   * @param {string} text
+   */
+  async notifyNotice(text) {
+    if (!this._connected) return false;
+    try {
+      await this.server.notification({
+        method: 'notifications/claude/channel',
+        params: { content: String(text), meta: { openmax_notice: 'status' } },
+      });
+      return true;
+    } catch (e) {
+      this.logger?.warn?.(`claude/channel notice failed: ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
    * Push a wake into the agent's visible context via `notifications/claude/channel`.
    *
    * Resolves ONLY when the notification write to the transport resolved — the
@@ -116,6 +157,11 @@ export class ClaudeChannel {
   async notifyWake(wakes) {
     if (!this._connected) {
       const err = new Error('claude/channel not connected — runtime unavailable');
+      err.failureClass = 'runtime_unavailable';
+      throw err;
+    }
+    if (!this._deliveryEnabled) {
+      const err = new Error(`claude/channel delivery disabled (${this._deliveryDisabledReason}) — runtime unavailable`);
       err.failureClass = 'runtime_unavailable';
       throw err;
     }

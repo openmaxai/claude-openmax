@@ -4,7 +4,10 @@ import { mkdtempSync, writeFileSync, readFileSync, statSync, existsSync } from '
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { ensureRegistered, resolveConfigPath } from '../hooks/auto-register.js';
+import { spawnSync, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+import { ensureRegistered, resolveConfigPath, registerAndAccept, describeOutcome, describeFetchError, isRetryable } from '../hooks/auto-register.js';
 
 function seedConfig(overrides = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'claude-openmax-reg-'));
@@ -254,4 +257,230 @@ test('invite is NOT cleared when acceptance fails (so it retries next session)',
     return jsonRes(404, {});
   }, () => ensureRegistered()));
   assert.deepEqual(JSON.parse(readFileSync(cfgPath, 'utf8')).invite, { invitation_id: 'inv-f', token: 'tok-f' }, 'invite retained on failure');
+});
+
+// ── structured outcome + retries ─────────────────────────────────
+
+test('registerAndAccept reports failed (not "no-op") when registration fails, with step + reason', async () => {
+  const cfgPath = seedConfig();
+  const res = await runWith(cfgPath, () => withFetch(() => jsonRes(500, { error: 'boom' }), () => registerAndAccept()));
+  assert.equal(res.status, 'failed');
+  assert.equal(res.step, 'POST /auth/register/agent');
+  assert.match(res.reason, /^HTTP 500/);
+  assert.match(describeOutcome(res), /^FAILED: POST \/auth\/register\/agent → HTTP 500/);
+});
+
+test('register retries only provably-unsent failures (connection refused, 503), then succeeds', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const res = await runWith(cfgPath, () => withFetch((url) => {
+    n++;
+    if (n === 1) { const e = new TypeError('fetch failed'); e.cause = { code: 'ECONNREFUSED' }; throw e; }
+    if (n === 2) return jsonRes(503, {});
+    return jsonRes(200, { identity_id: 'id-r', api_key: 'cwsk_r' });
+  }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
+  assert.equal(n, 3);
+  assert.equal(res.status, 'changed');
+  assert.equal(res.registered, true);
+});
+
+test('registerAndAccept does NOT retry a 4xx', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const res = await runWith(cfgPath, () => withFetch(() => { n++; return jsonRes(403, {}); }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
+  assert.equal(n, 1);
+  assert.equal(res.status, 'failed');
+});
+
+test('registerAndAccept gives up after retries are exhausted and surfaces the network cause', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const res = await runWith(cfgPath, () => withFetch(() => { n++; const e = new TypeError('fetch failed'); e.cause = { code: 'ECONNREFUSED' }; throw e; },
+    () => registerAndAccept({ retries: 2, backoffMs: [1] })));
+  assert.equal(n, 3);
+  assert.equal(res.status, 'failed');
+  assert.equal(res.reason, 'fetch failed (ECONNREFUSED)');
+});
+
+test('registerAndAccept: an already-registered config with no invite is a genuine no-op', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' } });
+  const res = await runWith(cfgPath, () => withFetch(() => { throw new Error('no fetch expected'); }, () => registerAndAccept()));
+  assert.equal(res.status, 'unchanged');
+  assert.equal(describeOutcome(res), 'no-op (already registered, no invitation pending)');
+});
+
+test('registerAndAccept: failed invite accept is a failure with invitePending', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' }, invite: { invitation_id: 'i', token: 't' } });
+  const res = await runWith(cfgPath, () => withFetch((url) => (url.endsWith('/auth/agent/token') ? jsonRes(401, {}) : jsonRes(404, {})), () => registerAndAccept()));
+  assert.equal(res.status, 'failed');
+  assert.equal(res.invitePending, true);
+  assert.equal(res.step, 'POST /auth/agent/token');
+});
+
+test('error excerpts are secret-scrubbed', async () => {
+  const cfgPath = seedConfig();
+  const res = await runWith(cfgPath, () => withFetch(() => jsonRes(500, { api_key: 'cwsk_leaky' }), () => registerAndAccept()));
+  assert.ok(!res.reason.includes('cwsk_leaky'), res.reason);
+});
+
+test('describeFetchError: per-request timeout, budget abort, cause code appended', () => {
+  const abort = new Error('x'); abort.name = 'AbortError';
+  assert.equal(describeFetchError(abort), 'timed out (total budget exhausted)');
+  assert.equal(describeFetchError(Object.assign(new Error('timed out after 5ms'), { name: 'TimeoutError' })), 'timed out after 5ms');
+  const e = new TypeError('fetch failed'); e.cause = { code: 'ENOTFOUND' };
+  assert.equal(describeFetchError(e), 'fetch failed (ENOTFOUND)');
+});
+
+const AR = fileURLToPath(new URL('../hooks/auto-register.js', import.meta.url));
+const runCli = (cfgPath) => spawnSync(process.execPath, [AR], { encoding: 'utf8', env: { ...process.env, CLAUDE_OPENMAX_CONFIG: cfgPath, COCO_API_URL: '', COCO_API_KEY: '' }, timeout: 20000 });
+
+test('standalone CLI: exits 1 and prints FAILED when it cannot register', () => {
+  const cfgPath = seedConfig({ server: {} }); // no bff_url → cannot register
+  const r = runCli(cfgPath);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /FAILED: register → no bff_url/);
+  assert.ok(!/no-op/.test(r.stderr));
+});
+
+test('standalone CLI: exits 0 with a real no-op message when already registered', () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' } });
+  const r = runCli(cfgPath);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /no-op \(already registered, no invitation pending\)/);
+});
+
+// ── register must never create an orphan identity; per-request timeouts ──────
+
+const netErr = (code) => Object.assign(new TypeError('fetch failed'), { cause: { code } });
+
+test('register: a dropped connection after the server may have created the identity is NOT retried', async () => {
+  // Server-side: identity created, then the connection resets before the response.
+  const cfgPath = seedConfig();
+  let created = 0;
+  const res = await runWith(cfgPath, () => withFetch((url) => {
+    if (url.endsWith('/auth/register/agent')) { created++; throw netErr('ECONNRESET'); }
+    return jsonRes(404, {});
+  }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
+  assert.equal(created, 1, 'exactly one register call — a retry would orphan the first identity');
+  assert.equal(res.status, 'failed');
+  assert.match(res.reason, /ECONNRESET.*may already have created an agent identity/);
+});
+
+test('register: HTTP 500 / 502 / 504 are not retried (may have been processed)', async () => {
+  for (const status of [500, 502, 504]) {
+    const cfgPath = seedConfig();
+    let n = 0;
+    const res = await runWith(cfgPath, () => withFetch(() => { n++; return jsonRes(status, {}); }, () => registerAndAccept({ retries: 3, backoffMs: [1] })));
+    assert.equal(n, 1, `HTTP ${status}`);
+    assert.equal(res.status, 'failed');
+  }
+});
+
+const hangUntilAbort = (url, opts) => new Promise((_r, rej) => opts.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+
+test('register: a hung request times out per request (not the whole budget) and is not retried', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const t0 = Date.now();
+  const res = await runWith(cfgPath, () => withFetch((url, opts) => { n++; return hangUntilAbort(url, opts); },
+    () => registerAndAccept({ retries: 3, backoffMs: [1], requestTimeoutMs: 40, deadlineMs: 5000 })));
+  assert.equal(n, 1);
+  assert.ok(Date.now() - t0 < 2000, 'returned at the per-request timeout, long before the 5s budget');
+  assert.match(res.reason, /^timed out after 40ms/);
+});
+
+test('token exchange: a hung first request times out per request and the retry succeeds within the budget', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' }, invite: { invitation_id: 'inv-t', token: 'tok-t' } });
+  let tokCalls = 0;
+  const res = await runWith(cfgPath, () => withFetch((url, opts) => {
+    if (url.endsWith('/auth/agent/token')) return ++tokCalls === 1 ? hangUntilAbort(url, opts) : jsonRes(200, { access_token: 'a' });
+    if (url.includes('/invitations/inv-t/accept')) return jsonRes(200, {});
+    return jsonRes(404, {});
+  }, () => registerAndAccept({ retries: 3, backoffMs: [1], requestTimeoutMs: 40, deadlineMs: 5000 })));
+  assert.equal(tokCalls, 2);
+  assert.equal(res.status, 'changed');
+  assert.equal(res.inviteAccepted, true);
+});
+
+test('isRetryable policy table', () => {
+  assert.equal(isRetryable('not-idempotent', { error: netErr('ECONNREFUSED') }), true);
+  assert.equal(isRetryable('not-idempotent', { error: netErr('ENOTFOUND') }), true);
+  assert.equal(isRetryable('not-idempotent', { error: netErr('ECONNRESET') }), false);
+  assert.equal(isRetryable('not-idempotent', { error: Object.assign(new Error('t'), { name: 'TimeoutError' }) }), false);
+  assert.equal(isRetryable('not-idempotent', { status: 503 }), true);
+  assert.equal(isRetryable('not-idempotent', { status: 429 }), true);
+  assert.equal(isRetryable('not-idempotent', { status: 500 }), false);
+  assert.equal(isRetryable('idempotent', { error: netErr('ECONNRESET') }), true);
+  assert.equal(isRetryable('idempotent', { status: 502 }), true);
+  assert.equal(isRetryable('idempotent', { status: 404 }), false);
+  assert.equal(isRetryable('idempotent', { error: Object.assign(new Error('x'), { name: 'AbortError' }) }), false);
+});
+
+// ── SessionStart never registers; aborted registration is "may have created" ──
+
+import http from 'node:http';
+
+test('register aborted by the overall budget while in flight → "may already have created" with what to do', async () => {
+  const cfgPath = seedConfig();
+  let n = 0;
+  const res = await runWith(cfgPath, () => withFetch((url, opts) => { n++; return hangUntilAbort(url, opts); },
+    () => registerAndAccept({ retries: 3, backoffMs: [1], deadlineMs: 50, requestTimeoutMs: 10000 })));
+  assert.equal(n, 1);
+  assert.equal(res.status, 'failed');
+  assert.match(res.reason, /^timed out \(total budget exhausted\) — NOT retried automatically: the server may already have created an agent identity/);
+  assert.match(res.reason, /nothing appears in the workspace and nothing needs cleaning up/);
+  assert.match(res.reason, /re-run the same onboarding command/);
+  assert.match(res.reason, /reach https:\/\/core\.test/);
+});
+
+test('register: HTTP 504 carries the same hint; 500 does not', async () => {
+  for (const [status, hinted] of [[504, true], [502, true], [500, false]]) {
+    const cfgPath = seedConfig();
+    const res = await runWith(cfgPath, () => withFetch(() => jsonRes(status, {}), () => registerAndAccept()));
+    assert.equal(/may already have created/.test(res.reason), hinted, `HTTP ${status}: ${res.reason}`);
+  }
+});
+
+test('register:false (SessionStart) never registers, even with no key', async () => {
+  const cfgPath = seedConfig();
+  const res = await runWith(cfgPath, () => withFetch(() => { throw new Error('no network call expected'); },
+    () => registerAndAccept({ register: false })));
+  assert.equal(res.status, 'unchanged');
+  assert.equal(res.notRegistered, true);
+  assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).agent.api_key, '');
+});
+
+test('register:false still accepts a pending invite when a key exists', async () => {
+  const cfgPath = seedConfig({ agent: { api_key: 'cwsk_have' }, invite: { invitation_id: 'inv-h', token: 't' } });
+  const res = await runWith(cfgPath, () => withFetch((url) => {
+    if (url.endsWith('/auth/register/agent')) throw new Error('must not register');
+    if (url.endsWith('/auth/agent/token')) return jsonRes(200, { access_token: 'a' });
+    return jsonRes(200, {});
+  }, () => registerAndAccept({ register: false })));
+  assert.equal(res.inviteAccepted, true);
+});
+
+const HOOK = fileURLToPath(new URL('../hooks/session-hook.js', import.meta.url));
+
+test('SessionStart hook end-to-end: blank key → zero register calls, orientation printed, exit 0', async () => {
+  const hits = [];
+  const srv = http.createServer((req, res) => { hits.push(req.url); res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"data":{"identity_id":"x","api_key":"cwsk_x"}}'); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const cfgPath = seedConfig({ server: { bff_url: `http://127.0.0.1:${srv.address().port}` } });
+    const r = await new Promise((resolve) => {
+      const c = spawn(process.execPath, [HOOK], { env: { ...process.env, CLAUDE_OPENMAX_CONFIG: cfgPath, COCO_API_KEY: '' } });
+      let out = '';
+      let err = '';
+      c.stdout.on('data', (d) => { out += d; });
+      c.stderr.on('data', (d) => { err += d; });
+      c.on('exit', (code) => resolve({ code, out, err }));
+      c.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart' }));
+    });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /hookSpecificOutput/);
+    assert.deepEqual(hits, [], 'the hook must not call /auth/register/agent');
+    assert.match(r.err, /not registering from the SessionStart hook/);
+    assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).agent.api_key, '');
+  } finally { srv.close(); }
 });

@@ -303,3 +303,18 @@ test('an endpoint carrying a suffix still resolves against the conversation id',
   await handler('comm_send', { endpoint: 'conv1|thread7', content: 'ping @nova-noah' });
   assert.equal(calls.roster[0], 'conv1');
 });
+
+test('a failed tool call keeps the network cause hidden behind a bare "fetch failed"', async () => {
+  const services = { core: { me: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }); } } };
+  const { handler } = createMcpTools({ services });
+  const res = await handler('core', { method: 'me', params: {} });
+  assert.equal(res.isError, true);
+  assert.equal(parse(res).error, 'fetch failed (ECONNRESET)');
+});
+
+test('an already-detailed error message is not repeated', async () => {
+  const err = Object.assign(new Error('fetch failed: GET /api/v1/me → ECONNRESET'), { cause: Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } }) });
+  const { handler } = createMcpTools({ services: { core: { me: async () => { throw err; } } } });
+  const msg = parse(await handler('core', { method: 'me', params: {} })).error;
+  assert.ok(msg.startsWith('fetch failed: GET /api/v1/me → ECONNRESET'), msg);
+});
