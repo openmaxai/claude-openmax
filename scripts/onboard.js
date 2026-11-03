@@ -15,7 +15,9 @@
  *                    registration when the same invitation is re-run)
  *   3. register    — POST /auth/register/agent, then exchange a token and accept
  *                    the invitation; 45s total budget, retries on network
- *                    errors / 5xx
+ *                    errors / 5xx. A NEW registration also leaves
+ *                    <dataDir>/first-sync.json so the first channel session
+ *                    catches up messages sent from then on (src/first-sync.js)
  *   4. permissions — APPEND the OpenMax tool rules to permissions.allow in
  *                    ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json (backup first,
  *                    never removes or reorders anything, refuses a corrupt file)
@@ -25,7 +27,10 @@
  *                    in tmux: a new window when already inside tmux, else a
  *                    detached `openmax` session; with no tmux it prints the
  *                    command instead. It never types into any dialog — the
- *                    dev-channel warning is for the user to confirm.
+ *                    dev-channel warning is for the user to confirm. A new
+ *                    window/session must still be running ~3 s later, otherwise
+ *                    the launch is reported as FAILED (exit status + output)
+ *                    with LAUNCH: manual — never as a successful launch.
  *
  * Output contract (stdout; consumed by the invitation prompt):
  *   [onboard] <step>: …        progress lines
@@ -54,6 +59,9 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
 import { registerAndAccept, resolveConfigPath, writeConfig0600, isPlaceholderKey } from '../hooks/auto-register.js';
+import { scrubLine } from '../src/redact.js';
+import { defaultDataDir } from '../src/storage.js';
+import { writeFirstSyncMarker } from '../src/first-sync.js';
 
 export const CHANNEL_REF = 'plugin:openmax-channel@openmax';
 export const TMUX_NAME = 'openmax';
@@ -241,7 +249,10 @@ export function buildLaunchCommand({ claudeBin = 'claude', env = process.env, st
   if (stripEnv) parts.push('env', ...ENV_VARS_TO_STRIP.flatMap((v) => ['-u', v]));
   for (const k of ENV_PASSTHROUGH) if (env[k]) parts.push(`${k}=${shellQuote(env[k])}`);
   parts.push('CLAUDE_OPENMAX_CHANNEL=1', shellQuote(claudeBin), '--dangerously-load-development-channels', CHANNEL_REF);
-  if (prompt) parts.push(shellQuote(prompt));
+  // `--dangerously-load-development-channels` is VARIADIC: without the `--`
+  // Claude Code reads the prompt as a second channel entry and exits 1
+  // ("--dangerously-load-development-channels entries must be tagged: …").
+  if (prompt) parts.push('--', shellQuote(prompt));
   return parts.join(' ');
 }
 
@@ -270,20 +281,71 @@ function resolveClaudeBin(exec, env) {
   return p || 'claude';
 }
 
+// How long a freshly started channel session must survive before the launch is
+// reported as successful. A command-line/parse error makes Claude Code exit
+// within about a second; a healthy session sits in the dev-channel warning
+// dialog waiting for the user.
+export const LAUNCH_SETTLE_MS = 3000;
+const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
+
+/** The last few non-empty lines of a dead pane, scrubbed and size-capped. */
+function paneTail(text, maxLines = 8, maxChars = 600) {
+  const lines = String(text || '').split('\n').map((l) => l.trimEnd())
+    .filter((l) => l && !/^Pane is dead\b/.test(l));
+  const tail = lines.slice(-maxLines).map((l) => scrubLine(l)).join(' | ');
+  return tail.length > maxChars ? `…${tail.slice(-maxChars)}` : tail;
+}
+
+/**
+ * After starting a new window/session: wait, then check that the pane is still
+ * running. The window was created with `remain-on-exit on` (in the SAME tmux
+ * command, so even an instant exit leaves the dead pane behind) — that keeps the
+ * exit status and the error output readable here. A dead pane we just created
+ * is removed again; a live one gets the option reset to the user's default.
+ * @returns {{alive: boolean, exitStatus?: string, output?: string}}
+ */
+async function verifyStarted({ run, target, kill, settleMs, delay }) {
+  await delay(settleMs);
+  const st = run(['display-message', '-p', '-t', target, '#{pane_dead} #{pane_dead_status}']);
+  if (st.status !== 0) return { alive: false, output: '' };   // window already gone
+  const [dead, exitStatus = ''] = st.stdout.trim().split(/\s+/);
+  if (dead !== '1') {
+    run(['set-option', '-w', '-u', '-t', target, 'remain-on-exit']);
+    return { alive: true };
+  }
+  const cap = run(['capture-pane', '-p', '-J', '-t', target, '-S', '-50']);
+  run(kill);
+  return { alive: false, exitStatus, output: cap.status === 0 ? paneTail(cap.stdout) : '' };
+}
+
+function exitedReason(v) {
+  return `the channel session exited right after starting${v.exitStatus ? ` (exit status ${v.exitStatus})` : ''}`
+    + (v.output ? `: ${v.output}` : ' (no output captured)');
+}
+
 /**
  * Start (or reuse) the channel session in tmux. Never sends keystrokes and never
- * kills anything.
+ * kills anything it did not just create.
  *
  * `allowReuse=false` (this run registered a new identity or replaced the
  * config): an already-running `openmax` window/session holds the OLD key in
  * memory, so switching to it would leave the new agent offline. In that case it
  * is reported (`stale: true`) instead of reused, and nothing is started.
- * @returns {{launched: boolean, mode: string, reused?: boolean, stale?: boolean, attach?: string, reason?: string}}
+ *
+ * A NEW window/session is only reported as launched when it is still running
+ * after `settleMs`; one that exited is reported as `exited: true` with its exit
+ * status and the tail of its output, and removed again.
+ * @returns {Promise<{launched: boolean, mode: string, reused?: boolean, stale?: boolean, exited?: boolean, attach?: string, reason?: string}>}
  */
-export function launchInTmux({ mode, cwd, env, exec = defaultExec, claudeBin = 'claude', allowReuse = true }) {
+export async function launchInTmux({
+  mode, cwd, env, exec = defaultExec, claudeBin = 'claude', allowReuse = true,
+  settleMs = LAUNCH_SETTLE_MS, delay = sleep,
+}) {
   const tenv = cleanEnv(env);
   const cmd = buildLaunchCommand({ claudeBin, env, stripEnv: true });
   const run = (args) => exec('tmux', args, { env: tenv });
+  // `;` chains a second tmux command into the same invocation.
+  const keepDeadPane = [';', 'set-option', '-w', 'remain-on-exit', 'on'];
 
   if (mode === 'tmux-window') {
     const list = run(['list-windows', '-F', '#{window_name}']);
@@ -292,8 +354,11 @@ export function launchInTmux({ mode, cwd, env, exec = defaultExec, claudeBin = '
       const sel = run(['select-window', '-t', TMUX_NAME]);
       if (sel.status === 0) return { launched: true, mode, reused: true };
     }
-    const r = run(['new-window', '-n', TMUX_NAME, '-c', cwd, cmd]);
+    const r = run(['new-window', '-P', '-F', '#{window_id}', '-n', TMUX_NAME, '-c', cwd, cmd, ...keepDeadPane]);
     if (r.status !== 0) return { launched: false, mode, reason: (r.stderr || r.error?.message || 'tmux new-window failed').trim() };
+    const target = r.stdout.trim().split('\n')[0] || TMUX_NAME;
+    const v = await verifyStarted({ run, target, kill: ['kill-window', '-t', target], settleMs, delay });
+    if (!v.alive) return { launched: false, mode, exited: true, exitStatus: v.exitStatus, output: v.output, reason: exitedReason(v) };
     return { launched: true, mode, reused: false };
   }
 
@@ -303,8 +368,10 @@ export function launchInTmux({ mode, cwd, env, exec = defaultExec, claudeBin = '
     if (!allowReuse) return { launched: false, mode, stale: true, attach, reason: `tmux session "${TMUX_NAME}" is already running with the previous configuration` };
     return { launched: true, mode, reused: true, attach };
   }
-  const r = run(['new-session', '-d', '-s', TMUX_NAME, '-c', cwd, cmd]);
+  const r = run(['new-session', '-d', '-s', TMUX_NAME, '-c', cwd, cmd, ...keepDeadPane]);
   if (r.status !== 0) return { launched: false, mode, reason: (r.stderr || r.error?.message || 'tmux new-session failed').trim(), attach };
+  const v = await verifyStarted({ run, target: `=${TMUX_NAME}:`, kill: ['kill-session', '-t', `=${TMUX_NAME}`], settleMs, delay });
+  if (!v.alive) return { launched: false, mode, exited: true, exitStatus: v.exitStatus, output: v.output, reason: exitedReason(v), attach };
   return { launched: true, mode, reused: false, attach };
 }
 
@@ -347,11 +414,13 @@ function pluginVersion() {
  * @param {Function} [o.exec]           (cmd,args,opts) => {status,stdout,stderr}
  * @param {Function} [o.register]       default registerAndAccept
  * @param {number} [o.now]
+ * @param {object} [o.launchOpts]     TEST SEAM: extra launchInTmux options (settleMs, delay)
  * @returns {Promise<number>} exit code
  */
 export async function runOnboard({
   argv = [], stdinText = null, env = process.env, cwd = process.cwd(), platform = process.platform,
   print = (l) => process.stdout.write(`${l}\n`), exec = defaultExec, register = registerAndAccept, now = Date.now(),
+  launchOpts = {},
 } = {}) {
   const say = (msg) => print(`[onboard] ${msg}`);
   try {
@@ -407,6 +476,15 @@ export async function runOnboard({
     if (isPlaceholderKey(key)) throw new OnboardError('register', `no api_key in ${configPath} after registration`);
     if (after.invite) throw new OnboardError('accept invitation', 'invitation is still pending after registration');
     say(`register: ${reg.registered ? `OK identity_id=${reg.identityId}` : 'already registered'}`);
+    if (reg.registered) {
+      // The first channel session must pick up messages sent from now on, instead
+      // of seeking past them to the inbox end (see src/first-sync.js).
+      const dataDir = defaultDataDir(env);
+      // Only the orgs this onboarding joined; an org added later keeps the SDK default.
+      const orgIds = isObject(after.orgs) ? Object.entries(after.orgs).map(([id, o]) => o?.org_id || id) : [];
+      if (writeFirstSyncMarker({ dataDir, apiKey: key, identityId: reg.identityId, orgIds, now })) say(`first-sync: messages from now on reach the first channel session (${path.join(dataDir, 'first-sync.json')})`);
+      else say(`first-sync: WARN could not write ${path.join(dataDir, 'first-sync.json')} — messages sent before the first channel session starts may be skipped`);
+    }
     say(`invitation: ${!reg.inviteAccepted ? 'none pending' : keptRegistration ? 'already accepted (re-confirmed)' : 'accepted'}`);
 
     // 4. permissions
@@ -442,13 +520,19 @@ export async function runOnboard({
         // A running channel session may only be reused when this run did not
         // change the agent identity it was started with.
         const allowReuse = !reg.registered && (keptRegistration || !configChanged);
-        const res = launchInTmux({ mode: choice.mode, cwd, env, exec, claudeBin, allowReuse });
+        const res = await launchInTmux({ mode: choice.mode, cwd, env, exec, claudeBin, allowReuse, ...launchOpts });
         if (res.stale) {
           launch = 'manual';
           say(`launch: ${res.reason} — not reusing it (it still holds the old agent key) and not stopping it`);
           next = `First close the old OpenMax session in tmux ${choice.mode === 'tmux-window' ? 'window' : 'session'} "${TMUX_NAME}" `
             + `(exit Claude Code there, or \`tmux kill-${choice.mode === 'tmux-window' ? 'window' : 'session'} -t ${TMUX_NAME}\`), `
             + 'then run the RESTART_COMMAND below and choose "I am using this for local development" in the warning dialog.';
+        } else if (res.exited) {
+          // Started, but Claude Code quit at once — never report that as a launch.
+          launch = 'manual';
+          say(`launch: FAILED ${res.reason}`);
+          next = `The new Claude Code session did not start: ${res.reason}. Fix that, then run the RESTART_COMMAND below `
+            + '(in a new terminal or tmux window) and choose "I am using this for local development" in the warning dialog.';
         } else if (!res.launched) {
           launch = 'manual';
           say(`launch: WARN could not start tmux (${res.reason}) — run the command yourself`);

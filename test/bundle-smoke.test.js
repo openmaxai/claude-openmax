@@ -235,3 +235,29 @@ test('channel-only with a key: wakes are accepted once the runtime is ready', as
     assert.equal((await s.wake()).status, 200);
   } finally { s.child.kill('SIGTERM'); }
 });
+
+// ── 1.3.3 ──────────────────────────────────────────────────────────────────────
+
+test('bundle: the first channel session after onboarding catches up the inbox from seq 0 (first-sync marker)', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'claude-openmax-firstsync-'));
+  const dataDir = path.join(dir, 'data');
+  const apiKey = 'cwsk_smoke_fixture_fresh';
+  const { writeFirstSyncMarker } = await import('../src/first-sync.js');
+  assert.equal(writeFirstSyncMarker({ dataDir, apiKey, orgIds: ['org-smoke'] }), true);
+  const config = { server: { bff_url: 'http://127.0.0.1:9', ws_url: 'ws://127.0.0.1:9/ws' }, agent: { api_key: apiKey }, orgs: { 'org-smoke': { org_id: 'org-smoke' } } };
+  const { stderr } = await probeBundle({ CLAUDE_OPENMAX_CHANNEL: '1', CLAUDE_OPENMAX_DATA_DIR: dataDir }, { config, until: /\[first-sync\]|warm-restart|\] started/ });
+  assert.match(stderr, /\[first-sync\] org=org-smoke: first channel session after onboarding/);
+});
+
+test('bare clone: scripts/onboard.js and its imports run with no node_modules', async () => {
+  const { cpSync, mkdirSync } = await import('node:fs');
+  const { spawnSync } = await import('node:child_process');
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const clone = mkdtempSync(path.join(tmpdir(), 'claude-openmax-bare-'));
+  for (const d of ['scripts', 'hooks', 'src']) cpSync(path.join(root, d), path.join(clone, d), { recursive: true });
+  cpSync(path.join(root, 'package.json'), path.join(clone, 'package.json'));
+  mkdirSync(path.join(clone, 'node_modules'), { recursive: true }); // empty: nothing resolvable
+  const r = spawnSync(process.execPath, [path.join(clone, 'scripts', 'onboard.js'), '--help'], { encoding: 'utf8', cwd: clone, timeout: 20000 });
+  assert.equal(r.status, 0, `onboard.js failed to load from a bare clone:\n${r.stderr}`);
+  assert.match(r.stdout, /Usage: node scripts\/onboard\.js/);
+});

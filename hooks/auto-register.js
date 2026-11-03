@@ -35,6 +35,7 @@ import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 
 import { scrubLine } from '../src/redact.js';
+import { describeCause } from '../src/fetch-guard.js';
 
 const PLACEHOLDER_API_KEYS = new Set(['', 'cwsk_replace_me']);
 const DEFAULT_TOTAL_BUDGET_MS = 8000;
@@ -113,8 +114,8 @@ export function describeFetchError(e) {
   if (!e) return 'unknown error';
   if (e.name === 'TimeoutError') return e.message || 'timed out';
   if (e.name === 'AbortError') return 'timed out (total budget exhausted)';
-  const cause = e.cause && (e.cause.code || e.cause.message);
-  return cause ? `${e.message} (${cause})` : (e.message || String(e));
+  const cause = describeCause(e.cause);
+  return cause && cause !== e.message ? `${e.message} (${cause})` : (e.message || String(e));
 }
 
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });

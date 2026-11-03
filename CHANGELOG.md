@@ -8,6 +8,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [1.3.3] - 2026-11-03
+
+Fixes from the INT real-machine end-to-end test of 1.3.2 (Claude Code 2.1.308).
+
+### Fixed
+
+- **`onboard.js --launch` started a session that exited at once — and reported
+  success** (`scripts/onboard.js`). `--dangerously-load-development-channels` takes
+  several values, so Claude Code read the greeting prompt that followed the plugin
+  ref as a second channel entry and exited 1 (`--dangerously-load-development-channels
+  entries must be tagged: …`); the tmux window/session vanished, yet the script
+  printed `LAUNCH: tmux-window` / `tmux-session`. The launch command and
+  `RESTART_COMMAND` now put `--` before the prompt. A newly started window/session
+  must also still be running after 3 s: it is created with `remain-on-exit` (in the
+  same tmux command), checked, and on an early exit the script prints
+  `launch: FAILED the channel session exited right after starting (exit status N): <last output lines>`,
+  removes the dead window/session it just created, and reports `LAUNCH: manual`
+  with a NEXT line that says what went wrong. A live one gets `remain-on-exit`
+  reset to the user's default.
+- **The first channel session skipped messages sent right after onboarding**
+  (`src/first-sync.js`, `loadSession` in `src/config.js`, `src/create-bridge.js`,
+  `scripts/onboard.js`). With no saved `/sync` cursor the SDK seeks to the END of
+  the inbox (`init sync_seq=N (seeked to inbox end)`), so a DM sent between
+  onboarding and the first channel session was never delivered or answered. When
+  the onboarding registers a NEW identity it now writes `<dataDir>/first-sync.json`
+  (api_key fingerprint + the org ids it joined, 0600); the first channel session for
+  that identity then catches up those orgs' inboxes from seq 0 through the normal
+  dedupe → access-policy → deliver path. A new identity has no older inbox history,
+  so nothing from before the onboarding is replayed. In that session, `/sync`
+  events that the SDK sweep skips because they are not deliverable messages (no
+  `message_id`) are recorded in the SDK inbox ledger — otherwise a first seq of
+  that kind would leave a permanent hole and the ledger would re-run `/sync` from 0
+  every ~10 s. The watermark itself is never jumped, so a message the sweep skipped
+  as an in-flight duplicate of a live delivery that then fails is still recovered
+  by the SDK's gap rescan. The marker is
+  ignored for any other api_key and for orgs joined later, never used when a
+  cursor exists, and retired per org once a real cursor is saved. Existing
+  identities keep the seek-to-end behaviour.
+- **Routine token logs at ERROR level** (`ERROR [token] ws-ticket ok …`). The SDK
+  TokenManager's exchange / refresh / ws-ticket progress lines are now logged at
+  INFO, its cache-discard notice at WARN (`levelTokenLogs` in `src/providers.js`).
+- Network errors keep undici's code and add its readable message, e.g.
+  `fetch failed: POST /auth/ws-ticket → UND_ERR_SOCKET: other side closed` (log,
+  tool errors, onboarding errors).
+
+### Notes
+
+- A launched session that dies more than 3 s after starting is not detected (it
+  still counts as launched).
+- `inbox-ledger: gap persisted … triggering /sync from 0` (seen four times without
+  a `/sync` request in the E2E log): SDK 1.1.0 `syncMissedEvents` returns early
+  while the session cursor is 0, which is the state after a first connect that
+  found an empty inbox; the ledger then keeps re-triggering a sweep that never
+  runs. Not changed here (SDK-side). The first-sync path above starts with a
+  truthy cursor and records skipped non-message seqs, so it neither hits that early
+  return nor leaves a gap of its own.
+
 ## [1.3.2] - 2026-11-02
 
 The rest of Plane OPENM-1107 / cws-core#269 (the gating part shipped in 1.3.1).

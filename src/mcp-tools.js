@@ -36,6 +36,8 @@
  * the SDK wins and the divergence is called out in the method `note`.
  */
 
+import { describeCause } from './fetch-guard.js';
+
 const SERVICE_KEYS = ['tm', 'kb', 'as', 'comm', 'core', 'conn'];
 
 const SERVICE_DESCRIPTIONS = {
@@ -1293,7 +1295,7 @@ export function createMcpTools({ services, bridge, defaultOrgId, mentions, logge
       // Keep the network cause (undici hides it in e.cause behind a bare
       // "fetch failed") so the agent and the log can tell what actually broke.
       const msg = e?.message || String(e);
-      const cause = e?.cause && (e.cause.code || e.cause.message);
+      const cause = describeCause(e?.cause);
       const detail = cause && !msg.includes(cause) ? `${msg} (${cause})` : msg;
       logger?.warn?.(`tool ${name} failed: ${detail}`);
       return errResult(detail);

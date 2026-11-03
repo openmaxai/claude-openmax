@@ -331,6 +331,11 @@ test('describeFetchError: per-request timeout, budget abort, cause code appended
   assert.equal(describeFetchError(e), 'fetch failed (ENOTFOUND)');
 });
 
+test('describeFetchError keeps the undici code and adds its readable message', () => {
+  const e = new TypeError('fetch failed'); e.cause = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+  assert.equal(describeFetchError(e), 'fetch failed (UND_ERR_SOCKET: other side closed)');
+});
+
 const AR = fileURLToPath(new URL('../hooks/auto-register.js', import.meta.url));
 const runCli = (cfgPath) => spawnSync(process.execPath, [AR], { encoding: 'utf8', env: { ...process.env, CLAUDE_OPENMAX_CONFIG: cfgPath, COCO_API_URL: '', COCO_API_KEY: '' }, timeout: 20000 });
 

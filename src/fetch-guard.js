@@ -28,10 +28,23 @@ function requestPath(url) {
   try { return new URL(String(url)).pathname; } catch { return String(url).split('?')[0]; }
 }
 
+/**
+ * A network-error cause as "<code>: <message>" — undici's code alone
+ * (UND_ERR_SOCKET, UND_ERR_HEADERS_TIMEOUT, …) does not say what happened, its
+ * message ("other side closed") does. The code is kept for grepping; the message
+ * is dropped when it already contains the code (e.g. "connect ECONNREFUSED …").
+ */
+export function describeCause(c) {
+  if (!c) return '';
+  const code = c.code ? String(c.code) : '';
+  const msg = c.message ? String(c.message) : '';
+  if (code && msg && !msg.includes(code)) return `${code}: ${msg}`;
+  return msg || code;
+}
+
 /** The most specific reason available for a failed fetch. */
 export function fetchCause(e) {
-  const c = e?.cause;
-  return (c && (c.code || c.message)) || e?.code || e?.message || String(e);
+  return describeCause(e?.cause) || e?.code || e?.message || String(e);
 }
 
 /**
