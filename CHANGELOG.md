@@ -36,10 +36,13 @@ Fixes from the INT real-machine end-to-end test of 1.3.2 (Claude Code 2.1.308).
   (api_key fingerprint + the org ids it joined, 0600); the first channel session for
   that identity then catches up those orgs' inboxes from seq 0 through the normal
   dedupe → access-policy → deliver path. A new identity has no older inbox history,
-  so nothing from before the onboarding is replayed. When the first real cursor is
-  saved, the SDK inbox ledger is advanced to it (as the seek-to-end path does) —
-  otherwise a first seq that is not a deliverable message would leave a permanent
-  hole and the ledger would re-run `/sync` from 0 every ~10 s. The marker is
+  so nothing from before the onboarding is replayed. In that session, `/sync`
+  events that the SDK sweep skips because they are not deliverable messages (no
+  `message_id`) are recorded in the SDK inbox ledger — otherwise a first seq of
+  that kind would leave a permanent hole and the ledger would re-run `/sync` from 0
+  every ~10 s. The watermark itself is never jumped, so a message the sweep skipped
+  as an in-flight duplicate of a live delivery that then fails is still recovered
+  by the SDK's gap rescan. The marker is
   ignored for any other api_key and for orgs joined later, never used when a
   cursor exists, and retired per org once a real cursor is saved. Existing
   identities keep the seek-to-end behaviour.
@@ -59,8 +62,8 @@ Fixes from the INT real-machine end-to-end test of 1.3.2 (Claude Code 2.1.308).
   while the session cursor is 0, which is the state after a first connect that
   found an empty inbox; the ledger then keeps re-triggering a sweep that never
   runs. Not changed here (SDK-side). The first-sync path above starts with a
-  non-zero cursor and advances the ledger, so it neither hits that early return nor
-  leaves a gap of its own.
+  truthy cursor and records skipped non-message seqs, so it neither hits that early
+  return nor leaves a gap of its own.
 
 ## [1.3.2] - 2026-11-02
 

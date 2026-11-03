@@ -61,17 +61,15 @@ test('writeFirstSyncMarker refuses a marker that would apply to no org', () => {
   assert.equal(fs.existsSync(path.join(dir, FIRST_SYNC_KEY)), false);
 });
 
-test('cursorSaved advances the bound inbox ledger to the first real cursor (closes a gap below it)', async () => {
+test('cursorSaved retires the marker but never moves the ledger watermark (SDK #5 recovery stays intact)', async () => {
   const dir = tmpDir();
   writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [ORG] });
   const fsx = createFirstSync({ storage: createFileStorage({ dataDir: dir }), apiKey: API_KEY, logger: silent });
-  let acked = 0;
-  const ledger = { getAckedSeq: () => acked, setAckedSeq: (n) => { if (n > acked) acked = n; } };
-  fsx.bindLedgers((id) => (id === ORG ? ledger : null));
+  const touched = [];
+  fsx.bindLedgers(() => ({ getAckedSeq: () => 0, setAckedSeq: (n) => touched.push(['setAckedSeq', n]), record: (n) => touched.push(['record', n]) }));
   await fsx.cursorSaved(ORG, 7);
-  assert.equal(acked, 7);
-  await fsx.cursorSaved(ORG, 9);   // marker spent → no more ledger writes
-  assert.equal(acked, 7);
+  assert.deepEqual(touched, []);
+  assert.equal(await fsx.initialCursor(ORG), null, 'spent');
 });
 
 test('no marker → loadSession keeps the SDK default (empty session → seek to the inbox end)', async () => {
@@ -103,15 +101,14 @@ test('marker, no session → start-of-inbox cursor; saveSession retires it; a pu
 
 // ── end to end through the real SDK orchestrator ─────────────────────────────
 
-function runtime(dataDir) {
+function runtime(dataDir, httpClient = null) {
   const config = normalizeConfig({
     server: { bff_url: 'https://core.example', ws_url: 'wss://comm.example/ws' },
     agent: { identity_id: 'agent-1', api_key: API_KEY, device_id: 'dev', app_version: 'claude-openmax/test' },
     orgs: { [ORG]: { org_id: ORG, owner: { member_id: OWNER, name: 'Owner' }, self: { member_id: 'self-member', name: 'Bot' }, access: {} } },
   }, { logger: silent });
   return buildRuntime({
-    config, file: path.join(dataDir, 'config.json'), storage: createFileStorage({ dataDir }), logger: silent,
-    httpClient: fakeHttp.current,
+    config, file: path.join(dataDir, 'config.json'), storage: createFileStorage({ dataDir }), logger: silent, httpClient,
   });
 }
 
@@ -120,17 +117,19 @@ const DM_ONLY = [{ seq: 1, conversation_id: 'C1', message_id: 'M1' }];
 // The inbox starts with a seq that is not a deliverable message (no message_id).
 const NON_MESSAGE_FIRST = [{ seq: 1, conversation_id: 'C1' }, { seq: 2, conversation_id: 'C1', message_id: 'M1' }];
 
-function makeFakeHttp(inbox = DM_ONLY) {
+function makeFakeHttp(inbox = DM_ONLY, { syncDelayMs = 0 } = {}) {
   const calls = [];
   const http = {
     calls,
+    inbox,   // tests may append to it (messages that arrive later)
     apiPath: (p) => `/api/v1${p}`,
     async getForOrg(_org, p) {
       calls.push(['GET', p]);
       if (p.endsWith('/me')) return { identity_id: 'agent-1', display_name: 'Bot' };
-      if (p === '/api/v1/conversations/C1/messages/M1') {
-        const seq = inbox.find((e) => e.message_id === 'M1').seq;
-        return { id: 'M1', conversation_id: 'C1', sender_id: OWNER, sender_type: 'HUMAN', type: 'TEXT', inbox_seq: seq, seq, content: { content_type: 'text', body: { text: 'hello?' } } };
+      const m = p.match(/^\/api\/v1\/conversations\/C1\/messages\/(\w+)$/);
+      if (m) {
+        const seq = http.inbox.find((e) => e.message_id === m[1]).seq;
+        return { id: m[1], conversation_id: 'C1', sender_id: OWNER, sender_type: 'HUMAN', type: 'TEXT', inbox_seq: seq, seq, content: { content_type: 'text', body: { text: `msg ${m[1]}` } } };
       }
       if (p === '/api/v1/conversations/C1') return { id: 'C1', type: 'dm' };
       return {};
@@ -138,7 +137,8 @@ function makeFakeHttp(inbox = DM_ONLY) {
     async postForOrg(_org, p, body) {
       calls.push(['POST', p, body]);
       if (p === '/api/v1/sync') {
-        const events = inbox.filter((e) => e.seq > body.since_seq);
+        if (syncDelayMs) await new Promise((r) => setTimeout(r, syncDelayMs));
+        const events = http.inbox.filter((e) => e.seq > body.since_seq);
         return events.length
           ? { events, next_cursor: String(events.at(-1).seq), has_more: false }
           : { events: [], has_more: false };
@@ -150,32 +150,41 @@ function makeFakeHttp(inbox = DM_ONLY) {
   };
   return http;
 }
-const fakeHttp = { current: null };
 
-async function firstChannelSession(dataDir, { inbox, holdMs = 20, inspect } = {}) {
-  fakeHttp.current = makeFakeHttp(inbox);
-  const rt = runtime(dataDir);
+/**
+ * One channel session through the real CwsAgentBridge, wired like createBridge()
+ * (wrapped http + bound ledgers). `onOpen(sock)` runs right after the WS 'open'
+ * (live frames), `deliver` overrides the inbound delivery.
+ */
+async function firstChannelSession(dataDir, { inbox, holdMs = 20, inspect, syncDelayMs, onOpen, deliver, until } = {}) {
+  const http = makeFakeHttp(inbox ? [...inbox] : undefined, { syncDelayMs });
+  const rt = runtime(dataDir, http);
   const delivered = [];
   const sock = new EventEmitter();
   sock.close = () => {};
   sock.send = () => {};
   const bridge = new CwsAgentBridge({
-    http: fakeHttp.current,
-    ws: { baseUrl: 'wss://comm.example/ws', urlProvider: async () => 'wss://comm.example/ws?ticket=t', wsFactory: () => { setImmediate(() => sock.emit('open')); return sock; } },
+    http: rt.firstSync.wrapHttp(http),                 // what createBridge() does
+    ws: { baseUrl: 'wss://comm.example/ws', urlProvider: async () => 'wss://comm.example/ws?ticket=t', wsFactory: () => { setImmediate(() => { sock.emit('open'); onOpen?.(sock, http); }); return sock; } },
     orgConfigs: rt.orgConfigs,
-    providers: { storage: createFileStorage({ dataDir }), logger: silent, inbound: { deliver: async (m) => { delivered.push(m.messageId); return { ok: true }; } } },
+    providers: { storage: createFileStorage({ dataDir }), logger: silent, inbound: { deliver: async (m) => {
+      const res = deliver ? await deliver(m) : { ok: true };
+      if (res?.ok === true) delivered.push(m.messageId);
+      return res;
+    } } },
     callbacks: rt.callbacks,
     reporters: { metrics: false, frameMetrics: false, markReadOnDeliver: false },
   });
   rt.firstSync.bindLedgers(ledgerAccessor(bridge));   // what createBridge() does
   await bridge.start();
-  for (let i = 0; i < 100 && !fakeHttp.current.calls.some(([m, p]) => m === 'POST' && p === '/api/v1/sync/ack'); i++) {
+  for (let i = 0; i < 100 && !http.calls.some(([m, p]) => m === 'POST' && p === '/api/v1/sync/ack'); i++) {
     await new Promise((r) => setTimeout(r, 10));
   }
-  await new Promise((r) => setTimeout(r, holdMs));
+  const t0 = Date.now();
+  while (Date.now() - t0 < holdMs && !(until && until(delivered))) await new Promise((r) => setTimeout(r, 50));
   const state = inspect ? inspect(bridge) : undefined;
   await bridge.stop();
-  return { delivered, calls: fakeHttp.current.calls, state };
+  return { delivered, calls: http.calls, state };
 }
 
 test('first channel session after onboarding delivers the DM sent before it started (real SDK pipeline)', async () => {
@@ -214,7 +223,7 @@ test('inbox starting with a non-message seq: the first catch-up advances the led
   const { delivered, calls, state } = await firstChannelSession(dir, { inbox: NON_MESSAGE_FIRST, holdMs: 100, inspect: ledgerState });
   assert.deepEqual(delivered, ['M1']);
   assert.equal(syncCount(calls), 1);
-  assert.equal(state.acked, 2, 'watermark advanced to the swept cursor (1.3.3 first cut left it at 0)');
+  assert.equal(state.acked, 2, 'watermark past the non-message seq (1.3.3 first cut left it at 0)');
   assert.deepEqual(state.pendingBelow, [], 'no hole for the gap timer to chase');
   const persisted = JSON.parse(fs.readFileSync(path.join(dir, `inbox-${ORG}.json`), 'utf8'));
   assert.equal(persisted.acked_seq, 2);
@@ -231,14 +240,58 @@ test('inbox starting with a non-message seq: exactly ONE /sync over 22 s (the ga
   assert.equal(state.acked, 2);
 });
 
-test('createBridge binds the started bridge\'s inbox ledgers to first-sync', () => {
-  let bound = null;
-  const rt = runtime(tmpDir());
-  rt.firstSync.bindLedgers = (fn) => { bound = fn; };
-  const bridge = createBridge({ runtime: rt, inbound: { deliver: async () => ({ ok: true }) }, storage: createFileStorage({ dataDir: tmpDir() }), runtimeState: {}, logger: silent, wsConfig: rt.wsConfig });
-  assert.equal(typeof bound, 'function');
-  const fake = { setAckedSeq() {} };
-  bridge._orgs.set(ORG, { ledger: fake });
-  assert.equal(bound(ORG), fake, 'resolves the SDK per-org ledger');
-  assert.equal(bound('nope'), null);
+test('createBridge wraps the http for first-sync and binds the started bridge\'s inbox ledgers', async () => {
+  const dir = tmpDir();
+  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [ORG] });
+  const http = makeFakeHttp(NON_MESSAGE_FIRST);
+  const rt = runtime(dir, http);
+  const bridge = createBridge({ runtime: rt, inbound: { deliver: async () => ({ ok: true }) }, storage: createFileStorage({ dataDir: dir }), runtimeState: {}, logger: silent, wsConfig: rt.wsConfig });
+  const recorded = [];
+  bridge._orgs.set(ORG, { ledger: { record: (n) => recorded.push(n) } });
+  assert.ok(await rt.callbacks.loadSession(ORG), 'org enters first-sync mode');
+  const res = await bridge.http.postForOrg(ORG, '/api/v1/sync', { since_seq: 0 });
+  assert.equal(res.events.length, 2, 'response passed through unchanged');
+  assert.deepEqual(recorded, [1], 'only the non-message seq is recorded, through the bound ledger');
+  await bridge.http.postForOrg(ORG, '/api/v1/sync/ack', { seq: 2 });
+  assert.deepEqual(recorded, [1], '/sync/ack is not touched');
+  assert.equal(bridge.http.apiPath('/x'), '/api/v1/x', 'other methods pass through');
+});
+
+test('wrapHttp leaves orgs that are not in first-sync mode alone', async () => {
+  const fsx = createFirstSync({ storage: createFileStorage({ dataDir: tmpDir() }), apiKey: API_KEY, logger: silent });
+  const recorded = [];
+  fsx.bindLedgers(() => ({ record: (n) => recorded.push(n) }));
+  await fsx.wrapHttp(makeFakeHttp(NON_MESSAGE_FIRST)).postForOrg(ORG, '/api/v1/sync', { since_seq: 0 });
+  assert.deepEqual(recorded, []);
+});
+
+// SDK #5 recovery must survive first-sync: M1 is in the inbox AND arrives live at
+// sweep start; the sweep skips it as an in-flight duplicate (its cursor still
+// moves past seq 1); the live delivery fails 300 ms later; M2 arrives live 2 s
+// later. The ledger's gap rescan from acked_seq (~15 s) must deliver M1.
+test('a message skipped by the catch-up as in-flight and then failing live is recovered by the gap rescan', { timeout: 60000 }, async () => {
+  const dir = tmpDir();
+  writeFirstSyncMarker({ dataDir: dir, apiKey: API_KEY, orgIds: [ORG] });
+  let m1Attempts = 0;
+  const { delivered, state } = await firstChannelSession(dir, {
+    inbox: DM_ONLY,
+    syncDelayMs: 50,
+    onOpen: (sock, http) => {
+      sock.emit('message', JSON.stringify({ type: 'message', payload: { id: 'M1', conversation_id: 'C1', sender_id: OWNER } }));
+      setTimeout(() => {
+        http.inbox.push({ seq: 2, conversation_id: 'C1', message_id: 'M2' });
+        sock.emit('message', JSON.stringify({ type: 'message', payload: { id: 'M2', conversation_id: 'C1', sender_id: OWNER } }));
+      }, 2000);
+    },
+    deliver: async (m) => {
+      if (m.messageId === 'M1' && ++m1Attempts === 1) { await new Promise((r) => setTimeout(r, 300)); return { ok: false }; }
+      return { ok: true };
+    },
+    holdMs: 25000,
+    until: (d) => d.includes('M1') && d.includes('M2'),
+    inspect: ledgerState,
+  });
+  assert.ok(m1Attempts >= 2, `M1 was retried (attempts=${m1Attempts})`);
+  assert.deepEqual([...delivered].sort(), ['M1', 'M2'], 'M1 is eventually delivered, not lost');
+  assert.equal(state.acked, 2);
 });

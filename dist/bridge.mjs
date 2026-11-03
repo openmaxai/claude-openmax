@@ -4016,15 +4016,55 @@ function createFirstSync({ storage, apiKey, logger }) {
   };
   const pendingFor = (m, orgId) => !!m && !!fp && m.fp === fp && Array.isArray(m.orgs) && m.orgs.includes(orgId) && !(Array.isArray(m.done) && m.done.includes(orgId));
   let ledgerFor = () => null;
+  const catchUpOrgs = /* @__PURE__ */ new Set();
+  const recordSkipped = (orgId, res) => {
+    const events = Array.isArray(res?.events) ? res.events : [];
+    const skipped = events.filter((ev) => ev && (!ev.message_id || !ev.conversation_id) && typeof ev.seq === "number" && ev.seq > 0).map((ev) => ev.seq);
+    if (!skipped.length) return;
+    const ledger = ledgerFor(orgId);
+    if (!ledger || typeof ledger.record !== "function") {
+      logger?.warn?.(`[first-sync] org=${orgId}: inbox ledger not reachable \u2014 non-message seq(s) ${skipped.join(",")} stay open`);
+      return;
+    }
+    for (const seq of skipped) ledger.record(seq);
+    logger?.info?.(`[first-sync] org=${orgId}: recorded non-message inbox seq(s) ${skipped.join(",")} in the ledger`);
+  };
   return {
     /**
      * Give access to the started orgs' inbox ledgers. SDK 1.1.0 has no public
      * accessor; `CwsAgentBridge._orgs` (orgId → {ledger, …}) is the record the
      * orchestrator keeps per started org (test/first-sync.test.js pins it).
-     * @param {(orgId:string) => ({setAckedSeq:Function, getAckedSeq?:Function}|null|undefined)} fn
+     * @param {(orgId:string) => ({record:Function}|null|undefined)} fn
      */
     bindLedgers(fn) {
       if (typeof fn === "function") ledgerFor = fn;
+    },
+    /**
+     * The http client handed to the SDK bridge: identical, except that `/sync`
+     * pages for orgs in first-sync mode get their non-message seqs recorded.
+     */
+    wrapHttp(http) {
+      if (!http) return http;
+      const isSync = (p) => /\/sync$/.test(String(p || "").replace(/\?.*$/, ""));
+      return new Proxy(http, {
+        get(target, prop) {
+          const v = Reflect.get(target, prop, target);
+          if (prop === "postForOrg" && typeof v === "function") {
+            return async (orgId, p, ...rest) => {
+              const res = await v.call(target, orgId, p, ...rest);
+              if (catchUpOrgs.has(orgId) && isSync(p)) {
+                try {
+                  recordSkipped(orgId, res);
+                } catch (e) {
+                  logger?.warn?.(`[first-sync] org=${orgId}: ${e.message}`);
+                }
+              }
+              return res;
+            };
+          }
+          return typeof v === "function" ? v.bind(target) : v;
+        }
+      });
     },
     /**
      * The cursor to hand the SDK for an org that has NO persisted session, or
@@ -4033,6 +4073,7 @@ function createFirstSync({ storage, apiKey, logger }) {
     async initialCursor(orgId) {
       const m = await read();
       if (!pendingFor(m, orgId)) return null;
+      catchUpOrgs.add(orgId);
       logger?.info?.(`[first-sync] org=${orgId}: first channel session after onboarding \u2014 catching up the inbox from seq 0 (onboarded ${m.created_at || "?"}) instead of seeking to its end`);
       return inboxStartCursor();
     },
@@ -4041,18 +4082,6 @@ function createFirstSync({ storage, apiKey, logger }) {
       if (!(typeof seq === "number" && seq > 0)) return;
       const m = await read();
       if (!pendingFor(m, orgId)) return;
-      try {
-        const ledger = ledgerFor(orgId);
-        if (ledger && typeof ledger.setAckedSeq === "function") {
-          const before = ledger.getAckedSeq?.() ?? 0;
-          ledger.setAckedSeq(seq);
-          if (seq > before) logger?.info?.(`[first-sync] org=${orgId}: inbox ledger advanced ${before} \u2192 ${seq} after the first catch-up`);
-        } else {
-          logger?.warn?.(`[first-sync] org=${orgId}: inbox ledger not reachable \u2014 gap sweeps from 0 may repeat this session`);
-        }
-      } catch (e) {
-        logger?.warn?.(`[first-sync] org=${orgId}: could not advance the inbox ledger: ${e.message}`);
-      }
       try {
         await storage.set(FIRST_SYNC_KEY, JSON.stringify({ ...m, done: [...Array.isArray(m.done) ? m.done : [], orgId] }));
       } catch (e) {
@@ -9248,7 +9277,8 @@ function createInboundDelivery({
 // src/create-bridge.js
 function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
   const bridge = new CwsAgentBridge({
-    http: runtime.http,
+    // first-sync records /sync events the SDK sweep skips (see first-sync.js).
+    http: runtime.firstSync ? runtime.firstSync.wrapHttp(runtime.http) : runtime.http,
     tokenManager: runtime.tokenManager,
     ws: {
       baseUrl: wsConfig.baseUrl,

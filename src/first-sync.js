@@ -24,15 +24,17 @@
  * a real cursor (so a later purge of the local session state never replays the
  * whole inbox).
  *
- * Ledger watermark: the SDK's seek-to-end path seeds the inbox ledger with the
- * cursor (`setAckedSeq`). The catch-up path does not, and `/sync` events that
- * are not deliverable messages (no message_id) are skipped WITHOUT being
- * recorded — so if the inbox starts with such a seq the ledger's contiguous
- * watermark would stay at 0 and its gap timer would re-run `/sync` from 0 every
- * ~10 s for the whole session. When the first real cursor is persisted for an
- * org in first-sync mode (the SDK only persists it after a sweep that processed
- * every event up to it, or from the ledger's own watermark), the ledger is
- * advanced to that cursor — exactly what the seek-to-end path would have done.
+ * Non-message seqs: the SDK's seek-to-end path seeds the inbox ledger with the
+ * cursor (`setAckedSeq`); the catch-up path does not (the start cursor is not
+ * `> 0`). `/sync` events that are not deliverable messages (no message_id /
+ * conversation_id) are skipped by the SDK sweep WITHOUT being recorded, so if
+ * the inbox starts with such a seq the ledger's contiguous watermark would stay
+ * at 0 and its gap timer would re-run `/sync` from 0 every ~10 s for the whole
+ * session. For orgs in first-sync mode, `wrapHttp()` therefore records exactly
+ * those skipped seqs in the ledger as each `/sync` page arrives. The watermark
+ * is NOT jumped to the swept cursor: a message the sweep skipped as an
+ * in-flight duplicate of a live delivery that then FAILS must stay below the
+ * watermark, so the SDK's gap rescan (from acked_seq) can still recover it.
  *
  * inboxStartCursor(): the SDK (1.1.0, `orchestrator.#startOrgWs` / `SyncEngine`)
  * treats a FALSY `sync_seq` as "first-ever connect → seek to the end", and
@@ -113,15 +115,56 @@ export function createFirstSync({ storage, apiKey, logger }) {
 
   // (orgId) => the SDK's inbox ledger for that org, bound once the bridge exists.
   let ledgerFor = () => null;
+  // Orgs that started this process from the start-of-inbox cursor.
+  const catchUpOrgs = new Set();
+
+  // Record the seqs of a /sync page that the SDK sweep will skip (see header).
+  const recordSkipped = (orgId, res) => {
+    const events = Array.isArray(res?.events) ? res.events : [];
+    const skipped = events.filter((ev) => ev && (!ev.message_id || !ev.conversation_id)
+      && typeof ev.seq === 'number' && ev.seq > 0).map((ev) => ev.seq);
+    if (!skipped.length) return;
+    const ledger = ledgerFor(orgId);
+    if (!ledger || typeof ledger.record !== 'function') {
+      logger?.warn?.(`[first-sync] org=${orgId}: inbox ledger not reachable — non-message seq(s) ${skipped.join(',')} stay open`);
+      return;
+    }
+    for (const seq of skipped) ledger.record(seq);
+    logger?.info?.(`[first-sync] org=${orgId}: recorded non-message inbox seq(s) ${skipped.join(',')} in the ledger`);
+  };
 
   return {
     /**
      * Give access to the started orgs' inbox ledgers. SDK 1.1.0 has no public
      * accessor; `CwsAgentBridge._orgs` (orgId → {ledger, …}) is the record the
      * orchestrator keeps per started org (test/first-sync.test.js pins it).
-     * @param {(orgId:string) => ({setAckedSeq:Function, getAckedSeq?:Function}|null|undefined)} fn
+     * @param {(orgId:string) => ({record:Function}|null|undefined)} fn
      */
     bindLedgers(fn) { if (typeof fn === 'function') ledgerFor = fn; },
+
+    /**
+     * The http client handed to the SDK bridge: identical, except that `/sync`
+     * pages for orgs in first-sync mode get their non-message seqs recorded.
+     */
+    wrapHttp(http) {
+      if (!http) return http;
+      const isSync = (p) => /\/sync$/.test(String(p || '').replace(/\?.*$/, ''));
+      return new Proxy(http, {
+        get(target, prop) {
+          const v = Reflect.get(target, prop, target);
+          if (prop === 'postForOrg' && typeof v === 'function') {
+            return async (orgId, p, ...rest) => {
+              const res = await v.call(target, orgId, p, ...rest);
+              if (catchUpOrgs.has(orgId) && isSync(p)) {
+                try { recordSkipped(orgId, res); } catch (e) { logger?.warn?.(`[first-sync] org=${orgId}: ${e.message}`); }
+              }
+              return res;
+            };
+          }
+          return typeof v === 'function' ? v.bind(target) : v;
+        },
+      });
+    },
 
     /**
      * The cursor to hand the SDK for an org that has NO persisted session, or
@@ -130,6 +173,7 @@ export function createFirstSync({ storage, apiKey, logger }) {
     async initialCursor(orgId) {
       const m = await read();
       if (!pendingFor(m, orgId)) return null;
+      catchUpOrgs.add(orgId);
       logger?.info?.(`[first-sync] org=${orgId}: first channel session after onboarding — `
         + `catching up the inbox from seq 0 (onboarded ${m.created_at || '?'}) instead of seeking to its end`);
       return inboxStartCursor();
@@ -140,19 +184,6 @@ export function createFirstSync({ storage, apiKey, logger }) {
       if (!(typeof seq === 'number' && seq > 0)) return;
       const m = await read();
       if (!pendingFor(m, orgId)) return;
-      // Close the ledger gap below the cursor (see header) before retiring.
-      try {
-        const ledger = ledgerFor(orgId);
-        if (ledger && typeof ledger.setAckedSeq === 'function') {
-          const before = ledger.getAckedSeq?.() ?? 0;
-          ledger.setAckedSeq(seq);
-          if (seq > before) logger?.info?.(`[first-sync] org=${orgId}: inbox ledger advanced ${before} → ${seq} after the first catch-up`);
-        } else {
-          logger?.warn?.(`[first-sync] org=${orgId}: inbox ledger not reachable — gap sweeps from 0 may repeat this session`);
-        }
-      } catch (e) {
-        logger?.warn?.(`[first-sync] org=${orgId}: could not advance the inbox ledger: ${e.message}`);
-      }
       try {
         await storage.set(FIRST_SYNC_KEY, JSON.stringify({ ...m, done: [...(Array.isArray(m.done) ? m.done : []), orgId] }));
       } catch (e) {

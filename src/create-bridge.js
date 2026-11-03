@@ -30,7 +30,8 @@ import { ledgerAccessor } from './first-sync.js';
  */
 export function createBridge({ runtime, inbound, storage, runtimeState, logger, wsConfig }) {
   const bridge = new CwsAgentBridge({
-    http: runtime.http,
+    // first-sync records /sync events the SDK sweep skips (see first-sync.js).
+    http: runtime.firstSync ? runtime.firstSync.wrapHttp(runtime.http) : runtime.http,
     tokenManager: runtime.tokenManager,
     ws: {
       baseUrl: wsConfig.baseUrl,
@@ -53,8 +54,8 @@ export function createBridge({ runtime, inbound, storage, runtimeState, logger, 
       version: PKG_VERSION,
     },
   });
-  // First channel session after onboarding: let first-sync advance the inbox
-  // ledger once the first catch-up cursor is persisted (see first-sync.js).
+  // First channel session after onboarding: let first-sync reach the started
+  // orgs' inbox ledgers (see first-sync.js).
   runtime.firstSync?.bindLedgers(ledgerAccessor(bridge));
   return bridge;
 }
