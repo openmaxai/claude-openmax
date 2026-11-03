@@ -59,6 +59,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { identityIdFromMe, purgeOrgTokenCache } from './token-guard.js';
+import { createFirstSync } from './first-sync.js';
 import { safeJson, redactSecretsDeep } from './redact.js';
 import {
   accessFingerprint,
@@ -81,6 +82,7 @@ import {
 } from '@openmaxai/openmax-agent-sdk';
 import { DEFAULT_APP_VERSION } from './version.js';
 import { createGuardedFetch } from './fetch-guard.js';
+import { levelTokenLogs } from './providers.js';
 const DEFAULT_FRONTEND_BASE_PATH = '/workspace';
 
 // Hard cap on how long a single owner-sync core HTTP call may block the caller
@@ -489,7 +491,7 @@ export function buildRuntime({
     storage,
     resolveDefaultOrgId,
     onMemberId: applyMemberId,
-    logger,
+    logger: levelTokenLogs(logger),
   });
 
   const http = httpClient || new CwsHttpClient({
@@ -558,7 +560,12 @@ export function buildRuntime({
     return [org._legacySlug, legacySlugify(org.org_name)].filter((k) => k && k !== orgId);
   };
 
-  const loadSession = async (orgId) => {
+  // First channel session after onboarding a NEW identity: catch up its inbox
+  // from seq 0 instead of letting the SDK seek to the end (see first-sync.js).
+  const firstSync = createFirstSync({ storage, apiKey: state.agent.api_key, logger });
+
+  // The persisted session (or a migrated legacy one); null when there is none.
+  const readSession = async (orgId) => {
     try {
       const raw = await storage.get(path.join('sessions', `${orgId}.json`));
       if (raw) return JSON.parse(raw);
@@ -575,12 +582,19 @@ export function buildRuntime({
           return JSON.parse(old);
         }
       }
-      return {};
+      return null;
     } catch { return {}; }
   };
+  const loadSession = async (orgId) => {
+    const session = await readSession(orgId);
+    if (session) return session;
+    const cursor = await firstSync.initialCursor(orgId);
+    return cursor ? { sync_seq: cursor } : {};
+  };
   const saveSession = async (orgId, partial) => {
-    const cur = await loadSession(orgId);
+    const cur = (await readSession(orgId)) || {};
     await storage.set(path.join('sessions', `${orgId}.json`), JSON.stringify({ ...cur, ...partial }));
+    await firstSync.cursorSaved(orgId, partial?.sync_seq);
   };
 
   const syncSelf = async (orgConfig) => {

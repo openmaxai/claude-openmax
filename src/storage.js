@@ -15,9 +15,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export function defaultDataDir() {
-  if (process.env.CLAUDE_OPENMAX_DATA_DIR) return process.env.CLAUDE_OPENMAX_DATA_DIR;
-  const base = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+export function defaultDataDir(env = process.env) {
+  if (env.CLAUDE_OPENMAX_DATA_DIR) return env.CLAUDE_OPENMAX_DATA_DIR;
+  const base = env.XDG_DATA_HOME || path.join(env.HOME || os.homedir(), '.local', 'share');
   return path.join(base, 'claude-openmax');
 }
 

@@ -17584,8 +17584,8 @@ var StdioServerTransport = class {
 };
 
 // src/config.js
-import fs4 from "node:fs";
-import path4 from "node:path";
+import fs5 from "node:fs";
+import path5 from "node:path";
 
 // src/token-guard.js
 import crypto from "node:crypto";
@@ -17672,6 +17672,49 @@ async function writeApiKeyMarkers({ storage, orgIds, apiKey, logger }) {
       logger?.warn?.(`token-guard: failed to persist api_key marker for org=${orgId}: ${e.message}`);
     }
   }
+}
+
+// src/first-sync.js
+var FIRST_SYNC_KEY = "first-sync.json";
+function inboxStartCursor() {
+  return Object(0);
+}
+function createFirstSync({ storage, apiKey, logger }) {
+  const fp = apiKeyFingerprint(apiKey);
+  const read = async () => {
+    try {
+      const raw = await storage.get(FIRST_SYNC_KEY);
+      if (!raw) return null;
+      const m = JSON.parse(raw);
+      return m && typeof m === "object" ? m : null;
+    } catch {
+      return null;
+    }
+  };
+  const pendingFor = (m, orgId) => !!m && !!fp && m.fp === fp && !(Array.isArray(m.done) && m.done.includes(orgId));
+  return {
+    /**
+     * The cursor to hand the SDK for an org that has NO persisted session, or
+     * null to keep the SDK default (seek to the inbox end).
+     */
+    async initialCursor(orgId) {
+      const m = await read();
+      if (!pendingFor(m, orgId)) return null;
+      logger?.info?.(`[first-sync] org=${orgId}: first channel session after onboarding \u2014 catching up the inbox from seq 0 (onboarded ${m.created_at || "?"}) instead of seeking to its end`);
+      return inboxStartCursor();
+    },
+    /** A real cursor was persisted for this org — the marker is spent for it. */
+    async cursorSaved(orgId, seq) {
+      if (!(typeof seq === "number" && seq > 0)) return;
+      const m = await read();
+      if (!pendingFor(m, orgId)) return;
+      try {
+        await storage.set(FIRST_SYNC_KEY, JSON.stringify({ ...m, done: [...Array.isArray(m.done) ? m.done : [], orgId] }));
+      } catch (e) {
+        logger?.warn?.(`[first-sync] could not retire the marker for org=${orgId}: ${e.message}`);
+      }
+    }
+  };
 }
 
 // src/redact.js
@@ -21984,7 +22027,7 @@ var CwsAgentBridge = class {
 // src/version.js
 var version2;
 if (true) {
-  version2 = "1.3.2";
+  version2 = "1.3.3";
 } else {
   version2 = JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")
@@ -22005,9 +22048,15 @@ function requestPath(url) {
     return String(url).split("?")[0];
   }
 }
+function describeCause(c) {
+  if (!c) return "";
+  const code = c.code ? String(c.code) : "";
+  const msg = c.message ? String(c.message) : "";
+  if (code && msg && !msg.includes(code)) return `${code}: ${msg}`;
+  return msg || code;
+}
 function fetchCause(e) {
-  const c = e?.cause;
-  return c && (c.code || c.message) || e?.code || e?.message || String(e);
+  return describeCause(e?.cause) || e?.code || e?.message || String(e);
 }
 function createGuardedFetch({
   baseFetch,
@@ -22068,6 +22117,91 @@ function createGuardedFetch({
   };
 }
 
+// src/providers.js
+import fs4 from "node:fs";
+import path4 from "node:path";
+var LOG_FILE_MODE = 384;
+var LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
+function createStderrLogger(prefix = "[claude-openmax]", { logFile } = {}) {
+  let appendToFile = null;
+  if (logFile) {
+    try {
+      fs4.mkdirSync(path4.dirname(logFile), { recursive: true, mode: 448 });
+      try {
+        if (fs4.statSync(logFile).size > LOG_FILE_MAX_BYTES) {
+          fs4.renameSync(logFile, `${logFile}.1`);
+        }
+      } catch {
+      }
+      const fd = fs4.openSync(logFile, "a", LOG_FILE_MODE);
+      try {
+        fs4.chmodSync(logFile, LOG_FILE_MODE);
+      } catch {
+      }
+      appendToFile = (line) => {
+        try {
+          fs4.writeSync(fd, scrubLine(line));
+        } catch {
+        }
+      };
+    } catch (e) {
+      process.stderr.write(`${(/* @__PURE__ */ new Date()).toISOString()} ${prefix} WARN failed to open log file ${logFile}: ${e.message} \u2014 logging to stderr only
+`);
+    }
+  }
+  const emit = (level, args) => {
+    const line = args.map((a) => typeof a === "string" ? a : safeStringify(a)).join(" ");
+    const out = `${(/* @__PURE__ */ new Date()).toISOString()} ${prefix} ${level} ${line}
+`;
+    process.stderr.write(out);
+    if (appendToFile) appendToFile(out);
+  };
+  return {
+    info: (...a) => emit("INFO", a),
+    // The SDK's RPC logger calls logger.log(...); without this method the very
+    // first token exchange throws "this._logger.log is not a function". RPC
+    // logging is gated operator-side by COCO_RPC_LOG (set =0 to silence — e.g.
+    // to keep api_key/JWTs out of logs).
+    log: (...a) => emit("LOG", a),
+    warn: (...a) => emit("WARN", a),
+    error: (...a) => emit("ERROR", a),
+    // Kept a no-op: the SDK can call debug() very frequently, and flooding the
+    // diagnostic log file would bury the signal. Adapter diagnostics use info/warn.
+    debug: () => {
+    }
+  };
+}
+function createEmptyRuntimeState() {
+  return { async getMetrics() {
+    return {};
+  } };
+}
+function safeStringify(v) {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+var TOKEN_PROGRESS_RE = /^\[token\] (exchange|refresh|ws-ticket)( ok)? org=/;
+var TOKEN_NOTICE_RE = /^\[token\] api_key changed \(/;
+function levelTokenLogs(logger) {
+  if (!logger) return logger;
+  const call = (level, args) => (logger[level] || logger.info || logger.log)?.(...args);
+  return {
+    info: (...a) => call("info", a),
+    log: (...a) => call("log", a),
+    warn: (...a) => call("warn", a),
+    debug: (...a) => call("debug", a),
+    error: (...a) => {
+      const first = typeof a[0] === "string" ? a[0] : "";
+      if (TOKEN_PROGRESS_RE.test(first)) return call("info", a);
+      if (TOKEN_NOTICE_RE.test(first)) return call("warn", a);
+      return call("error", a);
+    }
+  };
+}
+
 // src/config.js
 var DEFAULT_FRONTEND_BASE_PATH = "/workspace";
 var OWNER_SYNC_HTTP_TIMEOUT_MS = 1e4;
@@ -22085,8 +22219,8 @@ function legacySlugify(s) {
   return String(s ?? "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 function resolveConfigPath(explicit) {
-  return explicit || process.env.CLAUDE_OPENMAX_CONFIG || path4.join(
-    process.env.CLAUDE_OPENMAX_DATA_DIR || path4.join(process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`, "claude-openmax"),
+  return explicit || process.env.CLAUDE_OPENMAX_CONFIG || path5.join(
+    process.env.CLAUDE_OPENMAX_DATA_DIR || path5.join(process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`, "claude-openmax"),
     "config.json"
   );
 }
@@ -22097,7 +22231,7 @@ function loadAdapterConfig(explicitPath) {
   const file = resolveConfigPath(explicitPath);
   let raw = {};
   try {
-    raw = JSON.parse(fs4.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs5.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT") throw new Error(`failed to read config ${file}: ${e.message}`);
   }
@@ -22286,10 +22420,10 @@ function buildRuntime({
         ...state.metricsReport !== void 0 ? { metricsReport: state.metricsReport } : {},
         ...hasWsTuning(state.ws) ? { ws: state.ws } : {}
       };
-      fs4.mkdirSync(path4.dirname(file), { recursive: true });
+      fs5.mkdirSync(path5.dirname(file), { recursive: true });
       const tmp = `${file}.tmp-${process.pid}`;
-      fs4.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 384 });
-      fs4.renameSync(tmp, file);
+      fs5.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 384 });
+      fs5.renameSync(tmp, file);
       logger?.info?.(`config persisted to ${file}`);
     } catch (e) {
       logger?.error?.(`config persist FAILED to ${file}: ${e.message}`);
@@ -22318,7 +22452,7 @@ function buildRuntime({
     storage,
     resolveDefaultOrgId,
     onMemberId: applyMemberId,
-    logger
+    logger: levelTokenLogs(logger)
   });
   const http2 = httpClient || new CwsHttpClient({
     fetch: guardedFetch,
@@ -22371,26 +22505,34 @@ function buildRuntime({
     if (!org) return [];
     return [org._legacySlug, legacySlugify(org.org_name)].filter((k) => k && k !== orgId);
   };
-  const loadSession = async (orgId) => {
+  const firstSync = createFirstSync({ storage, apiKey: state.agent.api_key, logger });
+  const readSession = async (orgId) => {
     try {
-      const raw = await storage.get(path4.join("sessions", `${orgId}.json`));
+      const raw = await storage.get(path5.join("sessions", `${orgId}.json`));
       if (raw) return JSON.parse(raw);
       for (const legacy of legacySessionKeys(orgId)) {
-        const old = await storage.get(path4.join("sessions", `${legacy}.json`));
+        const old = await storage.get(path5.join("sessions", `${legacy}.json`));
         if (old != null) {
-          await storage.set(path4.join("sessions", `${orgId}.json`), old);
+          await storage.set(path5.join("sessions", `${orgId}.json`), old);
           logger?.info?.(`migrated session sessions/${legacy}.json \u2192 sessions/${orgId}.json`);
           return JSON.parse(old);
         }
       }
-      return {};
+      return null;
     } catch {
       return {};
     }
   };
+  const loadSession = async (orgId) => {
+    const session = await readSession(orgId);
+    if (session) return session;
+    const cursor = await firstSync.initialCursor(orgId);
+    return cursor ? { sync_seq: cursor } : {};
+  };
   const saveSession = async (orgId, partial2) => {
-    const cur = await loadSession(orgId);
-    await storage.set(path4.join("sessions", `${orgId}.json`), JSON.stringify({ ...cur, ...partial2 }));
+    const cur = await readSession(orgId) || {};
+    await storage.set(path5.join("sessions", `${orgId}.json`), JSON.stringify({ ...cur, ...partial2 }));
+    await firstSync.cursorSaved(orgId, partial2?.sync_seq);
   };
   const syncSelf = async (orgConfig) => {
     try {
@@ -22461,7 +22603,7 @@ function buildRuntime({
     logger?.info?.(`owner synced from core for org=${orgConfig.org_id}: ${localOwnerId || "(none)"} \u2192 ${coreOwnerId}${ownerName ? ` (${ownerName})` : ""}${idChanged ? "" : " (name backfill)"}`);
     return { changed: true, ownerMemberId: coreOwnerId, ownerName, previousOwnerMemberId: localOwnerId };
   };
-  const policyMarkerKey = (orgId) => path4.join("policy", `${orgId}.json`);
+  const policyMarkerKey = (orgId) => path5.join("policy", `${orgId}.json`);
   const readPolicyMarker = async (orgId) => {
     try {
       const raw = await storage.get(policyMarkerKey(orgId));
@@ -22781,26 +22923,26 @@ function applyConfigAccessEvent(access, event, data) {
 }
 
 // src/storage.js
-import fs5 from "node:fs";
+import fs6 from "node:fs";
 import os2 from "node:os";
-import path5 from "node:path";
-function defaultDataDir() {
-  if (process.env.CLAUDE_OPENMAX_DATA_DIR) return process.env.CLAUDE_OPENMAX_DATA_DIR;
-  const base = process.env.XDG_DATA_HOME || path5.join(os2.homedir(), ".local", "share");
-  return path5.join(base, "claude-openmax");
+import path6 from "node:path";
+function defaultDataDir(env = process.env) {
+  if (env.CLAUDE_OPENMAX_DATA_DIR) return env.CLAUDE_OPENMAX_DATA_DIR;
+  const base = env.XDG_DATA_HOME || path6.join(env.HOME || os2.homedir(), ".local", "share");
+  return path6.join(base, "claude-openmax");
 }
 function createFileStorage(opts = {}) {
   const dataDir = opts.dataDir || defaultDataDir();
-  fs5.mkdirSync(dataDir, { recursive: true });
+  fs6.mkdirSync(dataDir, { recursive: true });
   const resolve = (key) => {
     const safe = String(key).replace(/\.\.(\/|\\|$)/g, "");
-    return path5.join(dataDir, safe);
+    return path6.join(dataDir, safe);
   };
   return {
     dataDir,
     async get(key) {
       try {
-        return fs5.readFileSync(resolve(key), "utf8");
+        return fs6.readFileSync(resolve(key), "utf8");
       } catch (e) {
         if (e.code === "ENOENT") return null;
         throw e;
@@ -22808,10 +22950,10 @@ function createFileStorage(opts = {}) {
     },
     async set(key, value) {
       const file = resolve(key);
-      fs5.mkdirSync(path5.dirname(file), { recursive: true });
+      fs6.mkdirSync(path6.dirname(file), { recursive: true });
       const tmp = `${file}.tmp-${process.pid}`;
-      fs5.writeFileSync(tmp, String(value), { mode: 384 });
-      fs5.renameSync(tmp, file);
+      fs6.writeFileSync(tmp, String(value), { mode: 384 });
+      fs6.renameSync(tmp, file);
     },
     // Delete a stored key (best-effort). Returns true if a file was removed,
     // false if it was already absent. Never throws. Used by the stale-token-cache
@@ -22819,8 +22961,8 @@ function createFileStorage(opts = {}) {
     async remove(key) {
       const file = resolve(key);
       try {
-        if (!fs5.existsSync(file)) return false;
-        fs5.rmSync(file, { force: true });
+        if (!fs6.existsSync(file)) return false;
+        fs6.rmSync(file, { force: true });
         return true;
       } catch (e) {
         if (e.code === "ENOENT") return false;
@@ -22830,8 +22972,8 @@ function createFileStorage(opts = {}) {
     // AsService download target (falls back to os.tmpdir() if absent — we
     // provide a stable per-adapter dir instead).
     downloadDir() {
-      const dir = path5.join(dataDir, "media");
-      fs5.mkdirSync(dir, { recursive: true });
+      const dir = path6.join(dataDir, "media");
+      fs6.mkdirSync(dir, { recursive: true });
       return dir;
     },
     // ConnService credential cache — Phase 1 degrades to empty (no local cache).
@@ -22843,76 +22985,9 @@ function createFileStorage(opts = {}) {
     },
     // Convenience for the per-org sync cursor persisted by loadSession/saveSession.
     sessionPath(orgId) {
-      return resolve(path5.join("sessions", `${orgId}.json`));
+      return resolve(path6.join("sessions", `${orgId}.json`));
     }
   };
-}
-
-// src/providers.js
-import fs6 from "node:fs";
-import path6 from "node:path";
-var LOG_FILE_MODE = 384;
-var LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
-function createStderrLogger(prefix = "[claude-openmax]", { logFile } = {}) {
-  let appendToFile = null;
-  if (logFile) {
-    try {
-      fs6.mkdirSync(path6.dirname(logFile), { recursive: true, mode: 448 });
-      try {
-        if (fs6.statSync(logFile).size > LOG_FILE_MAX_BYTES) {
-          fs6.renameSync(logFile, `${logFile}.1`);
-        }
-      } catch {
-      }
-      const fd = fs6.openSync(logFile, "a", LOG_FILE_MODE);
-      try {
-        fs6.chmodSync(logFile, LOG_FILE_MODE);
-      } catch {
-      }
-      appendToFile = (line) => {
-        try {
-          fs6.writeSync(fd, scrubLine(line));
-        } catch {
-        }
-      };
-    } catch (e) {
-      process.stderr.write(`${(/* @__PURE__ */ new Date()).toISOString()} ${prefix} WARN failed to open log file ${logFile}: ${e.message} \u2014 logging to stderr only
-`);
-    }
-  }
-  const emit = (level, args) => {
-    const line = args.map((a) => typeof a === "string" ? a : safeStringify(a)).join(" ");
-    const out = `${(/* @__PURE__ */ new Date()).toISOString()} ${prefix} ${level} ${line}
-`;
-    process.stderr.write(out);
-    if (appendToFile) appendToFile(out);
-  };
-  return {
-    info: (...a) => emit("INFO", a),
-    // The SDK's RPC logger calls logger.log(...); without this method the very
-    // first token exchange throws "this._logger.log is not a function". RPC
-    // logging is gated operator-side by COCO_RPC_LOG (set =0 to silence — e.g.
-    // to keep api_key/JWTs out of logs).
-    log: (...a) => emit("LOG", a),
-    warn: (...a) => emit("WARN", a),
-    error: (...a) => emit("ERROR", a),
-    // Kept a no-op: the SDK can call debug() very frequently, and flooding the
-    // diagnostic log file would bury the signal. Adapter diagnostics use info/warn.
-    debug: () => {
-    }
-  };
-}
-function createEmptyRuntimeState() {
-  return { async getMetrics() {
-    return {};
-  } };
-}
-function safeStringify(v) {
-  try {
-    return JSON.stringify(v);
-  } catch {
-    return String(v);
-  }
 }
 
 // src/channel.js
@@ -26187,7 +26262,7 @@ function createMcpTools({ services, bridge, defaultOrgId, mentions, logger } = {
       return errResult(`unknown tool: ${name}`);
     } catch (e) {
       const msg = e?.message || String(e);
-      const cause = e?.cause && (e.cause.code || e.cause.message);
+      const cause = describeCause(e?.cause);
       const detail = cause && !msg.includes(cause) ? `${msg} (${cause})` : msg;
       logger?.warn?.(`tool ${name} failed: ${detail}`);
       return errResult(detail);

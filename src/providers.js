@@ -93,3 +93,31 @@ export function createEmptyRuntimeState() {
 function safeStringify(v) {
   try { return JSON.stringify(v); } catch { return String(v); }
 }
+
+// SDK 1.1.0's TokenManager logs its ROUTINE progress at ERROR ("[token] exchange
+// org=…", "[token] ws-ticket ok org=…", refresh, …), which made every healthy
+// connect look like a failure in the log. These exact lines are re-levelled to
+// INFO; the cache-discard notice becomes WARN. Anything else passes unchanged.
+const TOKEN_PROGRESS_RE = /^\[token\] (exchange|refresh|ws-ticket)( ok)? org=/;
+const TOKEN_NOTICE_RE = /^\[token\] api_key changed \(/;
+
+/**
+ * Wrap the logger handed to the SDK TokenManager so its progress lines get the
+ * right level. Returns the logger unchanged when there is none.
+ */
+export function levelTokenLogs(logger) {
+  if (!logger) return logger;
+  const call = (level, args) => (logger[level] || logger.info || logger.log)?.(...args);
+  return {
+    info: (...a) => call('info', a),
+    log: (...a) => call('log', a),
+    warn: (...a) => call('warn', a),
+    debug: (...a) => call('debug', a),
+    error: (...a) => {
+      const first = typeof a[0] === 'string' ? a[0] : '';
+      if (TOKEN_PROGRESS_RE.test(first)) return call('info', a);
+      if (TOKEN_NOTICE_RE.test(first)) return call('warn', a);
+      return call('error', a);
+    },
+  };
+}

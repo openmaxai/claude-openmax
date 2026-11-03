@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createStderrLogger } from '../src/providers.js';
+import { createStderrLogger, levelTokenLogs } from '../src/providers.js';
 
 // Regression: the SDK's RPC logger calls logger.log(...). createStderrLogger
 // originally only defined info/warn/error/debug, so the FIRST token exchange
@@ -81,4 +81,40 @@ test('createStderrLogger scrubs secrets (JWT / api_key / cwsk_ / Bearer) in the 
   // Non-secret content is preserved.
   assert.match(contents, /dmPolicy/);
   assert.match(contents, /\[redacted-jwt\]/);
+});
+
+test('levelTokenLogs: routine TokenManager progress goes to INFO, the cache-discard notice to WARN, real errors stay ERROR', () => {
+  const seen = [];
+  const base = Object.fromEntries(['info', 'log', 'warn', 'error', 'debug'].map((l) => [l, (...a) => seen.push([l, a.join(' ')])]));
+  const lg = levelTokenLogs(base);
+  for (const line of [
+    '[token] exchange org=o1', '[token] exchange ok org=o1 exp=2026-11-03T04:44:15.118Z',
+    '[token] refresh org=o1', '[token] refresh ok org=(identity-only) exp=x',
+    '[token] ws-ticket org=o1', '[token] ws-ticket ok org=o1',
+  ]) lg.error(line);
+  lg.error('[token] api_key changed (record fp=aa != current fp=bb); discarding cached token');
+  lg.error('[ws] error:', 'boom');
+  lg.log('[rpc] → POST x');
+  assert.deepEqual(seen.map(([l]) => l), ['info', 'info', 'info', 'info', 'info', 'info', 'warn', 'error', 'log']);
+  assert.equal(seen[5][1], '[token] ws-ticket ok org=o1');
+  assert.equal(levelTokenLogs(undefined), undefined);
+});
+
+test('buildRuntime hands the TokenManager the re-levelled logger (no "ERROR [token] ws-ticket ok")', async () => {
+  const { normalizeConfig, buildRuntime } = await import('../src/config.js');
+  const seen = [];
+  const logger = Object.fromEntries(['info', 'log', 'warn', 'error', 'debug'].map((l) => [l, (...a) => seen.push([l, a.join(' ')])]));
+  const config = normalizeConfig({
+    server: { bff_url: 'https://core.example', ws_url: 'wss://comm.example/ws' },
+    agent: { api_key: 'cwsk_k', device_id: 'd' },
+    orgs: { o1: { org_id: 'o1' } },
+  }, { logger });
+  const fetchImpl = async () => ({ ok: true, status: 200, headers: new Headers({ 'content-type': 'application/json' }), async json() { return { data: { ticket: 't1', access_token: 'a', expires_in: 900 } }; }, async text() { return JSON.stringify({ data: { ticket: 't1', access_token: 'a', expires_in: 900 } }); } });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-openmax-lvl-'));
+  const mem = new Map();
+  const rt = buildRuntime({ config, file: path.join(dir, 'c.json'), storage: { get: async (k) => mem.get(k) ?? null, set: async (k, v) => { mem.set(k, v); } }, logger, fetchImpl });
+  await rt.tokenManager.getWsTicket('o1').catch(() => {});
+  const tokenLines = seen.filter(([, m]) => m.startsWith('[token]'));
+  assert.ok(tokenLines.length > 0, JSON.stringify(seen));
+  assert.ok(!tokenLines.some(([l]) => l === 'error'), JSON.stringify(tokenLines));
 });

@@ -82,6 +82,7 @@ tests.
 | `src/create-bridge.js` | Assembles `CwsAgentBridge` from the runtime + providers. |
 | `src/channel-gate.js` | Channel activation (`CLAUDE_OPENMAX_CHANNEL`) + single-instance `channel.lock`. |
 | `scripts/onboard.js` | One-shot onboarding: config, register + accept, permission rules, launch the channel session. |
+| `src/first-sync.js` | First channel session after onboarding catches up the new inbox from seq 0 instead of seeking past it. |
 | `src/storage.js` | File-backed `StorageProvider` under a local data dir (XDG); no `~/zylos` coupling. |
 | `src/providers.js` | stderr logger + empty `RuntimeStateProvider` (Cat.B degraded metrics). |
 | `.claude-plugin/plugin.json` | Registers the `openmax` MCP server for Claude Code. |
@@ -145,9 +146,13 @@ invitation (per-request timeouts under a 45 s budget; registration is retried on
 when the request provably never reached the server, so no orphan identity is
 created), appends the OpenMax
 tool rules to `permissions.allow`, and with `--launch` starts
-`CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax "<greeting>"`
+`CLAUDE_OPENMAX_CHANNEL=1 claude --dangerously-load-development-channels plugin:openmax-channel@openmax -- "<greeting>"`
 in tmux — a new window if you are already in tmux, otherwise a detached session
-`openmax` (`tmux attach -t openmax`); without tmux it prints the command. You then
+`openmax` (`tmux attach -t openmax`); without tmux it prints the command. (The `--`
+matters: the channel flag takes several values, so without it Claude Code reads the
+greeting as a second channel and exits.) A new window/session is reported as
+launched only if it is still running a few seconds later; otherwise the script
+prints `launch: FAILED …` with the exit status and output and `LAUNCH: manual`. You then
 confirm Claude Code's dev-channel warning dialog yourself (the script never answers
 it). Output ends with `ONBOARD OK` / `LAUNCH:` / `NEXT:` / `RESTART_COMMAND:` on
 success or `ONBOARD FAILED: <step>: <reason>` on failure; exit codes are 0 (ok, also
@@ -206,7 +211,8 @@ before approving:
     `settings.json.bak-openmax-<ts>` first, and a file that is not valid JSON is
     refused.
   - `~/.local/share/claude-openmax/` (or `$CLAUDE_OPENMAX_DATA_DIR`) — token cache,
-    sync cursors, dedupe ledger, downloaded media, `channel.lock`; files 0600.
+    sync cursors, dedupe ledger, downloaded media, `channel.lock`, and after a new
+    registration `first-sync.json` (api_key fingerprint only); files 0600.
   - A log file only if you set `CLAUDE_OPENMAX_LOG_FILE` (0600, secrets scrubbed).
 - **Endpoints called** (only the workspace server in your config — `server.bff_url`
   / `server.ws_url`): `POST /auth/register/agent`, `POST /auth/agent/token`,

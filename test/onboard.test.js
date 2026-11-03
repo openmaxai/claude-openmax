@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, statSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 
 import {
@@ -152,6 +153,8 @@ test('chooseLaunchMode: tmux window inside tmux, detached session outside, manua
   assert.equal(chooseLaunchMode({ env: { CLAUDE_CODE_ENTRYPOINT: 'cli' }, platform: 'linux', tmuxAvailable: true }).mode, 'tmux-session');
 });
 
+const NO_SETTLE = { settleMs: 0, delay: async () => {} };
+
 function fakeExec(responses = {}) {
   const calls = [];
   const exec = (cmd, args, opts) => {
@@ -163,36 +166,36 @@ function fakeExec(responses = {}) {
   return { exec, calls };
 }
 
-test('launchInTmux inside tmux opens a new window running the channel command (env cleaned, no send-keys)', () => {
+test('launchInTmux inside tmux opens a new window running the channel command (env cleaned, no send-keys)', async () => {
   const { exec, calls } = fakeExec({ 'tmux list-windows': { status: 0, stdout: 'main\n' } });
-  const r = launchInTmux({ mode: 'tmux-window', cwd: '/work', env: { TMUX: 'x', CLAUDECODE: '1' }, exec, claudeBin: 'claude' });
+  const r = await launchInTmux({ ...NO_SETTLE, mode: 'tmux-window', cwd: '/work', env: { TMUX: 'x', CLAUDECODE: '1' }, exec, claudeBin: 'claude' });
   assert.deepEqual(r, { launched: true, mode: 'tmux-window', reused: false });
   const nw = calls.find((c) => c.args[0] === 'new-window');
-  assert.deepEqual(nw.args.slice(0, 5), ['new-window', '-n', 'openmax', '-c', '/work']);
-  assert.ok(nw.args[5].includes('CLAUDE_OPENMAX_CHANNEL=1'));
+  assert.deepEqual(nw.args.slice(0, 8), ['new-window', '-P', '-F', '#{window_id}', '-n', 'openmax', '-c', '/work']);
+  assert.ok(nw.args[8].includes('CLAUDE_OPENMAX_CHANNEL=1'));
   assert.equal(nw.env.CLAUDECODE, undefined);
   assert.ok(!calls.some((c) => c.args.includes('send-keys')));
 });
 
-test('launchInTmux reuses an existing "openmax" window instead of starting a second session', () => {
+test('launchInTmux reuses an existing "openmax" window instead of starting a second session', async () => {
   const { exec, calls } = fakeExec({ 'tmux list-windows': { status: 0, stdout: 'main\nopenmax\n' } });
-  const r = launchInTmux({ mode: 'tmux-window', cwd: '/w', env: { TMUX: 'x' }, exec });
+  const r = await launchInTmux({ ...NO_SETTLE, mode: 'tmux-window', cwd: '/w', env: { TMUX: 'x' }, exec });
   assert.equal(r.reused, true);
   assert.ok(calls.some((c) => c.args[0] === 'select-window'));
   assert.ok(!calls.some((c) => c.args[0] === 'new-window'));
 });
 
-test('launchInTmux outside tmux starts a detached "openmax" session and returns the attach command', () => {
+test('launchInTmux outside tmux starts a detached "openmax" session and returns the attach command', async () => {
   const { exec, calls } = fakeExec({ 'tmux has-session': { status: 1 } });
-  const r = launchInTmux({ mode: 'tmux-session', cwd: '/w', env: {}, exec });
+  const r = await launchInTmux({ ...NO_SETTLE, mode: 'tmux-session', cwd: '/w', env: {}, exec });
   assert.equal(r.launched, true);
   assert.equal(r.attach, 'tmux attach -t openmax');
   assert.deepEqual(calls.find((c) => c.args[0] === 'new-session').args.slice(0, 6), ['new-session', '-d', '-s', 'openmax', '-c', '/w']);
 });
 
-test('launchInTmux reuses an existing detached session', () => {
+test('launchInTmux reuses an existing detached session', async () => {
   const { exec, calls } = fakeExec({ 'tmux has-session': { status: 0 } });
-  const r = launchInTmux({ mode: 'tmux-session', cwd: '/w', env: {}, exec });
+  const r = await launchInTmux({ ...NO_SETTLE, mode: 'tmux-session', cwd: '/w', env: {}, exec });
   assert.equal(r.reused, true);
   assert.ok(!calls.some((c) => c.args[0] === 'new-session'));
 });
@@ -236,7 +239,7 @@ async function onboard(s, { argv = ['--launch'], stdinText = JSON.stringify(inco
   const code = await withEnv({ CLAUDE_OPENMAX_CONFIG: s.cfgPath }, () => withFetch(fetchImpl, (calls) => runOnboard({
     argv, stdinText, env, cwd: s.dir, platform: 'linux', print: (l) => lines.push(l), exec: fx,
     register: register || ((o) => registerAndAccept({ ...o, backoffMs: [1] })),
-    now: Date.UTC(2026, 10, 2),
+    now: Date.UTC(2026, 10, 2), launchOpts: NO_SETTLE,
   }).then((c) => { lines.fetchCalls = calls; return c; })));
   return { code, lines, out: lines.join('\n') };
 }
@@ -369,10 +372,10 @@ test('runOnboard warns (does not fail) on Bedrock', async () => {
 
 // ── never reuse a running session that holds an old identity ─────────────────
 
-test('launchInTmux(allowReuse=false) reports an existing session as stale and starts/kills nothing', () => {
+test('launchInTmux(allowReuse=false) reports an existing session as stale and starts/kills nothing', async () => {
   for (const [mode, key, env] of [['tmux-session', 'tmux has-session', {}], ['tmux-window', 'tmux list-windows', { TMUX: 'x' }]]) {
     const { exec, calls } = fakeExec({ [key]: { status: 0, stdout: 'openmax\n' } });
-    const r = launchInTmux({ mode, cwd: '/w', env, exec, allowReuse: false });
+    const r = await launchInTmux({ ...NO_SETTLE, mode, cwd: '/w', env, exec, allowReuse: false });
     assert.equal(r.launched, false);
     assert.equal(r.stale, true);
     assert.ok(!calls.some((c) => /^(new-|select-|kill-|send-keys)/.test(c.args[0])), `${mode}: ${calls.map((c) => c.args[0])}`);
@@ -456,4 +459,155 @@ test('runOnboard --no-stdin with a blank-key config registers and does not reuse
   const { exec } = fakeExec({ 'tmux has-session': { status: 0 } });
   const { lines } = await onboard(s, { exec, argv: ['--launch', '--no-stdin'], stdinText: '' });
   assert.ok(lines.includes('LAUNCH: manual'), lines.join('\n'));
+});
+
+// ── 1.3.3: launch order + truthful launch report ──────────────────────────────
+
+
+// A stand-in for `claude` that parses its argv the way Claude Code 2.1.x does:
+// `--dangerously-load-development-channels` is VARIADIC (it takes every following
+// argument up to the next option or `--`), and each entry must be tagged.
+const FAKE_CLAUDE = `#!/usr/bin/env node
+const a = process.argv.slice(2); const channels = []; let prompt = null;
+for (let i = 0; i < a.length; i++) {
+  if (a[i] === '--') { prompt = a.slice(i + 1).join(' '); break; }
+  if (a[i] === '--dangerously-load-development-channels') {
+    while (i + 1 < a.length && !a[i + 1].startsWith('-')) channels.push(a[++i]);
+    continue;
+  }
+  if (!a[i].startsWith('-')) prompt = a[i];
+}
+const bad = channels.find((c) => !/^(plugin:[^@]+@.+|server:.+)$/.test(c));
+if (bad) { console.error('--dangerously-load-development-channels entries must be tagged: ' + bad); process.exit(1); }
+if (process.env.FAKE_CLAUDE_STAY) setTimeout(() => {}, Number(process.env.FAKE_CLAUDE_STAY));
+else console.log(JSON.stringify({ channels, prompt }));
+`;
+
+function writeFakeClaude() {
+  const bin = path.join(tmp('claude-openmax-fake-claude-'), 'claude');
+  writeFileSync(bin, FAKE_CLAUDE, { mode: 0o755 });
+  return bin;
+}
+
+test('buildLaunchCommand puts `--` between the variadic channel flag and the greeting prompt', () => {
+  const cmd = buildLaunchCommand({ env: {} });
+  assert.ok(cmd.endsWith(`${CHANNEL_REF} -- ${shellQuote(GREETING_PROMPT)}`), cmd);
+  assert.ok(!buildLaunchCommand({ env: {}, prompt: '' }).includes(' -- '), 'no prompt → no separator');
+});
+
+test('the launch command parses as ONE channel entry + the greeting prompt (variadic-flag parser, through sh)', () => {
+  const bin = writeFakeClaude();
+  const cmd = buildLaunchCommand({ claudeBin: bin, env: {}, stripEnv: true });
+  const r = spawnSync('sh', ['-c', cmd], { encoding: 'utf8', env: { PATH: process.env.PATH } });
+  assert.equal(r.status, 0, `the launch command must not be rejected: ${r.stderr}`);
+  const parsed = JSON.parse(r.stdout);
+  assert.deepEqual(parsed.channels, [CHANNEL_REF]);
+  assert.equal(parsed.prompt, GREETING_PROMPT);
+});
+
+test('launchInTmux: a new session that exits at once is reported as exited (status + output), removed, not launched', async () => {
+  const { exec, calls } = fakeExec({
+    'tmux has-session': { status: 1 },
+    'tmux display-message': { status: 0, stdout: '1 1\n' },
+    'tmux capture-pane': { status: 0, stdout: "Error: --dangerously-load-development-channels entries must be tagged: OpenMax onboarding\n  plugin:<name>@<marketplace>\n\nPane is dead (status 1, Tue Nov  3 14:35:34 2026)\n" },
+  });
+  const r = await launchInTmux({ ...NO_SETTLE, mode: 'tmux-session', cwd: '/w', env: {}, exec });
+  assert.equal(r.launched, false);
+  assert.equal(r.exited, true);
+  assert.equal(r.exitStatus, '1');
+  assert.match(r.reason, /exited right after starting \(exit status 1\): Error: --dangerously-load-development-channels entries must be tagged/);
+  assert.ok(!r.reason.includes('Pane is dead'));
+  const ns = calls.find((c) => c.args[0] === 'new-session');
+  assert.deepEqual(ns.args.slice(-5), [';', 'set-option', '-w', 'remain-on-exit', 'on'], 'dead pane kept for inspection');
+  assert.deepEqual(calls.find((c) => c.args[0] === 'kill-session').args, ['kill-session', '-t', '=openmax']);
+});
+
+test('launchInTmux: a new window that is gone after the settle delay is not reported as launched', async () => {
+  let waited = 0;
+  const { exec, calls } = fakeExec({
+    'tmux list-windows': { status: 0, stdout: 'main\n' },
+    'tmux new-window': { status: 0, stdout: '@7\n' },
+    'tmux display-message': { status: 1, stderr: "can't find window: @7" },
+  });
+  const r = await launchInTmux({ mode: 'tmux-window', cwd: '/w', env: { TMUX: 'x' }, exec, settleMs: 2500, delay: async (ms) => { waited = ms; } });
+  assert.equal(waited, 2500, 'waits before checking');
+  assert.equal(r.launched, false);
+  assert.equal(r.exited, true);
+  assert.match(r.reason, /no output captured/);
+  assert.equal(calls.find((c) => c.args[0] === 'display-message').args[3], '@7', 'checks the window it created');
+});
+
+test('launchInTmux: a live new window is launched and remain-on-exit is reset to the default', async () => {
+  const { exec, calls } = fakeExec({
+    'tmux list-windows': { status: 0, stdout: 'main\n' },
+    'tmux new-window': { status: 0, stdout: '@3\n' },
+    'tmux display-message': { status: 0, stdout: '0 \n' },
+  });
+  const r = await launchInTmux({ ...NO_SETTLE, mode: 'tmux-window', cwd: '/w', env: { TMUX: 'x' }, exec });
+  assert.deepEqual(r, { launched: true, mode: 'tmux-window', reused: false });
+  assert.deepEqual(calls.find((c) => c.args[0] === 'set-option').args, ['set-option', '-w', '-u', '-t', '@3', 'remain-on-exit']);
+  assert.ok(!calls.some((c) => /^kill-/.test(c.args[0])));
+});
+
+test('runOnboard: a launched session that dies at once → LAUNCH: manual + FAILED with the reason, never tmux-session', async () => {
+  const s = setup();
+  const { exec } = fakeExec({
+    'tmux has-session': { status: 1 },
+    'tmux display-message': { status: 0, stdout: '1 1\n' },
+    'tmux capture-pane': { status: 0, stdout: 'Error: something broke\n' },
+  });
+  const { code, lines, out } = await onboard(s, { exec });
+  assert.equal(code, 0, out);
+  const i = lines.indexOf('ONBOARD OK');
+  assert.equal(lines[i + 1], 'LAUNCH: manual');
+  assert.ok(lines.includes('[onboard] launch: FAILED the channel session exited right after starting (exit status 1): Error: something broke'), out);
+  assert.match(lines[i + 2], /^NEXT: The new Claude Code session did not start: .*Error: something broke/);
+  assert.ok(!lines.some((l) => /started a detached tmux session/.test(l)));
+});
+
+const hasTmux = spawnSync('tmux', ['-V']).status === 0;
+
+test('launchInTmux with real tmux: the fixed command stays up, a failing one is detected (private tmux server)', { skip: !hasTmux && 'tmux not installed' }, async () => {
+  const sock = `claude-openmax-test-${process.pid}`;
+  const bin = writeFakeClaude();
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME, FAKE_CLAUDE_STAY: '20000' };
+  const exec = (cmd, args, opts) => {
+    const r = spawnSync(cmd, ['-L', sock, ...args], { encoding: 'utf8', timeout: 10000, ...opts });
+    return { status: r.error ? null : r.status, stdout: r.stdout || '', stderr: r.stderr || '', error: r.error };
+  };
+  try {
+    const ok = await launchInTmux({ mode: 'tmux-session', cwd: tmpdir(), env, exec, claudeBin: bin, settleMs: 1500 });
+    assert.equal(ok.launched, true, ok.reason);
+    exec('tmux', ['kill-server']);
+
+    const failing = path.join(tmp('claude-openmax-fake-claude-'), 'claude');
+    writeFileSync(failing, '#!/bin/sh\necho "Error: --dangerously-load-development-channels entries must be tagged: hello" >&2\nexit 1\n', { mode: 0o755 });
+    const bad = await launchInTmux({ mode: 'tmux-session', cwd: tmpdir(), env, exec, claudeBin: failing, settleMs: 1500 });
+    assert.equal(bad.launched, false);
+    assert.equal(bad.exited, true);
+    assert.match(bad.reason, /entries must be tagged/);
+    assert.notEqual(exec('tmux', ['has-session', '-t', '=openmax']).status, 0, 'the dead session was removed');
+  } finally {
+    exec('tmux', ['kill-server']);
+  }
+});
+
+// ── 1.3.3: first-sync marker ──────────────────────────────────────────────────
+
+test('runOnboard: a NEW registration leaves the first-sync marker in the data dir; a re-run does not rewrite it', async () => {
+  const s = setup();
+  const dataDir = path.join(s.dir, 'data');
+  const env = { ...s.env, CLAUDE_OPENMAX_DATA_DIR: dataDir };
+  const first = await onboard(s, { env });
+  assert.equal(first.code, 0, first.out);
+  const marker = path.join(dataDir, 'first-sync.json');
+  const m = JSON.parse(readFileSync(marker, 'utf8'));
+  assert.equal(m.identity_id, 'id-new');
+  assert.match(m.fp, /^[0-9a-f]{8}$/);
+  assert.ok(!readFileSync(marker, 'utf8').includes('cwsk_secret_value'), 'no api_key in the marker');
+  assert.ok(first.lines.some((l) => l.startsWith('[onboard] first-sync: ')));
+  writeFileSync(marker, JSON.stringify({ ...m, done: ['o1'] }));
+  const second = await onboard(s, { env });
+  assert.equal(second.code, 0, second.out);
+  assert.deepEqual(JSON.parse(readFileSync(marker, 'utf8')).done, ['o1'], 'kept registration → marker untouched');
 });

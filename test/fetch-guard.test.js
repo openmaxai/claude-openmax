@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createGuardedFetch, fetchCause } from '../src/fetch-guard.js';
+import { createGuardedFetch, fetchCause, describeCause } from '../src/fetch-guard.js';
 
 const netErr = (code) => Object.assign(new TypeError('fetch failed'), { cause: { code } });
 const ok = { ok: true, status: 200 };
@@ -66,6 +66,22 @@ test('a caller abort is passed through and not retried', async () => {
 test('fetchCause prefers cause.code', () => {
   assert.equal(fetchCause(netErr('ENOTFOUND')), 'ENOTFOUND');
   assert.equal(fetchCause(new Error('plain')), 'plain');
+});
+
+test('fetchCause keeps the undici code AND its readable message (UND_ERR_SOCKET: other side closed)', () => {
+  const sock = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) });
+  assert.equal(fetchCause(sock), 'UND_ERR_SOCKET: other side closed');
+  // a message that already names the code is not doubled
+  const refused = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), { code: 'ECONNREFUSED' }) });
+  assert.equal(fetchCause(refused), 'connect ECONNREFUSED 10.0.0.1:443');
+  assert.equal(describeCause(null), '');
+  assert.equal(describeCause({ message: 'boom' }), 'boom');
+});
+
+test('the guarded fetch error carries the readable cause', async () => {
+  const f = createGuardedFetch({ baseFetch: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) }); }, retries: 0 });
+  await assert.rejects(() => f('https://core.test/auth/ws-ticket', { method: 'POST', body: '{}' }),
+    (e) => e.message === 'fetch failed: POST /auth/ws-ticket → UND_ERR_SOCKET: other side closed');
 });
 
 test('message sends (comm_send → POST /conversations/<id>/messages) are never retried, even on timeout', async () => {
